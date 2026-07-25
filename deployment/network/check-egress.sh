@@ -1,42 +1,66 @@
-#!/bin/bash
-# Проверить egress-изоляцию OpenHands
-# Запускать изнутри контейнера или с хоста.
-# Не применяет правил — только проверка.
+#!/usr/bin/env bash
+# Run from the host. Tests network access from inside openhands-agent.
+set -Eeuo pipefail
 
-echo "=== Проверка egress-изоляции ==="
+CONTAINER="openhands-agent"
+FAIL=0
 
-check_url() {
-    local desc="$1"
-    local url="$2"
-    local expect="$3"
+if ! docker inspect "${CONTAINER}" >/dev/null 2>&1; then
+  echo "ERROR: container ${CONTAINER} does not exist" >&2
+  exit 1
+fi
 
-    if curl -fsS -o /dev/null -m 5 "${url}" 2>/dev/null; then
-        local result="доступен"
-    else
-        local result="недоступен"
-    fi
-
-    if [ "${result}" = "${expect}" ]; then
-        echo "  ✅ ${desc}: ${result}"
-    else
-        echo "  ❌ ${desc}: ${result} (ожидалось: ${expect})"
-    fi
+inside() {
+  docker exec "${CONTAINER}" bash -lc "$1"
 }
 
-echo ""
-echo "--- Внешний доступ (должен быть) ---"
-check_url "HTTPS (google.com)" "https://google.com" "доступен"
-check_url "HTTPS (api.openai.com)" "https://api.openai.com" "доступен"
+expect_ok() {
+  local name="$1" command="$2"
+  if inside "${command}" >/dev/null 2>&1; then
+    echo "OK   ${name}"
+  else
+    echo "FAIL ${name}: expected available"
+    FAIL=1
+  fi
+}
 
-echo ""
-echo "--- Внутренние сервисы (НЕ должны быть доступны) ---"
-check_url "AMNESIA Bridge (10.77.0.2:8090)" "http://10.77.0.2:8090/health" "недоступен"
-check_url "Nextcloud (10.77.0.2:11000)" "http://10.77.0.2:11000/status.php" "недоступен"
-check_url "LAN router (192.168.100.1)" "http://192.168.100.1" "недоступен"
+expect_blocked() {
+  local name="$1" command="$2"
+  if inside "${command}" >/dev/null 2>&1; then
+    echo "FAIL ${name}: unexpectedly reachable"
+    FAIL=1
+  else
+    echo "OK   ${name}: blocked"
+  fi
+}
 
-echo ""
-echo "--- WebUI (должен быть доступен) ---"
-check_url "Agent Canvas (10.77.0.2:8000)" "http://10.77.0.2:8000/canvas" "доступен"
+# External services required for model/API use.
+expect_ok "DNS resolution" "getent ahostsv4 example.com"
+expect_ok "External HTTPS" "curl -sS -o /dev/null --connect-timeout 5 --max-time 10 https://example.com/"
 
-echo ""
-echo "=== Проверка завершена ==="
+# Internal and non-web destinations must be unreachable.
+expect_blocked "AMNESIA 10.77.0.2:8090" "timeout 4 bash -c '</dev/tcp/10.77.0.2/8090'"
+expect_blocked "Nextcloud 10.77.0.2:11000" "timeout 4 bash -c '</dev/tcp/10.77.0.2/11000'"
+expect_blocked "mini-server SSH 10.77.0.2:22" "timeout 4 bash -c '</dev/tcp/10.77.0.2/22'"
+expect_blocked "Docker gateway 10.89.0.1:22" "timeout 4 bash -c '</dev/tcp/10.89.0.1/22'"
+expect_blocked "LAN router 192.168.100.1:80" "timeout 4 bash -c '</dev/tcp/192.168.100.1/80'"
+expect_blocked "VPS SSH 95.217.239.148:22" "timeout 4 bash -c '</dev/tcp/95.217.239.148/22'"
+expect_blocked "Public non-web port github.com:22" "timeout 4 bash -c '</dev/tcp/github.com/22'"
+
+if inside "ip -6 addr show scope global | grep -q inet6" >/dev/null 2>&1; then
+  echo "FAIL global IPv6 address is present"
+  FAIL=1
+else
+  echo "OK   IPv6 disabled/no global address"
+fi
+
+# WebUI is tested from the host/WireGuard side, not from the isolated container.
+HTTP_CODE=$(curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 10 http://10.77.0.2:8000/canvas || true)
+if [[ "${HTTP_CODE}" =~ ^(200|301|302|307|308)$ ]]; then
+  echo "OK   WebUI through WireGuard: HTTP ${HTTP_CODE}"
+else
+  echo "FAIL WebUI through WireGuard: HTTP ${HTTP_CODE:-000}"
+  FAIL=1
+fi
+
+exit "${FAIL}"
