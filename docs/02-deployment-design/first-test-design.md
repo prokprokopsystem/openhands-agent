@@ -141,7 +141,7 @@ LLM-провайдер, ключ и модель настраиваются **ч
    openssl rand -base64 32
    ```
 
-3. Создать `/srv/openhands-agent/secrets/.env` с `LOCAL_BACKEND_API_KEY` и `LLM_API_KEY`
+3. Создать `/srv/openhands-agent/secrets/.env` с `LOCAL_BACKEND_API_KEY` (LLM — через WebUI)
 
 4. Скопировать `compose.yaml` на mini-server
 
