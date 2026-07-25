@@ -1,17 +1,18 @@
 # Дизайн первого тестового запуска
 
-**Дата:** 25 июля 2026  
+**Дата:** 25 июля 2026 (финальная проверка: 25 июля 2026, 22:04 CEST)  
 **Проект:** OpenHands Agent — Этап 2  
 
 ---
 
 ## 1. Выбранные версии
 
-| Компонент | Версия | Источник |
-|---|---|---|
-| Agent Canvas (GUI + Server) | **v1.6.1** | `ghcr.io/openhands/agent-canvas:1.6.1` |
-| Дата релиза | 24 июля 2026 | https://github.com/OpenHands/agent-canvas/releases/tag/v1.6.1 |
-| Документация | https://docs.openhands.dev | Официальные доки |
+| Компонент | Версия | Источник | Подтверждение |
+|---|---|---|---|
+| Agent Canvas | **v1.6.1** | `ghcr.io/openhands/agent-canvas:1.6.1` | ✅ Manifest получен, `amd64/linux` подтверждён |
+| Agent Server | встроен в образ | — | Agent Server + Automation = один контейнер |
+| Дата релиза | 24 июля 2026 | https://github.com/OpenHands/agent-canvas/releases/tag/v1.6.1 | ✅ |
+| SHA сборки | `43f091baf135142ed6c146f888f44a957141193f` | `AGENT_CANVAS_BUILD_GIT_SHA` в образе | ✅ |
 
 **Примечание:** старый «Local GUI V1» помечен как deprecated. Agent Canvas — официальный наследник.
 
@@ -44,6 +45,26 @@ mini-server 10.77.0.2:8000
 **Docker socket НЕ используется.** Agent Canvas v1.6.1 не требует `/var/run/docker.sock`.
 
 В старом Local GUI V1 docker.sock был нужен для создания sandbox-контейнеров. В Agent Canvas песочницей является сам контейнер — агент работает внутри него, изолирован Docker'ом. Это безопаснее.
+
+### Детали образа (подтверждено из manifest)
+
+| Параметр | Значение |
+|---|---|
+| Архитектура | `linux/amd64` ✅ |
+| Пользователь | `openhands` |
+| Entrypoint | `tini -- /opt/agent-canvas/entrypoint.sh` |
+| Порты | `8000/tcp` (UI), `8002/tcp` (noVNC) |
+| WebUI base path | `/canvas` |
+| Volumes | `/home/openhands/.openhands`, `/projects` |
+| Healthcheck | Отсутствует |
+| Chrome | `/usr/bin/chromium` (--no-sandbox) |
+| VS Code | `/openhands/.openvscode-server` |
+
+### Переменные окружения (подтверждено)
+
+**Только одна:** `LOCAL_BACKEND_API_KEY`.
+
+LLM-провайдер, ключ и модель настраиваются **через WebUI** (Settings → LLM). `LLM_API_KEY`, `LLM_MODEL`, `LLM_BASE_URL` не являются переменными образа.
 
 ---
 
@@ -161,33 +182,17 @@ sudo rm -rf /srv/openhands-agent
 
 ---
 
-## 14. Модели — варианты конфигурации
+## 14. Модели — настройка через WebUI
 
-### Вариант 1: OpenAI
+После первого входа и ввода `LOCAL_BACKEND_API_KEY`:
 
-```env
-LLM_API_KEY=sk-proj-...
-LLM_MODEL=gpt-4o
-LLM_BASE_URL=https://api.openai.com/v1
-```
+1. Открыть **Settings → LLM**
+2. Выбрать провайдера: OpenAI, Anthropic, OpenRouter, Google, или другой
+3. Ввести API-ключ
+4. Выбрать модель (например, `gpt-4o`, `claude-sonnet-4`, `anthropic/claude-sonnet-4`)
+5. Настройки сохраняются в `/home/openhands/.openhands` (permanent volume)
 
-### Вариант 2: Anthropic
-
-```env
-LLM_API_KEY=sk-ant-...
-LLM_MODEL=claude-sonnet-4-20250514
-LLM_BASE_URL=https://api.anthropic.com/v1
-```
-
-### Вариант 3: OpenRouter
-
-```env
-LLM_API_KEY=sk-or-...
-LLM_MODEL=anthropic/claude-sonnet-4
-LLM_BASE_URL=https://openrouter.ai/api/v1
-```
-
-Пользователь предоставляет: название ключа, точную модель, base URL.
+**Что нужно от пользователя:** API-ключ выбранного провайдера. Ключ вводится один раз в WebUI и сохраняется в контейнере.
 
 ---
 

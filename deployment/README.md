@@ -14,8 +14,10 @@
 
 - **Образ:** `ghcr.io/openhands/agent-canvas:1.6.1`
 - **Порт:** `10.77.0.2:8000` — только через WireGuard
+- **WebUI:** `http://10.77.0.2:8000/canvas` (base path: `/canvas`)
+- **Пользователь в контейнере:** `openhands` (uid 1000)
 - **Docker socket:** не используется (песочница = сам контейнер)
-- **Постоянные данные:** `/srv/openhands-agent/config/` + `/srv/openhands-agent/workspace/`
+- **Постоянные данные:** `/home/openhands/.openhands` (настройки) + `/projects` (workspace)
 
 ## Первый запуск
 
@@ -66,6 +68,10 @@ http://10.77.0.2:8000/canvas
 ```
 
 Ввести `LOCAL_BACKEND_API_KEY` на экране входа.
+
+## Настройка LLM
+
+После входа: **Settings → LLM** → выбрать провайдера (OpenAI/Anthropic/OpenRouter), ввести API-ключ и модель. Настройки сохраняются в `/home/openhands/.openhands`.
 
 ## Остановка
 
