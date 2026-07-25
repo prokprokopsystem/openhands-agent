@@ -1,82 +1,97 @@
 # OpenHands Agent Canvas — развёртывание
 
-## Архитектура запуска
+**Единственная инструкция установки.** Другие документы — канонические решения и архитектура.
 
-```
-systemd (openhands-agent.service)
-  ├─ ExecStartPre: validate-runtime.sh (проверка .env, wg, docker, compose)
-  └─ ExecStart: run-supervised.sh
-       ├─ docker compose up (foreground)
-       └─ health-watchdog.sh (3×unhealthy → перезапуск)
-```
+## Первая установка и изолированный тестовый запуск
 
-**Главный lifecycle:** systemd. `start.sh` — удобная оболочка для ручного теста.
+Это включает: копирование на mini-server, подготовку каталогов, создание ключа, установку systemd unit, скачивание образа, запуск контейнера, настройку LLM через WebUI, тест в пустом test-workspace.
 
-## Первый запуск (только ручной тест)
+### 1. Подготовка
 
 ```bash
-# На mini-server:
-sudo /usr/bin/bash deployment/scripts/prepare.sh
+# Копировать файлы на mini-server
+scp -r deployment/ mini-server:/srv/openhands-agent/
 
-# Создать secrets/.env
-openssl rand -base64 32 > /tmp/api-key.txt
-cat > /srv/openhands-agent/secrets/.env << 'ENVEOF'
-LOCAL_BACKEND_API_KEY=*** из /tmp/api-key.txt>
-ENVEOF
+# Создать каталоги и права
+sudo /usr/bin/bash /srv/openhands-agent/deployment/scripts/prepare.sh
+```
+
+### 2. Создание ключа
+
+```bash
+umask 077
+printf 'LOCAL_BACKEND_API_KEY=%s\n' "$(openssl rand -base64 32 | tr -d '\n')" \
+  > /srv/openhands-agent/secrets/.env
 chmod 600 /srv/openhands-agent/secrets/.env
-
-# Ручной запуск (без systemd)
-sudo /usr/bin/bash deployment/scripts/start.sh
 ```
 
-## Systemd (production)
+### 3. Установка systemd unit
 
 ```bash
-sudo cp deployment/systemd/openhands-agent.service /etc/systemd/system/
+sudo cp /srv/openhands-agent/deployment/systemd/openhands-agent.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now openhands-agent
 ```
 
-## Проверка
+### 4. Первый запуск
 
 ```bash
-sudo /usr/bin/bash deployment/scripts/status.sh
+sudo systemctl start openhands-agent.service
+sudo systemctl status openhands-agent.service
 ```
 
-## Остановка
-
-```bash
-sudo /usr/bin/bash deployment/scripts/stop.sh
-```
-
-## Полное удаление тестового запуска
-
-```bash
-sudo /usr/bin/bash deployment/scripts/purge-test.sh --confirm-destroy-test-data
-```
-
-## Доступ
+### 5. Доступ
 
 ```
 http://10.77.0.2:8000/canvas (только WireGuard)
 ```
 
-LLM настраивается через WebUI (Settings → LLM) после первого входа.
+### 6. Настройка LLM
 
-## Сетевая изоляция
+Открыть WebUI → **Settings → LLM** → выбрать провайдера (OpenAI/Anthropic/OpenRouter), ввести API-ключ и модель.
 
-Применить egress-правила:
-```bash
-sudo /usr/bin/bash deployment/network/apply-egress-rules.sh
-```
+### 7. Тест
 
-Проверить:
-```bash
-sudo /usr/bin/bash deployment/network/check-egress.sh
-```
+Проверить: чат, файлы, фото, остановку задачи, перезапуск, потребление CPU/RAM, egress-изоляцию (через check-egress.sh).
 
-## Статическая проверка
+### 8. Остановка
 
 ```bash
-/usr/bin/bash deployment/scripts/validate-static.sh
+sudo systemctl stop openhands-agent.service
 ```
+
+Данные в `config/` и `test-workspace/` сохраняются.
+
+### 9. Полное удаление
+
+```bash
+# Preview
+sudo /usr/bin/bash /srv/openhands-agent/deployment/scripts/purge-test.sh
+
+# Удаление
+sudo /usr/bin/bash /srv/openhands-agent/deployment/scripts/purge-test.sh --confirm-destroy-test-data
+```
+
+## Lifecycle
+
+```
+systemd openhands-agent.service
+  ├─ ExecStartPre: prepare.sh
+  ├─ ExecStartPre: validate-runtime.sh
+  ├─ ExecStartPre: ожидание wg0 10.77.0.2
+  ├─ ExecStartPre: docker compose config
+  ├─ ExecStartPre: docker compose create
+  ├─ ExecStartPre: apply-egress-rules.sh
+  ├─ ExecStart: run-supervised.sh (compose up + watchdog)
+  ├─ ExecStop: docker compose down
+  └─ ExecStopPost: remove-egress-rules.sh
+```
+
+## Ключевые решения
+
+- **Запуск:** только через systemd (`systemctl start/stop`). `docker compose up -d` запрещён.
+- **Firewall:** контейнер стартует ТОЛЬКО после применения egress-правил.
+- **Watchdog:** 3×unhealthy → перезапуск через systemd Restart=on-failure.
+- **Healthcheck:** `/canvas` HTTP 200 + TCP-проверка портов 18000/18001. TCP = доступность порта, не функциональная readiness API.
+- **LLM:** через WebUI, не через env.
+- **Авторизация:** `LOCAL_BACKEND_API_KEY` передаётся frontend автоматически. Экрана ручного ввода нет. Защита — WireGuard.
+- **Секреты:** только в `/srv/openhands-agent/secrets/.env` (mode 600). Не в Git.

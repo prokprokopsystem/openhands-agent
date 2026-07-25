@@ -1,119 +1,70 @@
 #!/usr/bin/bash
 # OpenHands Agent Canvas — runtime-проверка
-# Завершается с ненулевым кодом при любой ошибке.
-# Не выводит значение LOCAL_BACKEND_API_KEY.
+# Обязательный ExecStartPre для systemd.
 set -euo pipefail
 
 BASE="/srv/openhands-agent"
 COMPOSE_FILE="${BASE}/deployment/compose.yaml"
 SECRETS_FILE="${BASE}/secrets/.env"
 
+ok()   { printf '  [OK] %s\n' "$1"; }
+fail() { printf '  [FAIL] %s\n' "$1"; exit 1; }
+
 echo "=== Runtime validation ==="
 
-# --- secrets/.env ---
-if [ ! -f "${SECRETS_FILE}" ]; then
-    echo "❌ ${SECRETS_FILE} не существует"
-    exit 1
-fi
+docker info >/dev/null 2>&1 || fail "Docker недоступен"
+ok "Docker доступен"
 
-PERMS=$(stat -c "%a" "${SECRETS_FILE}" 2>/dev/null)
-if [ "${PERMS}" != "600" ]; then
-    echo "❌ ${SECRETS_FILE} права ${PERMS}, требуется 600"
-    exit 1
-fi
+docker compose version >/dev/null 2>&1 || fail "docker compose отсутствует"
+ok "docker compose"
 
-# Извлечь значение LOCAL_BACKEND_API_KEY
-KEY_VALUE=$(grep -E '^LOCAL_BACKEND_API_KEY=' "${SECRETS_FILE}" | head -1 | cut -d'=' -f2-)
+ip link show wg0 >/dev/null 2>&1 || fail "Интерфейс wg0 не существует"
+ip addr show wg0 | grep -q '10.77.0.2' || fail "Адрес 10.77.0.2 не найден на wg0"
+ok "wg0: 10.77.0.2"
 
-if [ -z "${KEY_VALUE}" ]; then
-    echo "❌ LOCAL_BACKEND_API_KEY не задан или пуст"
-    exit 1
-fi
+[ -f "${COMPOSE_FILE}" ] || fail "${COMPOSE_FILE} не существует"
+ok "compose.yaml"
 
-# Запрещённые шаблоны
-FORBIDDEN="your-generated-key-here changeme example placeholder"
-for pattern in ${FORBIDDEN}; do
-    if [ "${KEY_VALUE}" = "${pattern}" ]; then
-        echo "❌ LOCAL_BACKEND_API_KEY содержит запрещённый шаблон: ${pattern}"
-        exit 1
-    fi
-done
-
-# Проверка на ***
-if echo "${KEY_VALUE}" | grep -q '\*\*\*'; then
-    echo "❌ LOCAL_BACKEND_API_KEY содержит *** (не заменён)"
-    exit 1
-fi
-
-# Минимальная длина
-if [ ${#KEY_VALUE} -lt 16 ]; then
-    echo "❌ LOCAL_BACKEND_API_KEY слишком короткий (${#KEY_VALUE} символов, минимум 16)"
-    exit 1
-fi
-
-# Пробелы и CRLF
-if echo "${KEY_VALUE}" | grep -q '[[:space:]]'; then
-    echo "❌ LOCAL_BACKEND_API_KEY содержит пробелы/непечатные символы"
-    exit 1
-fi
-
-echo "  ✅ LOCAL_BACKEND_API_KEY задан (длина: ${#KEY_VALUE})"
-
-# --- Каталоги ---
-for d in config secrets test-workspace; do
+for d in config secrets test-workspace logs; do
     DIR="${BASE}/${d}"
-    if [ ! -d "${DIR}" ]; then
-        echo "❌ Каталог ${DIR} не существует. Запустите prepare.sh"
-        exit 1
-    fi
-    DIR_PERMS=$(stat -c "%a" "${DIR}" 2>/dev/null)
-    if [ "${DIR_PERMS}" != "700" ]; then
-        echo "❌ ${DIR} права ${DIR_PERMS}, требуется 700"
-        exit 1
-    fi
+    [ -d "${DIR}" ] || fail "${DIR} не существует. Запустите prepare.sh"
+    P=$(stat -c "%a" "${DIR}")
+    [ "${P}" = "700" ] || fail "${DIR} права ${P}, требуется 700"
 done
-echo "  ✅ Каталоги config/secrets/test-workspace: 700"
+ok "Каталоги: 700"
 
-# --- compose.yaml ---
-if [ ! -f "${COMPOSE_FILE}" ]; then
-    echo "❌ ${COMPOSE_FILE} не существует"
-    exit 1
-fi
-echo "  ✅ compose.yaml существует"
+[ -f "${SECRETS_FILE}" ] || fail "${SECRETS_FILE} не существует"
+P=$(stat -c "%a" "${SECRETS_FILE}")
+[ "${P}" = "600" ] || fail "${SECRETS_FILE} права ${P}, требуется 600"
 
-# --- WireGuard ---
-if ! ip link show wg0 >/dev/null 2>&1; then
-    echo "❌ Интерфейс wg0 не существует"
-    exit 1
-fi
-if ! ip addr show wg0 2>/dev/null | grep -q '10.77.0.2'; then
-    echo "❌ Адрес 10.77.0.2 не найден на wg0"
-    exit 1
-fi
-echo "  ✅ wg0: 10.77.0.2"
+COUNT=$(grep -cE '^LOCAL_BACKEND_API_KEY=.*' "${SECRETS_FILE}" || true)
+[ "${COUNT}" -eq 1 ] || fail "${SECRETS_FILE}: найдено ${COUNT} строк LOCAL_BACKEND_API_KEY, нужна ровно 1"
 
-# --- Docker ---
-if ! docker info >/dev/null 2>&1; then
-    echo "❌ Docker недоступен"
-    exit 1
-fi
-echo "  ✅ Docker доступен"
+KEY=$(grep -E '^LOCAL_BACKEND_API_KEY=.*' "${SECRETS_FILE}" | head -1 | cut -d'=' -f2-)
+[ -n "${KEY}" ] || fail "LOCAL_BACKEND_API_KEY пуст"
+[ ${#KEY} -ge 16 ] || fail "LOCAL_BACKEND_API_KEY слишком короткий: ${#KEY} символов, минимум 16"
 
-# --- docker compose config ---
-if ! docker compose -f "${COMPOSE_FILE}" config >/dev/null 2>&1; then
-    echo "❌ docker compose config не прошёл"
-    exit 1
-fi
-echo "  ✅ docker compose config OK"
-
-# --- Firewall-скрипты ---
-for script in apply-egress-rules.sh check-egress.sh remove-egress-rules.sh; do
-    if [ ! -f "${BASE}/deployment/network/${script}" ]; then
-        echo "❌ ${BASE}/deployment/network/${script} не существует"
-        exit 1
-    fi
+for p in your-generated-key-here changeme example placeholder; do
+    [ "${KEY}" != "${p}" ] || fail "LOCAL_BACKEND_API_KEY совпадает с шаблоном '${p}'"
 done
-echo "  ✅ Firewall-скрипты на месте"
+
+echo "${KEY}" | grep -q '\*\*\*' && fail "LOCAL_BACKEND_API_KEY содержит ***, не заменён" || true
+echo "${KEY}" | grep -q '[[:space:]]' && fail "LOCAL_BACKEND_API_KEY содержит пробелы" || true
+
+ok "LOCAL_BACKEND_API_KEY задан, длина ${#KEY}"
+
+for s in run-supervised.sh health-watchdog.sh prepare.sh; do
+    [ -f "${BASE}/deployment/scripts/${s}" ] || fail "${s} не найден"
+done
+ok "Lifecycle-скрипты"
+
+for s in apply-egress-rules.sh remove-egress-rules.sh check-egress.sh; do
+    [ -f "${BASE}/deployment/network/${s}" ] || fail "network/${s} не найден"
+done
+ok "Firewall-скрипты"
+
+docker compose -f "${COMPOSE_FILE}" config >/dev/null 2>&1 || fail "docker compose config не прошёл"
+ok "docker compose config"
 
 echo ""
 echo "=== Validation PASSED ==="

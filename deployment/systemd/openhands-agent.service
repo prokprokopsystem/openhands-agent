@@ -2,28 +2,43 @@
 Description=OpenHands Agent Canvas
 Documentation=https://github.com/prokprokopsystem/openhands-agent
 After=network-online.target docker.service wg-quick@wg0.service
-Requires=docker.service
-Requires=wg-quick@wg0.service
+Requires=docker.service wg-quick@wg0.service
 Wants=network-online.target
 
 [Service]
 Type=simple
+WorkingDirectory=/srv/openhands-agent
+TimeoutStartSec=180
+TimeoutStopSec=90
+Restart=on-failure
+RestartSec=10
 
-# Runtime-проверка перед каждым запуском (systemctl start, boot, restart)
+# Каталоги и права
+ExecStartPre=/usr/bin/bash /srv/openhands-agent/deployment/scripts/prepare.sh
+
+# Runtime-валидация: .env, ключ, wg, docker, compose
 ExecStartPre=/usr/bin/bash /srv/openhands-agent/deployment/scripts/validate-runtime.sh
+
+# Ожидание WireGuard (конечный timeout)
+ExecStartPre=/usr/bin/timeout 60 /usr/bin/bash -c 'until ip -4 addr show dev wg0 | grep -q "10.77.0.2/"; do sleep 2; done'
+
+# Проверка compose-конфигурации
+ExecStartPre=/usr/bin/docker compose -f /srv/openhands-agent/deployment/compose.yaml config --quiet
+
+# Создание контейнера и сети БЕЗ запуска
+ExecStartPre=/usr/bin/docker compose -f /srv/openhands-agent/deployment/compose.yaml create
+
+# Firewall ДО старта контейнера
+ExecStartPre=/usr/bin/bash /srv/openhands-agent/deployment/network/apply-egress-rules.sh
 
 # Supervised lifecycle: compose foreground + watchdog
 ExecStart=/usr/bin/bash /srv/openhands-agent/deployment/scripts/run-supervised.sh
 
-# Штатная остановка
-ExecStop=/usr/bin/docker compose -f /srv/openhands-agent/deployment/compose.yaml down
+# Штатная остановка: Compose down
+ExecStop=/usr/bin/docker compose -f /srv/openhands-agent/deployment/compose.yaml down --remove-orphans
 
-Restart=on-failure
-RestartSec=10
-
-# Таймауты
-TimeoutStartSec=180
-TimeoutStopSec=60
+# Снятие firewall ПОСЛЕ остановки
+ExecStopPost=/usr/bin/bash /srv/openhands-agent/deployment/network/remove-egress-rules.sh
 
 [Install]
 WantedBy=multi-user.target

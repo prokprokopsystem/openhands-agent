@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/usr/bin/bash
 # Show OpenHands service, health, resources, firewall and WireGuard status.
 set -u
 

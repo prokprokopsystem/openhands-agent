@@ -1,15 +1,15 @@
 # OpenHands Agent Canvas — Compose
 # Версия: 1.6.1
-# Digest: sha256:fc24163754bee2ab0115b117d57512cc01b4d99770e7ac17c3607e76290deeb6
-# Образ: ghcr.io/openhands/agent-canvas:1.6.1@sha256:fc24163754bee2ab0115b117d57512cc01b4d99770e7ac17c3607e76290deeb6
+# Digest linux/amd64: sha256:fc24163754bee2ab0115b117d57512cc01b4d99770e7ac17c3607e76290deeb6
 #
 # Управление lifecycle: systemd (deployment/systemd/openhands-agent.service)
-# Docker restart policy НЕ используется.
+# Docker restart policy: "no" — перезапуск через systemd Restart=on-failure
 
 services:
   openhands:
     image: ghcr.io/openhands/agent-canvas:1.6.1@sha256:fc24163754bee2ab0115b117d57512cc01b4d99770e7ac17c3607e76290deeb6
     container_name: openhands-agent
+    restart: "no"
 
     ports:
       - "10.77.0.2:8000:8000"
@@ -33,21 +33,27 @@ services:
     security_opt:
       - no-new-privileges:true
 
-    read_only: false
+    sysctls:
+      net.ipv6.conf.all.disable_ipv6: "1"
+      net.ipv6.conf.default.disable_ipv6: "1"
 
     networks:
       openhands-net:
         ipv4_address: 10.89.0.2
 
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS -o /dev/null -w '%{http_code}' http://localhost:8000/canvas | grep -q 200"]
+      test:
+        - CMD-SHELL
+        - >-
+          curl -fsS -o /dev/null http://127.0.0.1:8000/canvas &&
+          python3 -c "import socket; [(lambda s,p: (s.settimeout(3), s.connect(('127.0.0.1',p)), s.close()))(socket.socket()) for p in (18000,18001)]"
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 60s
+      start_period: 90s
 
     logging:
-      driver: "json-file"
+      driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
@@ -56,6 +62,8 @@ networks:
   openhands-net:
     driver: bridge
     name: openhands-net
+    enable_ipv6: false
     ipam:
       config:
         - subnet: 10.89.0.0/28
+          gateway: 10.89.0.1

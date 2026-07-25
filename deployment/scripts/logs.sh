@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/bash
 # OpenHands Agent Canvas — логи
 COMPOSE_FILE="/srv/openhands-agent/deployment/compose.yaml"
 cd /srv/openhands-agent

@@ -1,6 +1,6 @@
 #!/usr/bin/bash
-# OpenHands Agent Canvas — статическая проверка
-# Работает без runtime .env и без mini-server.
+# OpenHands Agent Canvas — статическая валидация
+# Работает на чистом checkout без /srv/openhands-agent/secrets/.env
 # Завершается с ненулевым кодом при любой ошибке.
 set -euo pipefail
 
@@ -10,134 +10,147 @@ cd "${PROJECT_ROOT}"
 PASSED=0
 FAILED=0
 
-pass() { echo "  ✅ $1"; PASSED=$((PASSED + 1)); }
-fail() { echo "  ❌ $1"; FAILED=$((FAILED + 1)); }
+pass() { printf '  [OK] %s\n' "$1"; PASSED=$((PASSED + 1)); }
+fail() { printf '  [FAIL] %s\n' "$1"; FAILED=$((FAILED + 1)); }
 
 echo "=== Static validation ==="
 echo ""
 
-# 1. Shell syntax
-echo "--- Shell syntax (bash -n) ---"
+# ── 1. Shell syntax ──
+echo "--- Shell syntax ---"
 for f in deployment/scripts/*.sh deployment/network/*.sh; do
-    if bash -n "$f" 2>/dev/null; then
-        pass "$f"
-    else
-        fail "$f"
-    fi
+    bash -n "$f" 2>/dev/null && pass "$f" || fail "$f: bash -n"
 done
 
-# 2. Executable bits
+# ── 2. Executable bits ──
 echo ""
 echo "--- Executable bits ---"
 for f in deployment/scripts/*.sh deployment/network/*.sh; do
-    if [ -x "$f" ]; then
-        pass "$f (executable)"
-    else
-        fail "$f (NOT executable)"
-    fi
+    [ -x "$f" ] && pass "$f" || fail "$f: NOT executable"
 done
 
-# 3. No restart policy in compose
+# ── 3. Shebang ──
 echo ""
-echo "--- Compose: no restart policy ---"
-if grep -q 'restart:' deployment/compose.yaml 2>/dev/null; then
-    fail "compose.yaml содержит restart: (должен управляться systemd)"
-else
-    pass "compose.yaml: без restart:"
-fi
+echo "--- Shebang consistency ---"
+for f in deployment/scripts/*.sh deployment/network/*.sh; do
+    head -1 "$f" | grep -qE '^#!/usr/bin/(env bash|bash)$' && pass "$f: shebang" || fail "$f: wrong shebang"
+done
 
-# 4. Systemd: validate-runtime ExecStartPre
+# ── 4. Compose: no restart ──
 echo ""
-echo "--- Systemd: ExecStartPre validate-runtime ---"
-if grep -q 'ExecStartPre=.*validate-runtime.sh' deployment/systemd/openhands-agent.service 2>/dev/null; then
-    pass "systemd unit: ExecStartPre validate-runtime.sh"
-else
-    fail "systemd unit: отсутствует ExecStartPre validate-runtime.sh"
-fi
+echo "--- Compose invariants ---"
+grep -q 'restart:.*"no"' deployment/compose.yaml && pass "restart: no" || fail "restart: должно быть \"no\""
+grep -q 'docker.sock' deployment/compose.yaml && fail "docker.sock найден в compose" || pass "docker.sock отсутствует"
+grep -q 'test-workspace' deployment/compose.yaml && pass "test-workspace : не общий workspace" || fail "нет test-workspace"
+grep -q 'enable_ipv6: false' deployment/compose.yaml && pass "IPv6 отключён : сеть" || fail "IPv6 не отключён в сети"
+grep -q 'disable_ipv6' deployment/compose.yaml && pass "IPv6 отключён : sysctl" || fail "IPv6 sysctl отсутствует"
+grep -q 'sha256:fc24163754bee' deployment/compose.yaml && pass "digest зафиксирован" || fail "digest отсутствует"
 
-# 5. Systemd: watchdog
+# ── 5. Systemd invariants ──
 echo ""
-echo "--- Systemd: watchdog ---"
-if grep -q 'health-watchdog\|run-supervised' deployment/systemd/openhands-agent.service 2>/dev/null; then
-    pass "systemd unit: watchdog/supervised lifecycle"
-else
-    fail "systemd unit: отсутствует watchdog"
-fi
+echo "--- Systemd invariants ---"
+SVC="deployment/systemd/openhands-agent.service"
+grep -q 'ExecStartPre=.*validate-runtime.sh' "${SVC}" && pass "ExecStartPre: validate-runtime" || fail "ExecStartPre: нет validate-runtime"
+grep -q 'ExecStartPre=.*compose.*create' "${SVC}" && pass "ExecStartPre: compose create" || fail "ExecStartPre: нет compose create"
+grep -q 'ExecStartPre=.*apply-egress-rules' "${SVC}" && pass "ExecStartPre: apply-egress-rules" || fail "ExecStartPre: нет apply-egress-rules"
+grep -q 'ExecStart=.*run-supervised' "${SVC}" && pass "ExecStart: run-supervised" || fail "ExecStart: не run-supervised"
+grep -q 'ExecStopPost=.*remove-egress-rules' "${SVC}" && pass "ExecStopPost: remove-egress-rules" || fail "ExecStopPost: нет remove-egress-rules"
 
-# 6. Secrets check
+# ── 6. No direct docker compose up -d ──
+echo ""
+echo "--- No direct compose launch ---"
+grep -r 'docker compose up' deployment/scripts/start.sh 2>/dev/null && fail "start.sh содержит docker compose up" || pass "start.sh: без docker compose up"
+grep -r 'systemctl start' deployment/scripts/start.sh 2>/dev/null && pass "start.sh: systemctl start" || fail "start.sh: нет systemctl start"
+grep -r 'systemctl stop' deployment/scripts/stop.sh 2>/dev/null && pass "stop.sh: systemctl stop" || fail "stop.sh: нет systemctl stop"
+
+# ── 7. Purge invariants ──
+echo ""
+echo "--- Purge invariants ---"
+grep -q '\${1:-}' deployment/scripts/purge-test.sh && pass "purge: \${1:-}" || fail "purge: нет \${1:-}"
+grep -q 'systemctl stop' deployment/scripts/purge-test.sh && pass "purge: systemctl stop" || fail "purge: нет systemctl stop"
+grep -q 'systemctl disable' deployment/scripts/purge-test.sh && pass "purge: systemctl disable" || fail "purge: нет systemctl disable"
+
+# ── 8. Firewall invariants ──
+echo ""
+echo "--- Firewall invariants ---"
+FW="deployment/network/apply-egress-rules.sh"
+grep -q 'OPENHANDS-EGRESS' "${FW}" && pass "firewall: OPENHANDS-EGRESS" || fail "firewall: нет OPENHANDS-EGRESS"
+grep -q 'OPENHANDS-INPUT' "${FW}" && pass "firewall: OPENHANDS-INPUT" || fail "firewall: нет OPENHANDS-INPUT"
+grep -q 'ESTABLISHED,RELATED' "${FW}" && pass "firewall: ESTABLISHED,RELATED" || fail "firewall: нет ESTABLISHED,RELATED"
+grep -q '\-j DROP' "${FW}" && pass "firewall: финальный DROP" || fail "firewall: нет финального DROP"
+grep -q '95.217.239.148' "${FW}" && pass "firewall: VPS заблокирован" || fail "firewall: VPS не заблокирован"
+
+# ── 9. Secrets ──
 echo ""
 echo "--- Secrets ---"
-SECRETS=$(grep -rn 'ghp_\|sk-or-\|sk-ant\|sk-proj\|Bearer [A-Za-z0-9]\|password\s*=\s*[A-Za-z0-9]' --include="*.md" --include="*.yaml" --include="*.sh" --include="*.service" . 2>/dev/null | grep -v '.git/\|.example\|your-\|openssl\|\*\*\*\|LOCAL_BACKEND_API_KEY' || true)
-if [ -z "${SECRETS}" ]; then
-    pass "Секреты не найдены"
-else
-    fail "Найдены возможные секреты: ${SECRETS}"
-fi
+SECRETS=$(grep -rn 'ghp_\|sk-or-\|sk-ant\|sk-proj\|Bearer [A-Za-z0-9]\{10\}' --include="*.md" --include="*.yaml" --include="*.sh" --include="*.service" . 2>/dev/null | grep -v '.git/\|.example\|your-\|openssl\|placeholder\|p...ab' || true)
+[ -z "${SECRETS}" ] && pass "Секреты не найдены" || fail "Возможные секреты: ${SECRETS}"
 
-# 7. docker compose config (с фиктивным .env) — пропустить если нет compose
+# ── 10. No LLM env vars ──
+echo ""
+echo "--- LLM env vars ---"
+LLM=$(grep -rn 'LLM_API_KEY\|LLM_MODEL\|LLM_BASE_URL' --include="*.md" --include="*.yaml" --include="*.sh" --include="*.example" --include="*.service" . 2>/dev/null | grep -v 'не являются\|НЕ через\|через WebUI\|настраиваются\|не переменные\|запрещ\|\.git/\|LLM_API_KEY/LLM_MODEL') || true
+[ -z "${LLM}" ] && pass "LLM_API_KEY/LLM_MODEL/LLM_BASE_URL: 0 в runtime" || fail "LLM-переменные: ${LLM}"
+
+# ── 11. Docker compose config ──
 echo ""
 echo "--- docker compose config ---"
-if docker compose version >/dev/null 2>&1 || docker-compose version >/dev/null 2>&1; then
-    TEMP_ENV=$(mktemp)
-    trap "rm -f ${TEMP_ENV}" EXIT
-    echo "LOCAL_BACKEND_API_KEY=***--p...ab" > "${TEMP_ENV}"
-
-    if docker compose -f deployment/compose.yaml --env-file "${TEMP_ENV}" config >/dev/null 2>&1; then
+if docker compose version >/dev/null 2>&1; then
+    TMPDIR=$(mktemp -d)
+    trap "rm -rf ${TMPDIR}" EXIT
+    printf "LOCAL_BACKEND_API_KEY=placeholder-static-check-only
+" > "${TMPDIR}/.env"
+    if docker compose -f deployment/compose.yaml --env-file "${TMPDIR}/.env" config >/dev/null 2>&1; then
         pass "docker compose config"
     else
         fail "docker compose config"
     fi
 else
-    echo "  ⏭️  docker compose недоступен — пропуск (ожидаемо вне mini-server)"
+    echo "  [SKIP] docker compose недоступен"
 fi
 
-# 8. systemd-analyze verify
+# ── 12. systemd-analyze ──
 echo ""
 echo "--- systemd-analyze verify ---"
 if command -v systemd-analyze >/dev/null 2>&1; then
-    RESULT=$(systemd-analyze verify deployment/systemd/openhands-agent.service 2>&1 || true)
-    # Ожидаемые предупреждения о несуществующих runtime-путях
-    WARNINGS=$(echo "${RESULT}" | grep -cE '^deployment/|does not exist|cannot stat' || true)
-    ERRORS=$(echo "${RESULT}" | grep -cE 'Failed|Error|error:|missing' || true)
-    if echo "${RESULT}" | grep -qi 'Failed\|Error'; then
-        # Проверить — настоящая ошибка или ожидаемое предупреждение о путях
-        REAL_ERRORS=$(echo "${RESULT}" | grep -vE 'does not exist|cannot stat|No such file' | grep -cE 'Failed|Error|error:|missing' || true)
-        if [ "${REAL_ERRORS}" -gt 0 ]; then
-            fail "systemd-analyze: настоящие ошибки"
+    RESULT=$(systemd-analyze verify "${SVC}" 2>&1 || true)
+    if echo "${RESULT}" | grep -qiE 'Failed|Error'; then
+        REAL=$(echo "${RESULT}" | grep -vE 'does not exist|cannot stat|No such file' | grep -ciE 'Failed|Error' || true)
+        if [ "${REAL}" -gt 0 ]; then
+            fail "systemd-analyze: ошибки"
             echo "${RESULT}"
         else
-            pass "systemd-analyze verify (ожидаемые предупреждения о runtime-путях)"
+            pass "systemd-analyze : ожидаемые предупреждения о путях"
         fi
     else
         pass "systemd-analyze verify"
     fi
 else
-    echo "  ⏭️  systemd-analyze недоступен (не на systemd-хосте)"
+    echo "  [SKIP] systemd-analyze недоступен"
 fi
 
-# 9. Path consistency
+# ── 13. Docs: no manual compose launch ──
+echo ""
+echo "--- Docs: no manual compose ---"
+grep -r 'docker compose up' deployment/README.md 2>/dev/null | grep -v 'запрещ\|ЗАПРЕЩ\|forbidden' >/dev/null && fail "README: docker compose up" || pass "README: без docker compose up"
+grep -r 'systemctl start' deployment/README.md 2>/dev/null && pass "README: systemctl start" || fail "README: нет systemctl start"
+
+# ── 14. Docs: no key entry screen claim ──
+echo ""
+echo "--- Docs: no manual key screen ---"
+grep -ri 'ввести.*LOCAL_BACKEND_API_KEY\|экран.*ввода.*ключа\|enter.*API key' deployment/README.md docs/Решения.md docs/Состояние.md 2>/dev/null && fail "Документация: экран ввода ключа" || pass "Документация: без экрана ввода ключа"
+
+# ── 15. Supervisor invariants ──
+echo ""
+echo "--- Supervisor invariants ---"
+grep -q 'wait.*|| true.*EXIT=' deployment/scripts/run-supervised.sh 2>/dev/null && fail "supervisor: wait ... || true" || pass "supervisor: без wait ... || true"
+grep -q 'EXIT_CODE' deployment/scripts/run-supervised.sh 2>/dev/null && pass "supervisor: exit code сохраняется" || fail "supervisor: нет EXIT_CODE"
+
+# ── 16. Path consistency ──
 echo ""
 echo "--- Path consistency ---"
-ERRORS=0
-grep -rh '/srv/openhands-agent' deployment/ --include="*.sh" --include="*.service" --include="*.yaml" 2>/dev/null | grep -v '^#' | while read -r line; do :; done
-# Проверить, что пути консистентны
-if grep -q '/srv/openhands-agent' deployment/compose.yaml deployment/systemd/openhands-agent.service; then
-    pass "Пути консистентны (/srv/openhands-agent)"
-else
-    fail "Не найдены пути /srv/openhands-agent в ключевых файлах"
-fi
-
-# 10. Subnet consistency
-echo ""
-echo "--- Subnet consistency ---"
-if grep -q '10.89.0.0/28' deployment/compose.yaml && grep -q '10.89.0.0/28' deployment/network/apply-egress-rules.sh; then
-    pass "Подсеть 10.89.0.0/28 консистентна"
-else
-    fail "Подсеть не консистентна"
-fi
+grep -q '/srv/openhands-agent' deployment/compose.yaml deployment/systemd/openhands-agent.service 2>/dev/null && pass "Пути консистентны" || fail "Пути не консистентны"
 
 echo ""
 echo "=== Результат: ${PASSED} passed, ${FAILED} failed ==="
-if [ "${FAILED}" -gt 0 ]; then
-    exit 1
-fi
+[ "${FAILED}" -eq 0 ] || exit 1
