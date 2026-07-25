@@ -1,15 +1,10 @@
-#!/bin/bash
-# OpenHands Agent Canvas — остановка
-# Состояние сохраняется в config/ и test-workspace/.
-set -e
+#!/usr/bin/env bash
+# Stop OpenHands through systemd. Runtime data is preserved.
+set -Eeuo pipefail
 
-COMPOSE_FILE="/srv/openhands-agent/deployment/compose.yaml"
-cd /srv/openhands-agent
+UNIT="openhands-agent.service"
+systemctl cat "${UNIT}" >/dev/null 2>&1 || { echo "ERROR: ${UNIT} is not installed" >&2; exit 1; }
 
-echo "=== OpenHands Agent Canvas — остановка ==="
-docker compose -f "${COMPOSE_FILE}" down
-
-echo ""
-echo "Контейнер остановлен."
-echo "Состояние сохранено: /srv/openhands-agent/config/"
-echo "Workspace сохранён: /srv/openhands-agent/test-workspace/"
+sudo systemctl stop "${UNIT}"
+echo "OpenHands stopped. Firewall rules were removed by ExecStopPost."
+echo "Preserved: /srv/openhands-agent/config and test-workspace"
