@@ -35,9 +35,7 @@ iptables -I INPUT 1 -s "${SUBNET}" -j "${INPUT_CHAIN}"
 # Preserve replies to connections initiated from outside the container.
 iptables -A "${EGRESS_CHAIN}" -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
 
-# DNS is allowed. Private/internal destinations are denied before web access.
-iptables -A "${EGRESS_CHAIN}" -p udp --dport 53 -j RETURN
-iptables -A "${EGRESS_CHAIN}" -p tcp --dport 53 -j RETURN
+# Internal/private destinations are denied before any service allow-list.
 iptables -A "${EGRESS_CHAIN}" -d 127.0.0.0/8 -j DROP
 iptables -A "${EGRESS_CHAIN}" -d 169.254.0.0/16 -j DROP
 iptables -A "${EGRESS_CHAIN}" -d 10.0.0.0/8 -j DROP
@@ -45,6 +43,10 @@ iptables -A "${EGRESS_CHAIN}" -d 172.16.0.0/12 -j DROP
 iptables -A "${EGRESS_CHAIN}" -d 192.168.0.0/16 -j DROP
 iptables -A "${EGRESS_CHAIN}" -d 100.64.0.0/10 -j DROP
 iptables -A "${EGRESS_CHAIN}" -d "${VPS_IP}/32" -j DROP
+
+# Only public DNS and web traffic are allowed; everything else is denied.
+iptables -A "${EGRESS_CHAIN}" -p udp --dport 53 -j RETURN
+iptables -A "${EGRESS_CHAIN}" -p tcp --dport 53 -j RETURN
 iptables -A "${EGRESS_CHAIN}" -p tcp -m multiport --dports 80,443 -j RETURN
 iptables -A "${EGRESS_CHAIN}" -j DROP
 
