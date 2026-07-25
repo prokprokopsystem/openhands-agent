@@ -9,6 +9,15 @@ cd "${PROJECT_ROOT}"
 
 PASSED=0
 FAILED=0
+VALIDATION_TMP=$(mktemp -d)
+COMPOSE_RENDERED=false
+RENDERED_COMPOSE_JSON=""
+
+cleanup_validation() {
+    rm -rf "${VALIDATION_TMP}"
+}
+
+trap cleanup_validation EXIT
 
 pass() { printf '  [OK] %s\n' "$1"; PASSED=$((PASSED + 1)); }
 fail() { printf '  [FAIL] %s\n' "$1"; FAILED=$((FAILED + 1)); }
@@ -92,18 +101,21 @@ echo "--- LLM env vars ---"
 LLM=$(grep -rn 'LLM_API_KEY\|LLM_MODEL\|LLM_BASE_URL' --include="*.md" --include="*.yaml" --include="*.sh" --include="*.example" --include="*.service" . 2>/dev/null | grep -v 'не являются\|НЕ через\|через WebUI\|настраиваются\|не переменные\|запрещ\|\.git/\|LLM_API_KEY/LLM_MODEL') || true
 [ -z "${LLM}" ] && pass "LLM_API_KEY/LLM_MODEL/LLM_BASE_URL: 0 в runtime" || fail "LLM-переменные: ${LLM}"
 
-# ── 11. Docker compose config ──
+# ── 11. Docker compose config from a clean checkout ──
 echo ""
 echo "--- docker compose config ---"
 if docker compose version >/dev/null 2>&1; then
-    TMPDIR=$(mktemp -d)
-    trap "rm -rf ${TMPDIR}" EXIT
-    printf "LOCAL_BACKEND_API_KEY=placeholder-static-check-only
-" > "${TMPDIR}/.env"
-    if docker compose -f deployment/compose.yaml --env-file "${TMPDIR}/.env" config >/dev/null 2>&1; then
-        pass "docker compose config"
+    COMPOSE_TMP=$(mktemp -d "${VALIDATION_TMP}/compose.XXXXXX")
+    cp deployment/compose.yaml "${COMPOSE_TMP}/compose.yaml"
+    printf '%s\n' 'LOCAL_BACKEND_API_KEY=placeholder-static-check-only' > "${COMPOSE_TMP}/test.env"
+    sed -i "s|/srv/openhands-agent/secrets/.env|${COMPOSE_TMP}/test.env|" "${COMPOSE_TMP}/compose.yaml"
+    RENDERED_COMPOSE_JSON="${COMPOSE_TMP}/rendered-compose.json"
+
+    if docker compose -f "${COMPOSE_TMP}/compose.yaml" config --format json > "${RENDERED_COMPOSE_JSON}" 2>/dev/null; then
+        COMPOSE_RENDERED=true
+        pass "docker compose config: clean checkout with controlled env_file substitution"
     else
-        fail "docker compose config"
+        fail "docker compose config: clean checkout"
     fi
 else
     echo "  [SKIP] docker compose недоступен"
@@ -113,17 +125,20 @@ fi
 echo ""
 echo "--- systemd-analyze verify ---"
 if command -v systemd-analyze >/dev/null 2>&1; then
-    RESULT=$(systemd-analyze verify "${SVC}" 2>&1 || true)
-    if echo "${RESULT}" | grep -qiE 'Failed|Error'; then
-        REAL=$(echo "${RESULT}" | grep -vE 'does not exist|cannot stat|No such file' | grep -ciE 'Failed|Error' || true)
-        if [ "${REAL}" -gt 0 ]; then
-            fail "systemd-analyze: ошибки"
-            echo "${RESULT}"
-        else
-            pass "systemd-analyze : ожидаемые предупреждения о путях"
-        fi
+    set +e
+    RESULT=$(systemd-analyze verify "${SVC}" 2>&1)
+    SYSTEMD_VERIFY_RC=$?
+    set -e
+    REAL=$(
+        echo "${RESULT}" \
+            | grep -vE 'does not exist|cannot stat|No such file|Failed to create .*: Unit (docker\.service|wg-quick@wg0\.service) not found\.' \
+            || true
+    )
+    if [ "${SYSTEMD_VERIFY_RC}" -eq 0 ] || [ -z "${REAL}" ]; then
+        pass "systemd-analyze verify (внешние docker/wg-quick units могут отсутствовать на машине ревью)"
     else
-        pass "systemd-analyze verify"
+        fail "systemd-analyze: ошибки"
+        echo "${RESULT}"
     fi
 else
     echo "  [SKIP] systemd-analyze недоступен"
@@ -140,165 +155,280 @@ echo ""
 echo "--- Docs: no manual key screen ---"
 grep -ri 'ввести.*LOCAL_BACKEND_API_KEY\|экран.*ввода.*ключа\|enter.*API key' deployment/README.md docs/Решения.md docs/Состояние.md 2>/dev/null && fail "Документация: экран ввода ключа" || pass "Документация: без экрана ввода ключа"
 
-# ── 15. Healthcheck: real Python syntax test from compose ──
+# ── 15. Healthcheck from rendered Compose ──
 echo ""
-echo "--- Healthcheck Python test ---"
-# Извлечь Python-код из compose.yaml (строка с 'python3 -c')
-HC_LINE=$(grep 'python3 -c' deployment/compose.yaml | head -1)
-if [ -z "${HC_LINE}" ]; then
-    fail "healthcheck: не найден python3 -c в compose.yaml"
+echo "--- Rendered healthcheck ---"
+if ! ${COMPOSE_RENDERED}; then
+    fail "healthcheck: rendered Compose недоступен"
 else
-    # Извлечь код между 'python3 -c' и конца строки
-    HC_CMD=$(echo "${HC_LINE}" | sed 's/.*python3 -c "\(.*\)"/\1/')
-    if [ -z "${HC_CMD}" ]; then
-        # Попробовать без кавычек
-        HC_CMD=$(echo "${HC_LINE}" | sed "s/.*python3 -c //")
-    fi
-    # Проверить: однострочник, не for-in (который YAML свернёт)
-    if echo "${HC_CMD}" | grep -q 'for p'; then
-        fail "healthcheck: использует 'for p' — YAML свернёт в SyntaxError"
-    elif echo "${HC_CMD}" | grep -q 'create_connection'; then
-        # Проверить синтаксис: скомпилировать, не исполнять
-        python3 -c "compile('''${HC_CMD}''', '<healthcheck>', 'exec')" 2>/dev/null \
-            && pass "healthcheck: Python синтаксис корректен" \
-            || fail "healthcheck: Python SyntaxError"
+    if python3 - "${RENDERED_COMPOSE_JSON}" <<'PY'
+import json
+import shlex
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    rendered = json.load(stream)
+
+test = rendered["services"]["openhands"]["healthcheck"]["test"]
+if not isinstance(test, list) or len(test) != 2 or test[0] != "CMD-SHELL":
+    raise SystemExit("healthcheck.test was not rendered as [CMD-SHELL, command]")
+
+command = test[1]
+canvas_position = command.find("/canvas")
+port_18000_position = command.find("18000")
+port_18001_position = command.find("18001")
+if min(canvas_position, port_18000_position, port_18001_position) < 0:
+    raise SystemExit("rendered healthcheck is missing /canvas, 18000 or 18001")
+if canvas_position > min(port_18000_position, port_18001_position):
+    raise SystemExit("/canvas must be checked before backend TCP listeners")
+
+tokens = shlex.split(command)
+python_index = tokens.index("python3")
+if tokens[python_index + 1] != "-c":
+    raise SystemExit("rendered healthcheck lost python3 -c")
+compile(tokens[python_index + 2], "<rendered-healthcheck>", "exec")
+PY
+    then
+        pass "healthcheck: rendered quoting, /canvas order, ports 18000/18001 and Python syntax"
     else
-        fail "healthcheck: не использует create_connection"
+        fail "healthcheck: rendered command validation"
     fi
 fi
 
 # ── 16. Supervisor: real behavioral tests ──
 echo ""
 echo "--- Supervisor behavioral tests ---"
-TMPDIR=$(mktemp -d)
-trap "rm -rf ${TMPDIR}" EXIT
+SUPERVISOR_TEST_ROOT=$(mktemp -d "${VALIDATION_TMP}/supervisor.XXXXXX")
+MOCK_DOCKER="${SUPERVISOR_TEST_ROOT}/mock-docker"
+MOCK_WATCHDOG="${SUPERVISOR_TEST_ROOT}/mock-watchdog"
 
-# Mock docker: compose up → exit 7, compose down → OK
-cat > "${TMPDIR}/mock-docker" << 'EOF'
+cat > "${MOCK_DOCKER}" <<'EOF'
 #!/usr/bin/bash
-PIDFILE="/tmp/oh-test-compose-up.pid"
+set -euo pipefail
+
 if [ "$1" = "compose" ] && [ "${4:-}" = "up" ]; then
-    echo "mock compose up"
-    exit 7
+    printf '%s\n' "$$" > "${MOCK_PID_DIR}/compose.pid"
+    exec python3 -c 'import os, sys, time; time.sleep(float(os.environ["MOCK_COMPOSE_DELAY"])); sys.exit(int(os.environ["MOCK_COMPOSE_RC"]))'
 elif [ "$1" = "compose" ] && [ "${4:-}" = "down" ]; then
-    echo "mock compose down"
-    # Если compose-up ещё жив — убить его
-    if [ -f "${PIDFILE}" ]; then
-        kill "$(cat "${PIDFILE}")" 2>/dev/null || true
-        rm -f "${PIDFILE}"
+    : > "${MOCK_PID_DIR}/compose-down.called"
+    if [ -f "${MOCK_PID_DIR}/compose.pid" ]; then
+        kill -TERM "$(cat "${MOCK_PID_DIR}/compose.pid")" 2>/dev/null || true
     fi
     exit 0
 fi
-exit 0
+
+exit 2
 EOF
-chmod +x "${TMPDIR}/mock-docker"
+chmod +x "${MOCK_DOCKER}"
 
-# Mock watchdog
-cat > "${TMPDIR}/mock-watchdog" << 'EOF'
+cat > "${MOCK_WATCHDOG}" <<'EOF'
 #!/usr/bin/bash
-echo "mock watchdog ok"
-exit 0
+set -euo pipefail
+printf '%s\n' "$$" > "${MOCK_PID_DIR}/watchdog.pid"
+exec python3 -c 'import os, sys, time; time.sleep(float(os.environ["MOCK_WATCHDOG_DELAY"])); sys.exit(int(os.environ["MOCK_WATCHDOG_RC"]))'
 EOF
-chmod +x "${TMPDIR}/mock-watchdog"
+chmod +x "${MOCK_WATCHDOG}"
 
-cat > "${TMPDIR}/mock-watchdog-fail" << 'EOF'
-#!/usr/bin/bash
-echo "mock watchdog fail"
-exit 8
-EOF
-chmod +x "${TMPDIR}/mock-watchdog-fail"
+wait_for_pid_files() {
+    local case_dir="$1"
+    local attempt
 
-# Mock compose.yaml
-echo 'services: {openhands: {image: "alpine:latest", command: ["sleep","999"]}}' > "${TMPDIR}/compose.yaml"
+    for attempt in $(seq 1 100); do
+        if [ -s "${case_dir}/compose.pid" ] && [ -s "${case_dir}/watchdog.pid" ]; then
+            return 0
+        fi
+        sleep 0.05
+    done
+    return 1
+}
 
-# Тест 1: compose exit 7 → supervisor exit != 0
-echo "  Test 1: compose fail..."
-COMPOSE_FILE="${TMPDIR}/compose.yaml" \
-WATCHDOG="${TMPDIR}/mock-watchdog" \
-DOCKER_BIN="${TMPDIR}/mock-docker" \
-    timeout 10 /usr/bin/bash deployment/scripts/run-supervised.sh || RC1=$?
-[ "${RC1}" -ne 0 ] && pass "compose exit 7 → supervisor non-zero (rc=${RC1})" \
-    || fail "compose exit 7 → supervisor exit ${RC1}, expected non-zero"
+wait_for_process_exit() {
+    local pid="$1"
+    local attempt
 
-# Тест 2: watchdog exit 8 → supervisor exit != 0
-echo "  Test 2: watchdog fail..."
-# compose-up должен спать, чтобы watchdog умер первым
-cat > "${TMPDIR}/mock-docker-sleep-up" << 'SCRIPT'
-#!/usr/bin/bash
-PIDFILE="/tmp/oh-test-compose-up.pid"
-if [ "$1" = "compose" ] && [ "${4:-}" = "up" ]; then
-    echo "mock compose up, sleeping"
-    sleep 30 &
-    echo $! > "${PIDFILE}"
-    wait
-    exit 0
-elif [ "$1" = "compose" ] && [ "${4:-}" = "down" ]; then
-    echo "mock compose down"
-    if [ -f "${PIDFILE}" ]; then
-        kill "$(cat "${PIDFILE}")" 2>/dev/null || true
-        rm -f "${PIDFILE}"
+    for attempt in $(seq 1 200); do
+        if ! kill -0 "${pid}" 2>/dev/null; then
+            return 0
+        fi
+        sleep 0.05
+    done
+    return 1
+}
+
+mock_children_stopped() {
+    local case_dir="$1"
+    local child_pid
+
+    for child_name in compose watchdog; do
+        [ -s "${case_dir}/${child_name}.pid" ] || return 1
+        child_pid=$(cat "${case_dir}/${child_name}.pid")
+        if kill -0 "${child_pid}" 2>/dev/null; then
+            return 1
+        fi
+    done
+}
+
+collected_once() {
+    local log_file="$1"
+    [ "$(grep -c 'compose collected exit=' "${log_file}" || true)" -eq 1 ] &&
+        [ "$(grep -c 'watchdog collected exit=' "${log_file}" || true)" -eq 1 ]
+}
+
+run_failure_case() {
+    local name="$1"
+    local compose_rc="$2"
+    local compose_delay="$3"
+    local watchdog_rc="$4"
+    local watchdog_delay="$5"
+    local expected_compose_log="$6"
+    local expected_watchdog_log="$7"
+    local expect_compose_down="$8"
+    local case_dir
+    local supervisor_pid
+    local supervisor_rc=0
+
+    case_dir=$(mktemp -d "${SUPERVISOR_TEST_ROOT}/${name}.XXXXXX")
+    printf '%s\n' 'services: {}' > "${case_dir}/compose.yaml"
+
+    MOCK_PID_DIR="${case_dir}" \
+    MOCK_COMPOSE_RC="${compose_rc}" \
+    MOCK_COMPOSE_DELAY="${compose_delay}" \
+    MOCK_WATCHDOG_RC="${watchdog_rc}" \
+    MOCK_WATCHDOG_DELAY="${watchdog_delay}" \
+    COMPOSE_FILE="${case_dir}/compose.yaml" \
+    WATCHDOG="${MOCK_WATCHDOG}" \
+    DOCKER_BIN="${MOCK_DOCKER}" \
+    SUPERVISOR_POLL_INTERVAL=0.05 \
+    SUPERVISOR_TERM_TIMEOUT=2 \
+        /usr/bin/bash deployment/scripts/run-supervised.sh > "${case_dir}/supervisor.log" 2>&1 &
+    supervisor_pid=$!
+
+    if ! wait_for_pid_files "${case_dir}"; then
+        fail "${name}: mock PID files not created"
+        kill -KILL "${supervisor_pid}" 2>/dev/null || true
+        wait "${supervisor_pid}" 2>/dev/null || true
+        return
     fi
-    exit 0
-fi
-exit 0
-SCRIPT
-chmod +x "${TMPDIR}/mock-docker-sleep-up"
 
-COMPOSE_FILE="${TMPDIR}/compose.yaml" \
-WATCHDOG="${TMPDIR}/mock-watchdog-fail" \
-DOCKER_BIN="${TMPDIR}/mock-docker-sleep-up" \
-    timeout 15 /usr/bin/bash deployment/scripts/run-supervised.sh || RC2=$?
-[ "${RC2}" -ne 0 ] && pass "watchdog exit 8 → supervisor non-zero (rc=${RC2})" \
-    || fail "watchdog exit 8 → supervisor exit ${RC2}, expected non-zero"
-
-# Тест 3: SIGTERM → supervisor завершается (timeout убивает)
-echo "  Test 3: SIGTERM..."
-cat > "${TMPDIR}/mock-docker-sleep" << 'SCRIPT'
-#!/usr/bin/bash
-PIDFILE="/tmp/oh-test-compose-up.pid"
-if [ "$1" = "compose" ] && [ "${4:-}" = "up" ]; then
-    echo "mock compose up, sleeping"
-    sleep 30 &
-    echo $! > "${PIDFILE}"
-    wait
-    exit 0
-elif [ "$1" = "compose" ] && [ "${4:-}" = "down" ]; then
-    echo "mock compose down"
-    if [ -f "${PIDFILE}" ]; then
-        kill "$(cat "${PIDFILE}")" 2>/dev/null || true
-        rm -f "${PIDFILE}"
+    if ! wait_for_process_exit "${supervisor_pid}"; then
+        fail "${name}: supervisor timed out"
+        kill -TERM "${supervisor_pid}" 2>/dev/null || true
+        sleep 0.2
+        kill -KILL "${supervisor_pid}" 2>/dev/null || true
     fi
-    exit 0
-fi
-exit 0
-SCRIPT
-chmod +x "${TMPDIR}/mock-docker-sleep"
 
-cat > "${TMPDIR}/mock-watchdog-sleep" << 'SCRIPT'
-#!/usr/bin/bash
-echo "mock watchdog sleeping"
-sleep 30
-exit 0
-SCRIPT
-chmod +x "${TMPDIR}/mock-watchdog-sleep"
+    set +e
+    wait "${supervisor_pid}"
+    supervisor_rc=$?
+    set -e
 
-COMPOSE_FILE="${TMPDIR}/compose.yaml" \
-WATCHDOG="${TMPDIR}/mock-watchdog-sleep" \
-DOCKER_BIN="${TMPDIR}/mock-docker-sleep" \
-    timeout 10 /usr/bin/bash deployment/scripts/run-supervised.sh || RC3=$?
-# timeout убивает supervisor, supervisor ловит SIGTERM → cleanup → exit 0
-# timeout возвращает: 124 если истекло, или код дочернего процесса
-if [ "${RC3}" -eq 0 ] || [ "${RC3}" -eq 124 ]; then
-    pass "SIGTERM → exit ${RC3} (штатное завершение)"
+    if [ "${supervisor_rc}" -ne 0 ] && [ "${supervisor_rc}" -ne 124 ]; then
+        pass "${name}: supervisor non-zero (rc=${supervisor_rc})"
+    else
+        fail "${name}: supervisor rc=${supervisor_rc}, expected non-zero and not 124"
+    fi
+
+    if grep -q "${expected_compose_log}" "${case_dir}/supervisor.log" &&
+        grep -q "${expected_watchdog_log}" "${case_dir}/supervisor.log"; then
+        pass "${name}: both real exit codes collected"
+    else
+        fail "${name}: expected exit codes missing"
+        sed -n '1,160p' "${case_dir}/supervisor.log"
+    fi
+
+    collected_once "${case_dir}/supervisor.log" \
+        && pass "${name}: each PID waited exactly once" \
+        || fail "${name}: PID collection count is not exactly one each"
+
+    if [ "${expect_compose_down}" = "yes" ]; then
+        [ -f "${case_dir}/compose-down.called" ] \
+            && pass "${name}: compose down called" \
+            || fail "${name}: compose down was not called"
+    else
+        [ ! -f "${case_dir}/compose-down.called" ] \
+            && pass "${name}: compose down not needed" \
+            || fail "${name}: unexpected compose down"
+    fi
+
+    mock_children_stopped "${case_dir}" \
+        && pass "${name}: no mock child remains" \
+        || fail "${name}: mock child still running"
+}
+
+# A — Compose 7, watchdog long-running.
+run_failure_case "A-compose-7" 7 0.20 0 30 \
+    'compose collected exit=7' 'watchdog collected exit=143' no
+
+# B — Watchdog 8, Compose long-running.
+run_failure_case "B-watchdog-8" 0 30 8 0.20 \
+    'compose collected exit=143' 'watchdog collected exit=8' yes
+
+# C — race: Compose 0 and watchdog 8.
+run_failure_case "C-race-compose-0-watchdog-8" 0 0.20 8 0.20 \
+    'compose collected exit=0' 'watchdog collected exit=8' no
+
+# D — reverse race: Compose 7 and watchdog 0.
+run_failure_case "D-race-compose-7-watchdog-0" 7 0.20 0 0.20 \
+    'compose collected exit=7' 'watchdog collected exit=0' no
+
+# E — unexpected Compose exit 0.
+run_failure_case "E-compose-0" 0 0.20 0 30 \
+    'compose collected exit=0' 'watchdog collected exit=143' no
+
+# F — unexpected watchdog exit 0.
+run_failure_case "F-watchdog-0" 0 30 0 0.20 \
+    'compose collected exit=143' 'watchdog collected exit=0' yes
+
+# G — real SIGTERM must produce exactly 0 and reap both children.
+SIGTERM_DIR=$(mktemp -d "${SUPERVISOR_TEST_ROOT}/G-sigterm.XXXXXX")
+printf '%s\n' 'services: {}' > "${SIGTERM_DIR}/compose.yaml"
+RC_G=0
+
+MOCK_PID_DIR="${SIGTERM_DIR}" \
+MOCK_COMPOSE_RC=0 \
+MOCK_COMPOSE_DELAY=30 \
+MOCK_WATCHDOG_RC=0 \
+MOCK_WATCHDOG_DELAY=30 \
+COMPOSE_FILE="${SIGTERM_DIR}/compose.yaml" \
+WATCHDOG="${MOCK_WATCHDOG}" \
+DOCKER_BIN="${MOCK_DOCKER}" \
+SUPERVISOR_POLL_INTERVAL=0.05 \
+SUPERVISOR_TERM_TIMEOUT=2 \
+    /usr/bin/bash deployment/scripts/run-supervised.sh > "${SIGTERM_DIR}/supervisor.log" 2>&1 &
+SIGTERM_SUPERVISOR_PID=$!
+
+if wait_for_pid_files "${SIGTERM_DIR}"; then
+    kill -TERM "${SIGTERM_SUPERVISOR_PID}"
+    if ! wait_for_process_exit "${SIGTERM_SUPERVISOR_PID}"; then
+        fail "G-SIGTERM: supervisor timed out"
+        kill -KILL "${SIGTERM_SUPERVISOR_PID}" 2>/dev/null || true
+    fi
+    set +e
+    wait "${SIGTERM_SUPERVISOR_PID}"
+    RC_G=$?
+    set -e
+
+    [ "${RC_G}" -eq 0 ] \
+        && pass "G-SIGTERM: supervisor exit exactly 0" \
+        || fail "G-SIGTERM: supervisor rc=${RC_G}, expected 0"
+    collected_once "${SIGTERM_DIR}/supervisor.log" \
+        && pass "G-SIGTERM: each PID waited exactly once" \
+        || fail "G-SIGTERM: PID collection count is not exactly one each"
+    if grep -q 'compose collected exit=143' "${SIGTERM_DIR}/supervisor.log" &&
+        grep -q 'watchdog collected exit=143' "${SIGTERM_DIR}/supervisor.log"; then
+        pass "G-SIGTERM: both child exit codes collected (compose=143, watchdog=143)"
+    else
+        fail "G-SIGTERM: expected child exit codes missing"
+        sed -n '1,160p' "${SIGTERM_DIR}/supervisor.log"
+    fi
+    mock_children_stopped "${SIGTERM_DIR}" \
+        && pass "G-SIGTERM: no mock child remains" \
+        || fail "G-SIGTERM: mock child still running"
 else
-    fail "SIGTERM → exit ${RC3}, expected 0 or 124"
+    fail "G-SIGTERM: mock PID files not created"
+    kill -KILL "${SIGTERM_SUPERVISOR_PID}" 2>/dev/null || true
+    wait "${SIGTERM_SUPERVISOR_PID}" 2>/dev/null || true
 fi
-
-# Проверка: фоновых процессов не осталось
-LEFT=$(jobs -p 2>/dev/null | wc -l)
-[ "${LEFT}" -eq 0 ] && pass "Нет фоновых процессов" || fail "Остались фоновые процессы: ${LEFT}"
-
-rm -rf "${TMPDIR}"
 
 # ── 17. Supervisor static invariants ──
 echo ""
@@ -306,6 +436,9 @@ echo "--- Supervisor static invariants ---"
 grep -q 'wait_pid' deployment/scripts/run-supervised.sh 2>/dev/null && pass "supervisor: wait_pid функция" || fail "supervisor: нет wait_pid"
 grep -q 'set +e' deployment/scripts/run-supervised.sh 2>/dev/null && pass "supervisor: set +e перед wait" || fail "supervisor: нет set +e"
 grep -q 'TERMINATED_BY_SIGNAL' deployment/scripts/run-supervised.sh 2>/dev/null && pass "supervisor: TERMINATED_BY_SIGNAL" || fail "supervisor: нет TERMINATED_BY_SIGNAL"
+grep -q 'COMPOSE_COLLECTED=false' deployment/scripts/run-supervised.sh 2>/dev/null && pass "supervisor: COMPOSE_COLLECTED" || fail "supervisor: нет COMPOSE_COLLECTED"
+grep -q 'WATCHDOG_COLLECTED=false' deployment/scripts/run-supervised.sh 2>/dev/null && pass "supervisor: WATCHDOG_COLLECTED" || fail "supervisor: нет WATCHDOG_COLLECTED"
+grep -q 'eval ' deployment/scripts/run-supervised.sh 2>/dev/null && fail "supervisor: eval запрещён" || pass "supervisor: без eval"
 
 # ── 18. Purge extended checks ──
 echo ""
