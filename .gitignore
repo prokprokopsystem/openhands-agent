@@ -1,0 +1,18 @@
+# Secrets and environment files
+.env
+.env.*
+!.env.example
+secrets/
+**/secrets/
+
+# Agent Canvas runtime data
+config/
+workspace/
+logs/
+backups/
+
+# Local editor and OS files
+.DS_Store
+Thumbs.db
+*.swp
+*.tmp
