@@ -1,41 +1,28 @@
-#!/bin/bash
-# OpenHands Agent Canvas — подготовка каталогов
-# Запускать на mini-server: sudo bash prepare.sh
-# НЕ запускает контейнер, только создаёт каталоги и права.
-set -e
+#!/usr/bin/env bash
+# Prepare OpenHands runtime directories. Does not start containers.
+set -Eeuo pipefail
 
 BASE="/srv/openhands-agent"
 OWNER="igor:igor"
 
-echo "=== OpenHands Agent Canvas — подготовка каталогов ==="
-
-# Создание
-sudo mkdir -p "${BASE}/config"
-sudo mkdir -p "${BASE}/test-workspace"
-sudo mkdir -p "${BASE}/secrets"
-sudo mkdir -p "${BASE}/logs"
-
-# Права: config и secrets — только владелец
-sudo chmod 700 "${BASE}/config"
-sudo chmod 700 "${BASE}/secrets"
-sudo chmod 755 "${BASE}/test-workspace"
-sudo chmod 755 "${BASE}/logs"
-
-# Владелец
-sudo chown -R "${OWNER}" "${BASE}"
-
-# .env — если существует
-if [ -f "${BASE}/secrets/.env" ]; then
-    sudo chmod 600 "${BASE}/secrets/.env"
-    sudo chown "${OWNER}" "${BASE}/secrets/.env"
-    echo "secrets/.env — права 600"
-else
-    echo "⚠️  secrets/.env ещё не создан. Создайте из .env.example"
+if [[ ${EUID} -ne 0 ]]; then
+  echo "ERROR: run as root" >&2
+  exit 1
 fi
 
-echo ""
-echo "Каталоги подготовлены:"
-ls -la "${BASE}/"
-echo ""
-echo "Следующий шаг: создайте secrets/.env с LOCAL_BACKEND_API_KEY"
-echo "Затем: bash deployment/scripts/start.sh"
+install -d -o igor -g igor -m 700 "${BASE}/config"
+install -d -o igor -g igor -m 700 "${BASE}/test-workspace"
+install -d -o igor -g igor -m 700 "${BASE}/secrets"
+install -d -o igor -g igor -m 700 "${BASE}/logs"
+
+if [[ -f "${BASE}/secrets/.env" ]]; then
+  chown "${OWNER}" "${BASE}/secrets/.env"
+  chmod 600 "${BASE}/secrets/.env"
+fi
+
+for dir in config test-workspace secrets logs; do
+  mode=$(stat -c '%a' "${BASE}/${dir}")
+  [[ "${mode}" == "700" ]] || { echo "ERROR: ${dir} mode=${mode}, expected 700" >&2; exit 1; }
+done
+
+echo "OpenHands runtime directories prepared with private permissions."
