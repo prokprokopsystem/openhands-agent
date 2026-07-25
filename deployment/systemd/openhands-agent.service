@@ -1,29 +1,32 @@
 [Unit]
-Description=OpenHands Agent Canvas
+Description=OpenHands Agent Canvas isolated test
 Documentation=https://github.com/prokprokopsystem/openhands-agent
 After=network-online.target docker.service wg-quick@wg0.service
-Requires=docker.service
-Requires=wg-quick@wg0.service
+Requires=docker.service wg-quick@wg0.service
 Wants=network-online.target
 
 [Service]
-Type=oneshot
-RemainAfterExit=yes
-
-# Проверить наличие 10.77.0.2
-ExecStartPre=/bin/bash -c 'until ip addr show wg0 | grep -q 10.77.0.2; do sleep 2; done'
-
-# Запустить Compose-проект
-ExecStart=/usr/bin/docker compose -f /srv/openhands-agent/deployment/compose.yaml up -d
-
-# Остановить Compose-проект
-ExecStop=/usr/bin/docker compose -f /srv/openhands-agent/deployment/compose.yaml down
-
-# Проверить health после запуска
-ExecStartPost=/bin/bash -c 'for i in $(seq 1 30); do if curl -fsS -o /dev/null http://10.77.0.2:8000/canvas; then exit 0; fi; sleep 2; done; exit 1'
-
+Type=simple
+WorkingDirectory=/srv/openhands-agent
+TimeoutStartSec=180
+TimeoutStopSec=90
 Restart=on-failure
 RestartSec=10
+
+# Prepare private directories, validate config, create network/container without starting,
+# then install firewall rules before the agent process can run.
+ExecStartPre=/usr/bin/bash /srv/openhands-agent/deployment/scripts/prepare.sh
+ExecStartPre=/usr/bin/timeout 60 /usr/bin/bash -c 'until ip -4 addr show dev wg0 | grep -q "10.77.0.2/"; do sleep 2; done'
+ExecStartPre=/usr/bin/docker compose -f /srv/openhands-agent/deployment/compose.yaml config --quiet
+ExecStartPre=/usr/bin/docker compose -f /srv/openhands-agent/deployment/compose.yaml create
+ExecStartPre=/usr/bin/bash /srv/openhands-agent/deployment/network/apply-egress-rules.sh
+
+# Foreground process: systemd observes failure and performs restart.
+ExecStart=/usr/bin/docker compose -f /srv/openhands-agent/deployment/compose.yaml up --remove-orphans
+
+# Stop only this Compose project, then remove only its firewall rules.
+ExecStop=/usr/bin/docker compose -f /srv/openhands-agent/deployment/compose.yaml down --remove-orphans
+ExecStopPost=/usr/bin/bash /srv/openhands-agent/deployment/network/remove-egress-rules.sh
 
 [Install]
 WantedBy=multi-user.target
