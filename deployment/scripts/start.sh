@@ -1,58 +1,28 @@
-#!/bin/bash
-# OpenHands Agent Canvas — запуск
-set -e
+#!/usr/bin/env bash
+# Start OpenHands through the systemd lifecycle owner.
+set -Eeuo pipefail
 
 BASE="/srv/openhands-agent"
-COMPOSE_FILE="${BASE}/deployment/compose.yaml"
-cd "${BASE}"
+ENV_FILE="${BASE}/secrets/.env"
+UNIT="openhands-agent.service"
 
-echo "=== OpenHands Agent Canvas — запуск ==="
+[[ -f "${ENV_FILE}" ]] || { echo "ERROR: ${ENV_FILE} missing" >&2; exit 1; }
+[[ "$(stat -c '%a' "${ENV_FILE}")" == "600" ]] || { echo "ERROR: .env must be mode 600" >&2; exit 1; }
 
-# Проверка прав
-if [ ! -f secrets/.env ]; then
-    echo "❌ ОШИБКА: secrets/.env не найден. Создайте из .env.example"
-    exit 1
-fi
-
-PERMS=$(stat -c "%a" secrets/.env 2>/dev/null || echo "000")
-if [ "${PERMS}" != "600" ]; then
-    echo "❌ ОШИБКА: secrets/.env права ${PERMS}, должно быть 600"
-    exit 1
-fi
-
-if ! grep -q 'LOCAL_BACKEND_API_KEY' secrets/.env 2>/dev/null; then
-    echo "⚠️  LOCAL_BACKEND_API_KEY не задан в secrets/.env"
-fi
-
-# Проверка каталогов
-for d in config test-workspace secrets logs; do
-    if [ ! -d "${BASE}/${d}" ]; then
-        echo "❌ ОШИБКА: каталог ${BASE}/${d} не существует. Запустите prepare.sh"
-        exit 1
-    fi
+for dir in config test-workspace secrets logs; do
+  [[ -d "${BASE}/${dir}" ]] || { echo "ERROR: ${BASE}/${dir} missing" >&2; exit 1; }
+  [[ "$(stat -c '%a' "${BASE}/${dir}")" == "700" ]] || { echo "ERROR: ${dir} must be mode 700" >&2; exit 1; }
 done
 
-# Проверка WireGuard
-if ! ip addr show wg0 2>/dev/null | grep -q "10.77.0.2"; then
-    echo "❌ ОШИБКА: адрес 10.77.0.2 не найден на wg0"
-    exit 1
-fi
+KEY=$(sed -n 's/^LOCAL_BACKEND_API_KEY=//p' "${ENV_FILE}" | tail -n 1)
+[[ -n "${KEY}" ]] || { echo "ERROR: LOCAL_BACKEND_API_KEY is empty" >&2; exit 1; }
+case "${KEY}" in
+  your-generated-key-here|***|*'< '*|*'>'*) echo "ERROR: LOCAL_BACKEND_API_KEY is still a template" >&2; exit 1 ;;
+esac
 
-echo "✅ Проверки пройдены."
+ip -4 addr show dev wg0 | grep -q '10.77.0.2/' || { echo "ERROR: WireGuard address 10.77.0.2 is absent" >&2; exit 1; }
+systemctl cat "${UNIT}" >/dev/null 2>&1 || { echo "ERROR: ${UNIT} is not installed" >&2; exit 1; }
 
-# Compose config (без секретов)
-echo ""
-echo "--- docker compose config ---"
-docker compose -f "${COMPOSE_FILE}" config 2>&1 | grep -v "LOCAL_BACKEND_API_KEY" || true
-
-# Запуск
-echo ""
-docker compose -f "${COMPOSE_FILE}" up -d
-
-sleep 5
-echo ""
-echo "Статус:"
-docker compose -f "${COMPOSE_FILE}" ps
-
-echo ""
-echo 'Доступ: http://10.77.0.2:8000/canvas (только WireGuard)'
+sudo systemctl start "${UNIT}"
+sudo systemctl --no-pager --full status "${UNIT}"
+echo "WebUI: http://10.77.0.2:8000/canvas (WireGuard only)"
