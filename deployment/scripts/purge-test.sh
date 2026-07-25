@@ -1,42 +1,33 @@
-#!/bin/bash
-# OpenHands Agent Canvas — полное удаление тестового запуска
-# БЕЗ --confirm-destroy-test-data показывает только что будет удалено.
-# С --confirm-destroy-test-data выполняет удаление.
+#!/usr/bin/env bash
+# Preview or destroy only the OpenHands test deployment.
+set -Eeuo pipefail
 
 BASE="/srv/openhands-agent"
-COMPOSE_FILE="${BASE}/deployment/compose.yaml"
+UNIT_PATH="/etc/systemd/system/openhands-agent.service"
+CONFIRM="${1:-}"
 
-echo "=== OpenHands Agent Canvas — purge ==="
-echo ""
-
-if [ "$1" != "--confirm-destroy-test-data" ]; then
-    echo "⚠️  РЕЖИМ ПРОСМОТРА. Для удаления: $0 --confirm-destroy-test-data"
-    echo ""
-    echo "Будет удалено:"
-    echo "  Каталог: ${BASE}"
-    echo "  Docker-сеть: openhands-net"
-    echo "  Docker-контейнер: openhands-agent"
-    echo ""
-    echo "Файлы в ${BASE}:"
-    find "${BASE}" -type f 2>/dev/null | head -30 || echo "  (каталог не существует)"
-    echo ""
-    echo "Размер:"
-    du -sh "${BASE}" 2>/dev/null || echo "  (не существует)"
-    exit 0
+if [[ "${CONFIRM}" != "--confirm-destroy-test-data" ]]; then
+  echo "PREVIEW ONLY"
+  echo "Would stop/disable openhands-agent.service, remove OpenHands firewall rules,"
+  echo "remove container/network, remove ${UNIT_PATH}, and delete ${BASE}."
+  [[ -d "${BASE}" ]] && du -sh "${BASE}" || true
+  exit 0
 fi
 
-echo "=== УДАЛЕНИЕ ==="
-cd "${BASE}" 2>/dev/null || true
+sudo systemctl stop openhands-agent.service 2>/dev/null || true
+sudo systemctl disable openhands-agent.service 2>/dev/null || true
 
-# Остановить и удалить контейнер
-docker compose -f "${COMPOSE_FILE}" down -v 2>/dev/null || true
+if [[ -x "${BASE}/deployment/network/remove-egress-rules.sh" ]]; then
+  sudo "${BASE}/deployment/network/remove-egress-rules.sh"
+fi
 
-# Удалить сеть
+if [[ -f "${BASE}/deployment/compose.yaml" ]]; then
+  docker compose -f "${BASE}/deployment/compose.yaml" down --remove-orphans --volumes || true
+fi
+
 docker network rm openhands-net 2>/dev/null || true
+sudo rm -f "${UNIT_PATH}"
+sudo systemctl daemon-reload
+sudo rm -rf --one-file-system "${BASE}"
 
-# Удалить каталог
-sudo rm -rf "${BASE}"
-
-echo ""
-echo "Удалено: ${BASE}"
-echo "Удалена Docker-сеть: openhands-net"
+echo "OpenHands test deployment destroyed."
