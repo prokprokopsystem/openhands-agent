@@ -1,12 +1,14 @@
 #!/usr/bin/bash
 # OpenHands Agent Canvas — supervised lifecycle
 # Запускает docker compose up (foreground) + health-watchdog.
-# Падение любого процесса → остановка второго → ненулевой exit code.
-# SIGTERM от systemd — штатная остановка (exit 0).
+# Каждый PID ожидается ровно один раз.
+# Первый упавший → остановка второго → сбор его кода.
+# SIGTERM → штатная остановка (exit 0).
 set -euo pipefail
 
-COMPOSE_FILE="/srv/openhands-agent/deployment/compose.yaml"
-WATCHDOG="/srv/openhands-agent/deployment/scripts/health-watchdog.sh"
+COMPOSE_FILE="${COMPOSE_FILE:-/srv/openhands-agent/deployment/compose.yaml}"
+WATCHDOG="${WATCHDOG:-/srv/openhands-agent/deployment/scripts/health-watchdog.sh}"
+DOCKER_BIN="${DOCKER_BIN:-docker}"
 
 COMPOSE_PID=""
 WATCHDOG_PID=""
@@ -14,7 +16,6 @@ EXIT_CODE=0
 TERMINATED_BY_SIGNAL=false
 
 cleanup() {
-    # SIGTERM/SIGINT — штатная остановка systemd
     if [ -n "${WATCHDOG_PID:-}" ] && kill -0 "${WATCHDOG_PID}" 2>/dev/null; then
         kill "${WATCHDOG_PID}" 2>/dev/null || true
     fi
@@ -25,8 +26,18 @@ cleanup() {
 
 trap 'TERMINATED_BY_SIGNAL=true; cleanup' SIGTERM SIGINT
 
-echo "[supervisor] Запуск docker compose up..."
-docker compose -f "${COMPOSE_FILE}" up &
+# Функция безопасного сбора exit code (ровно один wait на PID)
+wait_pid() {
+    local pid="$1"
+    local varname="$2"
+    set +e
+    wait "${pid}" 2>/dev/null
+    eval "${varname}=$?"
+    set -e
+}
+
+echo "[supervisor] Запуск compose..."
+"${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" up &
 COMPOSE_PID=$!
 
 sleep 3
@@ -40,60 +51,45 @@ while kill -0 "${COMPOSE_PID}" 2>/dev/null && kill -0 "${WATCHDOG_PID}" 2>/dev/n
     sleep 2
 done
 
-# Определить, кто завершился первым
-COMPOSE_DONE=false
-WATCHDOG_DONE=false
+# Определить, кто завершился
+COMPOSE_DEAD=false
+WATCHDOG_DEAD=false
+if ! kill -0 "${COMPOSE_PID}" 2>/dev/null; then COMPOSE_DEAD=true; fi
+if ! kill -0 "${WATCHDOG_PID}" 2>/dev/null; then WATCHDOG_DEAD=true; fi
 
-if ! kill -0 "${COMPOSE_PID}" 2>/dev/null; then
-    COMPOSE_DONE=true
-fi
-if ! kill -0 "${WATCHDOG_PID}" 2>/dev/null; then
-    WATCHDOG_DONE=true
-fi
-
-# Безопасно получить exit codes (set -e не должен убить скрипт при wait)
-if ${COMPOSE_DONE}; then
-    set +e
-    wait "${COMPOSE_PID}" 2>/dev/null
-    COMPOSE_RC=$?
-    set -e
-    echo "[supervisor] docker compose завершился (exit=${COMPOSE_RC})"
+# Собрать коды: каждый PID ровно один раз
+if ${COMPOSE_DEAD}; then
+    wait_pid "${COMPOSE_PID}" COMPOSE_RC
+    echo "[supervisor] compose exit=${COMPOSE_RC}"
     if [ "${COMPOSE_RC}" -ne 0 ] && ! ${TERMINATED_BY_SIGNAL}; then
         EXIT_CODE=1
     fi
     # Остановить watchdog
-    if [ -n "${WATCHDOG_PID:-}" ] && kill -0 "${WATCHDOG_PID}" 2>/dev/null; then
+    if ! ${WATCHDOG_DEAD} && [ -n "${WATCHDOG_PID:-}" ] && kill -0 "${WATCHDOG_PID}" 2>/dev/null; then
         kill "${WATCHDOG_PID}" 2>/dev/null || true
+        # Дождаться остановленного watchdog
+        wait_pid "${WATCHDOG_PID}" WATCHDOG_RC
+        echo "[supervisor] watchdog stopped, exit=${WATCHDOG_RC}"
     fi
 fi
 
-if ${WATCHDOG_DONE} && ! ${COMPOSE_DONE}; then
-    set +e
-    wait "${WATCHDOG_PID}" 2>/dev/null
-    WATCHDOG_RC=$?
-    set -e
-    echo "[supervisor] watchdog завершился (exit=${WATCHDOG_RC})"
+if ${WATCHDOG_DEAD} && ! ${COMPOSE_DEAD}; then
+    wait_pid "${WATCHDOG_PID}" WATCHDOG_RC
+    echo "[supervisor] watchdog exit=${WATCHDOG_RC}"
     if [ "${WATCHDOG_RC}" -ne 0 ]; then
         EXIT_CODE=1
-        # Остановить compose
-        if [ -n "${COMPOSE_PID:-}" ] && kill -0 "${COMPOSE_PID}" 2>/dev/null; then
-            docker compose -f "${COMPOSE_FILE}" down 2>/dev/null
-        fi
+    fi
+    # Остановить compose
+    if [ -n "${COMPOSE_PID:-}" ] && kill -0 "${COMPOSE_PID}" 2>/dev/null; then
+        "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" down 2>/dev/null
+        # Дождаться остановленного compose
+        wait_pid "${COMPOSE_PID}" COMPOSE_RC
+        echo "[supervisor] compose stopped, exit=${COMPOSE_RC}"
     fi
 fi
 
-# Если оба завершились почти одновременно
-if ${COMPOSE_DONE} && ${WATCHDOG_DONE}; then
-    set +e
-    wait "${COMPOSE_PID}" 2>/dev/null
-    COMPOSE_RC=$?
-    wait "${WATCHDOG_PID}" 2>/dev/null
-    WATCHDOG_RC=$?
-    set -e
-    if [ "${COMPOSE_RC}" -ne 0 ] || [ "${WATCHDOG_RC}" -ne 0 ]; then
-        EXIT_CODE=1
-    fi
-fi
+# Если оба завершились одновременно — compose уже собран выше, watchdog тоже если compose убил его
+# Нет ситуации двойного wait
 
 if ${TERMINATED_BY_SIGNAL}; then
     echo "[supervisor] Штатное завершение по сигналу."

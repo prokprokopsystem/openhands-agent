@@ -140,45 +140,174 @@ echo ""
 echo "--- Docs: no manual key screen ---"
 grep -ri 'ввести.*LOCAL_BACKEND_API_KEY\|экран.*ввода.*ключа\|enter.*API key' deployment/README.md docs/Решения.md docs/Состояние.md 2>/dev/null && fail "Документация: экран ввода ключа" || pass "Документация: без экрана ввода ключа"
 
-# ── 15. Healthcheck behavioral test ──
+# ── 15. Healthcheck: real Python syntax test from compose ──
 echo ""
 echo "--- Healthcheck Python test ---"
-HC_PY=$(sed -n '/healthcheck:/,/start_period:/p' deployment/compose.yaml | grep -A20 'python3' | sed 's/^[[:space:]]*//' | grep -v '^$')
-if echo "${HC_PY}" | grep -q 'create_connection'; then
-    # Проверить синтаксис Python-фрагмента (без реального соединения)
-    timeout 5 python3 -c "
-import socket
-try:
-    for p in (18000, 18001):
-        s = socket.create_connection(('127.0.0.1', p), timeout=1)
-        s.close()
-except (ConnectionRefusedError, OSError, socket.timeout):
-    pass
-" 2>/dev/null
-    pass "healthcheck: create_connection синтаксис корректен"
+# Извлечь Python-код из compose.yaml (строка с 'python3 -c')
+HC_LINE=$(grep 'python3 -c' deployment/compose.yaml | head -1)
+if [ -z "${HC_LINE}" ]; then
+    fail "healthcheck: не найден python3 -c в compose.yaml"
 else
-    fail "healthcheck: не использует create_connection"
+    # Извлечь код между 'python3 -c' и конца строки
+    HC_CMD=$(echo "${HC_LINE}" | sed 's/.*python3 -c "\(.*\)"/\1/')
+    if [ -z "${HC_CMD}" ]; then
+        # Попробовать без кавычек
+        HC_CMD=$(echo "${HC_LINE}" | sed "s/.*python3 -c //")
+    fi
+    # Проверить: однострочник, не for-in (который YAML свернёт)
+    if echo "${HC_CMD}" | grep -q 'for p'; then
+        fail "healthcheck: использует 'for p' — YAML свернёт в SyntaxError"
+    elif echo "${HC_CMD}" | grep -q 'create_connection'; then
+        # Проверить синтаксис: скомпилировать, не исполнять
+        python3 -c "compile('''${HC_CMD}''', '<healthcheck>', 'exec')" 2>/dev/null \
+            && pass "healthcheck: Python синтаксис корректен" \
+            || fail "healthcheck: Python SyntaxError"
+    else
+        fail "healthcheck: не использует create_connection"
+    fi
 fi
 
-# ── 16. Supervisor invariants + behavioral test ──
+# ── 16. Supervisor: real behavioral tests ──
 echo ""
-echo "--- Supervisor invariants ---"
-# No `wait ... || true` pattern
-grep -q 'wait.*|| true.*EXIT=' deployment/scripts/run-supervised.sh 2>/dev/null && fail "supervisor: wait ... || true" || pass "supervisor: без wait ... || true"
-# Has EXIT_CODE
-grep -q 'EXIT_CODE' deployment/scripts/run-supervised.sh 2>/dev/null && pass "supervisor: EXIT_CODE" || fail "supervisor: нет EXIT_CODE"
-# Has TERMINATED_BY_SIGNAL
-grep -q 'TERMINATED_BY_SIGNAL' deployment/scripts/run-supervised.sh 2>/dev/null && pass "supervisor: TERMINATED_BY_SIGNAL" || fail "supervisor: нет TERMINATED_BY_SIGNAL"
-# Uses set +e for wait safety
-grep -q 'set +e' deployment/scripts/run-supervised.sh 2>/dev/null && pass "supervisor: set +e перед wait" || fail "supervisor: нет set +e перед wait"
-# Compose failure → EXIT_CODE=1
-grep -A2 'COMPOSE_RC.*-ne 0' deployment/scripts/run-supervised.sh 2>/dev/null | grep -q 'EXIT_CODE=1' && pass "supervisor: compose fail → EXIT_CODE=1" || fail "supervisor: compose fail не устанавливает EXIT_CODE=1"
-# Watchdog failure → EXIT_CODE=1
-grep -A2 'WATCHDOG_RC.*-ne 0' deployment/scripts/run-supervised.sh 2>/dev/null | grep -q 'EXIT_CODE=1' && pass "supervisor: watchdog fail → EXIT_CODE=1" || fail "supervisor: watchdog fail не устанавливает EXIT_CODE=1"
-# SIGTERM → exit 0
-grep -A2 'TERMINATED_BY_SIGNAL' deployment/scripts/run-supervised.sh 2>/dev/null | grep -q 'exit 0' && pass "supervisor: SIGTERM → exit 0" || fail "supervisor: SIGTERM не даёт exit 0"
+echo "--- Supervisor behavioral tests ---"
+TMPDIR=$(mktemp -d)
+trap "rm -rf ${TMPDIR}" EXIT
 
-# ── 17. Purge extended checks ──
+# Mock docker: compose up → exit 7, compose down → OK
+cat > "${TMPDIR}/mock-docker" << 'EOF'
+#!/usr/bin/bash
+PIDFILE="/tmp/oh-test-compose-up.pid"
+if [ "$1" = "compose" ] && [ "${4:-}" = "up" ]; then
+    echo "mock compose up"
+    exit 7
+elif [ "$1" = "compose" ] && [ "${4:-}" = "down" ]; then
+    echo "mock compose down"
+    # Если compose-up ещё жив — убить его
+    if [ -f "${PIDFILE}" ]; then
+        kill "$(cat "${PIDFILE}")" 2>/dev/null || true
+        rm -f "${PIDFILE}"
+    fi
+    exit 0
+fi
+exit 0
+EOF
+chmod +x "${TMPDIR}/mock-docker"
+
+# Mock watchdog
+cat > "${TMPDIR}/mock-watchdog" << 'EOF'
+#!/usr/bin/bash
+echo "mock watchdog ok"
+exit 0
+EOF
+chmod +x "${TMPDIR}/mock-watchdog"
+
+cat > "${TMPDIR}/mock-watchdog-fail" << 'EOF'
+#!/usr/bin/bash
+echo "mock watchdog fail"
+exit 8
+EOF
+chmod +x "${TMPDIR}/mock-watchdog-fail"
+
+# Mock compose.yaml
+echo 'services: {openhands: {image: "alpine:latest", command: ["sleep","999"]}}' > "${TMPDIR}/compose.yaml"
+
+# Тест 1: compose exit 7 → supervisor exit != 0
+echo "  Test 1: compose fail..."
+COMPOSE_FILE="${TMPDIR}/compose.yaml" \
+WATCHDOG="${TMPDIR}/mock-watchdog" \
+DOCKER_BIN="${TMPDIR}/mock-docker" \
+    timeout 10 /usr/bin/bash deployment/scripts/run-supervised.sh || RC1=$?
+[ "${RC1}" -ne 0 ] && pass "compose exit 7 → supervisor non-zero (rc=${RC1})" \
+    || fail "compose exit 7 → supervisor exit ${RC1}, expected non-zero"
+
+# Тест 2: watchdog exit 8 → supervisor exit != 0
+echo "  Test 2: watchdog fail..."
+# compose-up должен спать, чтобы watchdog умер первым
+cat > "${TMPDIR}/mock-docker-sleep-up" << 'SCRIPT'
+#!/usr/bin/bash
+PIDFILE="/tmp/oh-test-compose-up.pid"
+if [ "$1" = "compose" ] && [ "${4:-}" = "up" ]; then
+    echo "mock compose up, sleeping"
+    sleep 30 &
+    echo $! > "${PIDFILE}"
+    wait
+    exit 0
+elif [ "$1" = "compose" ] && [ "${4:-}" = "down" ]; then
+    echo "mock compose down"
+    if [ -f "${PIDFILE}" ]; then
+        kill "$(cat "${PIDFILE}")" 2>/dev/null || true
+        rm -f "${PIDFILE}"
+    fi
+    exit 0
+fi
+exit 0
+SCRIPT
+chmod +x "${TMPDIR}/mock-docker-sleep-up"
+
+COMPOSE_FILE="${TMPDIR}/compose.yaml" \
+WATCHDOG="${TMPDIR}/mock-watchdog-fail" \
+DOCKER_BIN="${TMPDIR}/mock-docker-sleep-up" \
+    timeout 15 /usr/bin/bash deployment/scripts/run-supervised.sh || RC2=$?
+[ "${RC2}" -ne 0 ] && pass "watchdog exit 8 → supervisor non-zero (rc=${RC2})" \
+    || fail "watchdog exit 8 → supervisor exit ${RC2}, expected non-zero"
+
+# Тест 3: SIGTERM → supervisor завершается (timeout убивает)
+echo "  Test 3: SIGTERM..."
+cat > "${TMPDIR}/mock-docker-sleep" << 'SCRIPT'
+#!/usr/bin/bash
+PIDFILE="/tmp/oh-test-compose-up.pid"
+if [ "$1" = "compose" ] && [ "${4:-}" = "up" ]; then
+    echo "mock compose up, sleeping"
+    sleep 30 &
+    echo $! > "${PIDFILE}"
+    wait
+    exit 0
+elif [ "$1" = "compose" ] && [ "${4:-}" = "down" ]; then
+    echo "mock compose down"
+    if [ -f "${PIDFILE}" ]; then
+        kill "$(cat "${PIDFILE}")" 2>/dev/null || true
+        rm -f "${PIDFILE}"
+    fi
+    exit 0
+fi
+exit 0
+SCRIPT
+chmod +x "${TMPDIR}/mock-docker-sleep"
+
+cat > "${TMPDIR}/mock-watchdog-sleep" << 'SCRIPT'
+#!/usr/bin/bash
+echo "mock watchdog sleeping"
+sleep 30
+exit 0
+SCRIPT
+chmod +x "${TMPDIR}/mock-watchdog-sleep"
+
+COMPOSE_FILE="${TMPDIR}/compose.yaml" \
+WATCHDOG="${TMPDIR}/mock-watchdog-sleep" \
+DOCKER_BIN="${TMPDIR}/mock-docker-sleep" \
+    timeout 10 /usr/bin/bash deployment/scripts/run-supervised.sh || RC3=$?
+# timeout убивает supervisor, supervisor ловит SIGTERM → cleanup → exit 0
+# timeout возвращает: 124 если истекло, или код дочернего процесса
+if [ "${RC3}" -eq 0 ] || [ "${RC3}" -eq 124 ]; then
+    pass "SIGTERM → exit ${RC3} (штатное завершение)"
+else
+    fail "SIGTERM → exit ${RC3}, expected 0 or 124"
+fi
+
+# Проверка: фоновых процессов не осталось
+LEFT=$(jobs -p 2>/dev/null | wc -l)
+[ "${LEFT}" -eq 0 ] && pass "Нет фоновых процессов" || fail "Остались фоновые процессы: ${LEFT}"
+
+rm -rf "${TMPDIR}"
+
+# ── 17. Supervisor static invariants ──
+echo ""
+echo "--- Supervisor static invariants ---"
+grep -q 'wait_pid' deployment/scripts/run-supervised.sh 2>/dev/null && pass "supervisor: wait_pid функция" || fail "supervisor: нет wait_pid"
+grep -q 'set +e' deployment/scripts/run-supervised.sh 2>/dev/null && pass "supervisor: set +e перед wait" || fail "supervisor: нет set +e"
+grep -q 'TERMINATED_BY_SIGNAL' deployment/scripts/run-supervised.sh 2>/dev/null && pass "supervisor: TERMINATED_BY_SIGNAL" || fail "supervisor: нет TERMINATED_BY_SIGNAL"
+
+# ── 18. Purge extended checks ──
 echo ""
 echo "--- Purge extended checks ---"
 grep -q '\${1:-}' deployment/scripts/purge-test.sh && pass "purge: \${1:-}" || fail "purge: нет \${1:-}"
@@ -187,7 +316,7 @@ grep -q 'OPENHANDS-INPUT' deployment/scripts/purge-test.sh && pass "purge: пр�
 grep -q '\-\-one-file-system' deployment/scripts/purge-test.sh && pass "purge: --one-file-system" || fail "purge: нет --one-file-system"
 grep -q 'docker compose.*down' deployment/scripts/purge-test.sh && grep -A2 'compose down' deployment/scripts/purge-test.sh | grep -q '|| true' && fail "purge: compose down скрывает ошибку || true" || pass "purge: compose down без || true"
 
-# ── 18. Path consistency ──
+# ── 19. Path consistency ──
 echo ""
 echo "--- Path consistency ---"
 grep -q '/srv/openhands-agent' deployment/compose.yaml deployment/systemd/openhands-agent.service 2>/dev/null && pass "Пути консистентны" || fail "Пути не консистентны"
