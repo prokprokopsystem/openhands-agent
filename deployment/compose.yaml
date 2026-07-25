@@ -1,0 +1,47 @@
+# OpenHands Agent Canvas — Compose
+# Версия: 1.6.1 (2026-07-24)
+# Образ: ghcr.io/openhands/agent-canvas:1.6.1
+
+services:
+  openhands:
+    image: ghcr.io/openhands/agent-canvas:1.6.1
+    container_name: openhands-agent
+    restart: unless-stopped
+
+    ports:
+      - "10.77.0.2:8000:8000"
+
+    volumes:
+      - /srv/openhands-agent/config:/home/openhands/.openhands:rw
+      - /srv/openhands-agent/workspace:/projects:rw
+
+    env_file:
+      - /srv/openhands-agent/secrets/.env
+
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: "4G"
+        reservations:
+          cpus: "1"
+          memory: "1G"
+
+    security_opt:
+      - no-new-privileges:true
+
+    read_only: false
+
+    networks:
+      - openhands-net
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  openhands-net:
+    driver: bridge
+    name: openhands-net
