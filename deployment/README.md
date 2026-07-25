@@ -2,7 +2,7 @@
 
 ## Архитектура
 
-```
+```text
 Пользователь (браузер)
   └─ WireGuard (10.77.0.x)
        └─ mini-server (10.77.0.2:8000)
@@ -14,97 +14,124 @@
 
 - **Образ:** `ghcr.io/openhands/agent-canvas:1.6.1`
 - **Порт:** `10.77.0.2:8000` — только через WireGuard
-- **WebUI:** `http://10.77.0.2:8000/canvas` (base path: `/canvas`)
-- **Пользователь в контейнере:** `openhands` (uid 1000)
-- **Docker socket:** не используется (песочница = сам контейнер)
-- **Постоянные данные:** `/home/openhands/.openhands` (настройки) + `/projects` (workspace)
+- **WebUI:** `http://10.77.0.2:8000/canvas`
+- **Пользователь контейнера:** `openhands` (uid 1000)
+- **Docker socket:** не используется
+- **Постоянные данные на хосте:** `/srv/openhands-agent/config/` и `/srv/openhands-agent/workspace/`
 
 ## Первый запуск
 
+Команды выполняются только после отдельного разрешения на реальный запуск.
+
 ```bash
-# 1. Создать каталоги на mini-server
+# 1. Подключиться к mini-server
 ssh mini-server
+
+# 2. Создать отдельные каталоги проекта
 sudo mkdir -p /srv/openhands-agent/{config,workspace,secrets,logs}
 sudo chown -R igor:igor /srv/openhands-agent
+chmod 700 /srv/openhands-agent/secrets
 
-# 2. Сгенерировать API-ключ
-openssl rand -base64 32 > /tmp/api-key.txt
-
-# 3. Создать .env с ключом и моделью
-cat > /srv/openhands-agent/secrets/.env << 'ENVEOF'
-LOCAL_BACKEND_API_KEY=<скопировать из /tmp/api-key.txt>
-LLM_API_KEY=<ваш-ключ-провайдера>
-LLM_MODEL=<ваша-модель>
-LLM_BASE_URL=<ваш-base-url>
-ENVEOF
+# 3. Создать ключ входа в Agent Canvas без временного файла
+umask 077
+printf 'LOCAL_BACKEND_API_KEY=%s\n' "$(openssl rand -base64 32)" \
+  > /srv/openhands-agent/secrets/.env
 chmod 600 /srv/openhands-agent/secrets/.env
 
-# 4. Скопировать compose.yaml на сервер
-scp deployment/compose.yaml mini-server:/srv/openhands-agent/
+# 4. Поместить compose.yaml в каталог проекта
+# Выполняется с компьютера, где клонирован репозиторий:
+# scp deployment/compose.yaml mini-server:/srv/openhands-agent/compose.yaml
 
-# 5. Запустить
+# 5. Проверить конфигурацию без запуска
 cd /srv/openhands-agent
-docker compose up -d
+docker compose config
+
+# 6. Первый запуск
+# docker compose up -d
 ```
 
-## Проверка
+## Проверка после запуска
 
 ```bash
-# Health
-curl -s http://10.77.0.2:8000/ | head -1
+# Проверка WebUI
+curl -sS -o /dev/null -w 'HTTP %{http_code}\n' \
+  http://10.77.0.2:8000/canvas
 
-# Логи
-docker compose -f /srv/openhands-agent/compose.yaml logs -f --tail 50
-
-# Статус
+# Статус контейнера
 docker compose -f /srv/openhands-agent/compose.yaml ps
+
+# Последние логи
+docker compose -f /srv/openhands-agent/compose.yaml logs --tail 100
 ```
 
 ## Доступ
 
-Открыть в браузере (при подключённом WireGuard):
-```
+При подключённом WireGuard открыть:
+
+```text
 http://10.77.0.2:8000/canvas
 ```
 
-Ввести `LOCAL_BACKEND_API_KEY` на экране входа.
+Для входа используется значение `LOCAL_BACKEND_API_KEY` из:
+
+```text
+/srv/openhands-agent/secrets/.env
+```
+
+Сам ключ в GitHub не сохраняется.
 
 ## Настройка LLM
 
-После входа: **Settings → LLM** → выбрать провайдера (OpenAI/Anthropic/OpenRouter), ввести API-ключ и модель. Настройки сохраняются в `/home/openhands/.openhands`.
+После первого входа открыть **Settings → LLM**, выбрать провайдера, модель и ввести API-ключ. Переменные `LLM_API_KEY`, `LLM_MODEL` и `LLM_BASE_URL` в `.env` для этого образа не используются.
 
-## Остановка
+Настройки должны сохраняться через bind mount:
+
+```text
+/srv/openhands-agent/config/ → /home/openhands/.openhands
+```
+
+## Остановка без удаления данных
 
 ```bash
 cd /srv/openhands-agent
 docker compose down
 ```
 
-## Полное удаление тестового запуска
+Каталоги `config/`, `workspace/` и `secrets/` остаются на хосте.
+
+## Удаление только контейнера и сети теста
 
 ```bash
 cd /srv/openhands-agent
-docker compose down --volumes
+docker compose down --remove-orphans
+```
+
+## Полное удаление данных теста
+
+Выполнять только после отдельного подтверждения, поскольку команда необратимо удаляет настройки, ключ входа и workspace:
+
+```bash
+cd /srv/openhands-agent
+docker compose down --remove-orphans
 sudo rm -rf /srv/openhands-agent
 ```
 
-Состояние (config, workspace) будет потеряно! Для сохранения — не удалять `/srv/openhands-agent/config/`.
-
 ## Ограничения безопасности
 
-- Контейнер НЕ имеет доступа к `/var/run/docker.sock`
-- Рабочий каталог — только `/srv/openhands-agent/workspace/`
-- Нет bind-mount каталогов AMNESIA (`/srv/prokop/projects/amnesia/`)
-- Нет bind-mount каталогов Nextcloud (`/srv/nextcloud/`)
-- Сеть изолирована: `openhands-net` (bridge), не подключена к `nextcloud-aio` или `bridge_default`
-- `no-new-privileges:true`
+- контейнер не получает `/var/run/docker.sock`;
+- рабочий каталог ограничен `/srv/openhands-agent/workspace/`;
+- каталоги AMNESIA и Nextcloud не монтируются;
+- используется отдельная сеть `openhands-net`;
+- порт публикуется только на адресе WireGuard `10.77.0.2`;
+- включён `no-new-privileges:true`;
+- настоящие ключи не хранятся в GitHub.
 
 ## Ресурсы
 
-- CPU: максимум 2 ядра, резерв 1 ядро
-- RAM: максимум 4 GB, резерв 1 GB
-- Логи: ротация 10 MB × 3 файла
+- CPU: максимум 2 ядра;
+- RAM: максимум 4 GB;
+- журнал Docker: 10 MB × 3 файла.
 
 ## Автозапуск
 
-`restart: unless-stopped` в compose.yaml. После перезагрузки mini-server контейнер поднимется автоматически (Docker daemon enabled).
+`restart: unless-stopped` поднимает контейнер после перезапуска Docker и mini-server, кроме случая, когда контейнер был намеренно остановлен вручную.
