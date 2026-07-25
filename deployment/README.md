@@ -1,89 +1,82 @@
-# Agent Canvas 1.6.1 — безопасный первый тест
+# OpenHands Agent Canvas — развёртывание
 
-Это единственная инструкция запуска. До отдельной команды ничего на mini-server не устанавливать и не запускать.
+## Архитектура запуска
 
-## Контур теста
+```
+systemd (openhands-agent.service)
+  ├─ ExecStartPre: validate-runtime.sh (проверка .env, wg, docker, compose)
+  └─ ExecStart: run-supervised.sh
+       ├─ docker compose up (foreground)
+       └─ health-watchdog.sh (3×unhealthy → перезапуск)
+```
 
-- WebUI: `http://10.77.0.2:8000/canvas`, только через WireGuard.
-- Публичного домена и второго рубежа авторизации пока нет.
-- `LOCAL_BACKEND_API_KEY` автоматически передаётся frontend внутри приватного WG-контура; отдельного экрана ввода ключа на порту 8000 нет.
-- Модель и её API-ключ вводятся после запуска через `Settings → LLM`.
-- Монтируется только пустой `/srv/openhands-agent/test-workspace`.
-- GitHub, SSH, AMNESIA, Nextcloud, n8n и Notion не подключаются.
-- Docker socket не монтируется.
+**Главный lifecycle:** systemd. `start.sh` — удобная оболочка для ручного теста.
 
-## Владелец жизненного цикла
-
-Единственный владелец запуска — `openhands-agent.service`. В Compose установлено `restart: "no"`. Прямой `docker compose up -d` запрещён.
-
-Systemd ждёт Docker и `wg-quick@wg0`, создаёт контейнер без запуска, устанавливает egress-правила и затем держит `docker compose up` в foreground. При остановке удаляются только правила OpenHands.
-
-## Файлы на mini-server
-
-Репозиторий должен находиться в `/srv/openhands-agent`, чтобы существовали:
-
-- `/srv/openhands-agent/deployment/compose.yaml`;
-- `/srv/openhands-agent/deployment/scripts/`;
-- `/srv/openhands-agent/deployment/network/`;
-- `/srv/openhands-agent/deployment/systemd/openhands-agent.service`.
-
-Постоянные каталоги:
-
-- `config` — mode 700, настройки и LLM-секреты;
-- `secrets` — mode 700;
-- `secrets/.env` — mode 600;
-- `test-workspace` — mode 700;
-- `logs` — mode 700.
-
-## Подготовка перед первым запуском
-
-После отдельного разрешения:
+## Первый запуск (только ручной тест)
 
 ```bash
-sudo /srv/openhands-agent/deployment/scripts/prepare.sh
-sudo cp /srv/openhands-agent/deployment/systemd/openhands-agent.service /etc/systemd/system/
+# На mini-server:
+sudo /usr/bin/bash deployment/scripts/prepare.sh
+
+# Создать secrets/.env
+openssl rand -base64 32 > /tmp/api-key.txt
+cat > /srv/openhands-agent/secrets/.env << 'ENVEOF'
+LOCAL_BACKEND_API_KEY=*** из /tmp/api-key.txt>
+ENVEOF
+chmod 600 /srv/openhands-agent/secrets/.env
+
+# Ручной запуск (без systemd)
+sudo /usr/bin/bash deployment/scripts/start.sh
+```
+
+## Systemd (production)
+
+```bash
+sudo cp deployment/systemd/openhands-agent.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable openhands-agent.service
+sudo systemctl enable --now openhands-agent
 ```
 
-Создать `/srv/openhands-agent/secrets/.env` с одной строкой и правами 600:
-
-```env
-LOCAL_BACKEND_API_KEY=<случайный непустой ключ>
-```
-
-Настоящие LLM-ключи в `.env` не помещаются.
-
-## Запуск и остановка
+## Проверка
 
 ```bash
-/srv/openhands-agent/deployment/scripts/start.sh
-/srv/openhands-agent/deployment/scripts/status.sh
-/srv/openhands-agent/deployment/network/check-egress.sh
-/srv/openhands-agent/deployment/scripts/stop.sh
+sudo /usr/bin/bash deployment/scripts/status.sh
 ```
 
-## Что проверяем в первом тесте
-
-- WebUI с ПК и телефона через WireGuard;
-- Docker health: frontend и внутренние порты Agent Server/Automation;
-- настройку одной LLM через WebUI;
-- загрузку тестового файла;
-- остановку задачи;
-- перезапуск сервиса и сохранение состояния;
-- CPU/RAM;
-- невозможность доступа к AMNESIA, Nextcloud, mini-server SSH, LAN, VPS и произвольным публичным портам.
-
-## Удаление теста
-
-Обычная остановка данные не удаляет. Полное удаление сначала работает в preview-режиме:
+## Остановка
 
 ```bash
-/srv/openhands-agent/deployment/scripts/purge-test.sh
+sudo /usr/bin/bash deployment/scripts/stop.sh
 ```
 
-Необратимое удаление возможно только явно:
+## Полное удаление тестового запуска
 
 ```bash
-/srv/openhands-agent/deployment/scripts/purge-test.sh --confirm-destroy-test-data
+sudo /usr/bin/bash deployment/scripts/purge-test.sh --confirm-destroy-test-data
+```
+
+## Доступ
+
+```
+http://10.77.0.2:8000/canvas (только WireGuard)
+```
+
+LLM настраивается через WebUI (Settings → LLM) после первого входа.
+
+## Сетевая изоляция
+
+Применить egress-правила:
+```bash
+sudo /usr/bin/bash deployment/network/apply-egress-rules.sh
+```
+
+Проверить:
+```bash
+sudo /usr/bin/bash deployment/network/check-egress.sh
+```
+
+## Статическая проверка
+
+```bash
+/usr/bin/bash deployment/scripts/validate-static.sh
 ```
