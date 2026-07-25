@@ -46,7 +46,12 @@ services:
         - CMD-SHELL
         - >-
           curl -fsS -o /dev/null http://127.0.0.1:8000/canvas &&
-          python3 -c "import socket; [(lambda s,p: (s.settimeout(3), s.connect(('127.0.0.1',p)), s.close()))(socket.socket()) for p in (18000,18001)]"
+          python3 -c "
+          import socket;
+          for p in (18000, 18001):
+              s = socket.create_connection(('127.0.0.1', p), timeout=3);
+              s.close()
+          "
       interval: 30s
       timeout: 10s
       retries: 3

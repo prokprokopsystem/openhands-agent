@@ -7,6 +7,8 @@ BASE="/srv/openhands-agent"
 COMPOSE_FILE="${BASE}/deployment/compose.yaml"
 REMOVE_FW="${BASE}/deployment/network/remove-egress-rules.sh"
 UNIT="openhands-agent.service"
+FW_EGRESS="OPENHANDS-EGRESS"
+FW_INPUT="OPENHANDS-INPUT"
 
 MODE="${1:-}"
 
@@ -46,39 +48,53 @@ if systemctl is-enabled --quiet "${UNIT}" 2>/dev/null; then
     systemctl disable "${UNIT}"
 fi
 
-# 3. Удалить firewall (ОШИБКА БЛОКИРУЕТ продолжение)
-if [ -f "${REMOVE_FW}" ]; then
-    echo "Удаление egress-правил..."
-    sudo /usr/bin/bash "${REMOVE_FW}"
-    echo "Firewall удалён."
-else
-    echo "❌ ${REMOVE_FW} не найден"
+# 3. Удалить firewall — ОШИБКА БЛОКИРУЕТ продолжение
+if [ ! -f "${REMOVE_FW}" ]; then
+    echo "ERROR: ${REMOVE_FW} не найден"
     exit 1
 fi
 
-# Проверить отсутствие цепочек
-if iptables -nL OPENHANDS-EGRESS >/dev/null 2>&1; then
-    echo "❌ Цепочка OPENHANDS-EGRESS всё ещё существует"
+echo "Удаление egress-правил..."
+sudo /usr/bin/bash "${REMOVE_FW}"
+
+# 4. Проверить отсутствие цепочек
+if iptables -nL "${FW_EGRESS}" >/dev/null 2>&1; then
+    echo "ERROR: цепочка ${FW_EGRESS} всё ещё существует после remove-egress-rules.sh"
     exit 1
 fi
 
-# 4. Compose down
+if iptables -nL "${FW_INPUT}" >/dev/null 2>&1; then
+    echo "ERROR: цепочка ${FW_INPUT} всё ещё существует после remove-egress-rules.sh"
+    exit 1
+fi
+
+echo "Firewall удалён."
+
+# 5. Compose down — не скрывать ошибку
 cd "${BASE}" 2>/dev/null || true
-docker compose -f "${COMPOSE_FILE}" down -v 2>/dev/null || true
+if ! docker compose -f "${COMPOSE_FILE}" down -v; then
+    echo "ERROR: docker compose down завершился с ошибкой"
+    exit 1
+fi
 
-# 5. Удалить unit-файл
+# 6. Удалить unit-файл
 if [ -f "/etc/systemd/system/${UNIT}" ]; then
     rm -f "/etc/systemd/system/${UNIT}"
     systemctl daemon-reload
 fi
 
-# 6. Удалить Docker-сеть
-docker network rm openhands-net 2>/dev/null || true
+# 7. Удалить Docker-сеть — не скрывать ошибку
+if docker network inspect openhands-net >/dev/null 2>&1; then
+    if ! docker network rm openhands-net; then
+        echo "ERROR: не удалось удалить сеть openhands-net"
+        exit 1
+    fi
+fi
 
-# 7. Удалить каталог (без выхода за ФС)
+# 8. Удалить каталог с защитой от выхода за ФС
 if [ -d "${BASE}" ]; then
-    rm -rf "${BASE}"
+    rm -rf --one-file-system -- "${BASE}"
 fi
 
 echo ""
-echo "✅ Purge завершён."
+echo "Purge завершён."

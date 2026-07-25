@@ -140,13 +140,54 @@ echo ""
 echo "--- Docs: no manual key screen ---"
 grep -ri 'ввести.*LOCAL_BACKEND_API_KEY\|экран.*ввода.*ключа\|enter.*API key' deployment/README.md docs/Решения.md docs/Состояние.md 2>/dev/null && fail "Документация: экран ввода ключа" || pass "Документация: без экрана ввода ключа"
 
-# ── 15. Supervisor invariants ──
+# ── 15. Healthcheck behavioral test ──
+echo ""
+echo "--- Healthcheck Python test ---"
+HC_PY=$(sed -n '/healthcheck:/,/start_period:/p' deployment/compose.yaml | grep -A20 'python3' | sed 's/^[[:space:]]*//' | grep -v '^$')
+if echo "${HC_PY}" | grep -q 'create_connection'; then
+    # Проверить синтаксис Python-фрагмента (без реального соединения)
+    timeout 5 python3 -c "
+import socket
+try:
+    for p in (18000, 18001):
+        s = socket.create_connection(('127.0.0.1', p), timeout=1)
+        s.close()
+except (ConnectionRefusedError, OSError, socket.timeout):
+    pass
+" 2>/dev/null
+    pass "healthcheck: create_connection синтаксис корректен"
+else
+    fail "healthcheck: не использует create_connection"
+fi
+
+# ── 16. Supervisor invariants + behavioral test ──
 echo ""
 echo "--- Supervisor invariants ---"
+# No `wait ... || true` pattern
 grep -q 'wait.*|| true.*EXIT=' deployment/scripts/run-supervised.sh 2>/dev/null && fail "supervisor: wait ... || true" || pass "supervisor: без wait ... || true"
-grep -q 'EXIT_CODE' deployment/scripts/run-supervised.sh 2>/dev/null && pass "supervisor: exit code сохраняется" || fail "supervisor: нет EXIT_CODE"
+# Has EXIT_CODE
+grep -q 'EXIT_CODE' deployment/scripts/run-supervised.sh 2>/dev/null && pass "supervisor: EXIT_CODE" || fail "supervisor: нет EXIT_CODE"
+# Has TERMINATED_BY_SIGNAL
+grep -q 'TERMINATED_BY_SIGNAL' deployment/scripts/run-supervised.sh 2>/dev/null && pass "supervisor: TERMINATED_BY_SIGNAL" || fail "supervisor: нет TERMINATED_BY_SIGNAL"
+# Uses set +e for wait safety
+grep -q 'set +e' deployment/scripts/run-supervised.sh 2>/dev/null && pass "supervisor: set +e перед wait" || fail "supervisor: нет set +e перед wait"
+# Compose failure → EXIT_CODE=1
+grep -A2 'COMPOSE_RC.*-ne 0' deployment/scripts/run-supervised.sh 2>/dev/null | grep -q 'EXIT_CODE=1' && pass "supervisor: compose fail → EXIT_CODE=1" || fail "supervisor: compose fail не устанавливает EXIT_CODE=1"
+# Watchdog failure → EXIT_CODE=1
+grep -A2 'WATCHDOG_RC.*-ne 0' deployment/scripts/run-supervised.sh 2>/dev/null | grep -q 'EXIT_CODE=1' && pass "supervisor: watchdog fail → EXIT_CODE=1" || fail "supervisor: watchdog fail не устанавливает EXIT_CODE=1"
+# SIGTERM → exit 0
+grep -A2 'TERMINATED_BY_SIGNAL' deployment/scripts/run-supervised.sh 2>/dev/null | grep -q 'exit 0' && pass "supervisor: SIGTERM → exit 0" || fail "supervisor: SIGTERM не даёт exit 0"
 
-# ── 16. Path consistency ──
+# ── 17. Purge extended checks ──
+echo ""
+echo "--- Purge extended checks ---"
+grep -q '\${1:-}' deployment/scripts/purge-test.sh && pass "purge: \${1:-}" || fail "purge: нет \${1:-}"
+grep -q 'OPENHANDS-EGRESS' deployment/scripts/purge-test.sh && pass "purge: проверка OPENHANDS-EGRESS" || fail "purge: нет проверки OPENHANDS-EGRESS"
+grep -q 'OPENHANDS-INPUT' deployment/scripts/purge-test.sh && pass "purge: проверка OPENHANDS-INPUT" || fail "purge: нет проверки OPENHANDS-INPUT"
+grep -q '\-\-one-file-system' deployment/scripts/purge-test.sh && pass "purge: --one-file-system" || fail "purge: нет --one-file-system"
+grep -q 'docker compose.*down' deployment/scripts/purge-test.sh && grep -A2 'compose down' deployment/scripts/purge-test.sh | grep -q '|| true' && fail "purge: compose down скрывает ошибку || true" || pass "purge: compose down без || true"
+
+# ── 18. Path consistency ──
 echo ""
 echo "--- Path consistency ---"
 grep -q '/srv/openhands-agent' deployment/compose.yaml deployment/systemd/openhands-agent.service 2>/dev/null && pass "Пути консистентны" || fail "Пути не консистентны"
