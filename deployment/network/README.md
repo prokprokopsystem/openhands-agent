@@ -1,48 +1,58 @@
-# Сетевая egress-изоляция OpenHands Agent
+# Сетевая изоляция тестового OpenHands
 
-## Подсеть
+Подсеть контейнера фиксирована: `10.89.0.0/28`, адрес контейнера `10.89.0.2`.
 
-OpenHands использует фиксированную Docker-подсеть: **10.89.0.0/28**
+Правила применяются только к этой подсети через отдельные цепочки:
 
-Правила применяются ТОЛЬКО к этой подсети. Другие контейнеры не затрагиваются.
+- `OPENHANDS-EGRESS`, переход из `DOCKER-USER`;
+- `OPENHANDS-INPUT`, переход из `INPUT`.
 
 ## Политика
 
-| Трафик | Разрешён |
-|---|---|
-| DNS (53/udp, 53/tcp) | ✅ |
-| Исходящий HTTPS (443/tcp) | ✅ |
-| 10.0.0.0/8 (включая WG) | ❌ |
-| 192.168.0.0/16 (LAN) | ❌ |
-| 172.16.0.0/12 (Docker-сети) | ❌ |
-| localhost хоста | ❌ |
+Разрешены:
 
-## Скрипты
+- ответы `ESTABLISHED,RELATED`;
+- DNS TCP/UDP 53;
+- внешний HTTP/HTTPS TCP 80/443.
 
-- `apply-egress-rules.sh` — применить правила (требует sudo)
-- `check-egress.sh` — проверить изоляцию (изнутри контейнера)
-- `remove-egress-rules.sh` — удалить только правила OpenHands (требует sudo)
+Запрещены:
 
-## Применение
+- mini-server и Docker gateway;
+- WireGuard и сети `10.0.0.0/8`;
+- LAN `192.168.0.0/16`;
+- чужие Docker-сети `172.16.0.0/12`;
+- CGNAT/link-local/loopback;
+- VPS `95.217.239.148`;
+- все остальные публичные порты;
+- IPv6 внутри контейнера.
+
+Порядок правил детерминирован. Ошибки не подавляются. Скрипты идемпотентны.
+
+## Жизненный цикл
+
+Правила не применяются вручную при штатной эксплуатации. `openhands-agent.service` выполняет последовательность:
+
+1. подготовка каталогов;
+2. ожидание `wg0` и адреса `10.77.0.2`;
+3. статическая проверка Compose;
+4. `docker compose create` без запуска;
+5. применение сетевых правил;
+6. запуск Compose в foreground.
+
+При остановке контейнер сначала останавливается, затем `ExecStopPost` удаляет только правила OpenHands.
+
+## Ручная проверка после запуска
+
+Запускать на хосте:
 
 ```bash
-sudo bash deployment/network/apply-egress-rules.sh
+bash /srv/openhands-agent/deployment/network/check-egress.sh
 ```
 
-Правила действуют до перезагрузки. Для постоянного применения — добавить в iptables-persistent или аналог (этап эксплуатации).
+Скрипт сам выполняет сетевые команды через `docker exec openhands-agent`. Он проверяет внешний HTTPS и блокировку AMNESIA, Nextcloud, SSH mini-server, Docker gateway, LAN-роутера, VPS, публичного SSH и IPv6.
 
-## Проверка
-
-```bash
-# Изнутри контейнера:
-docker exec openhands-agent bash deployment/network/check-egress.sh
-
-# Или с хоста:
-bash deployment/network/check-egress.sh
-```
-
-## Удаление
+## Аварийное удаление правил
 
 ```bash
-sudo bash deployment/network/remove-egress-rules.sh
+sudo /srv/openhands-agent/deployment/network/remove-egress-rules.sh
 ```
