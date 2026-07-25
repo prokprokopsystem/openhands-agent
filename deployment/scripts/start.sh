@@ -16,9 +16,10 @@ done
 
 KEY=$(sed -n 's/^LOCAL_BACKEND_API_KEY=//p' "${ENV_FILE}" | tail -n 1)
 [[ -n "${KEY}" ]] || { echo "ERROR: LOCAL_BACKEND_API_KEY is empty" >&2; exit 1; }
-case "${KEY}" in
-  your-generated-key-here|***|*'< '*|*'>'*) echo "ERROR: LOCAL_BACKEND_API_KEY is still a template" >&2; exit 1 ;;
-esac
+if [[ "${KEY}" == "your-generated-key-here" || "${KEY}" == "***" || "${KEY}" == *"<"* || "${KEY}" == *">"* ]]; then
+  echo "ERROR: LOCAL_BACKEND_API_KEY is still a template" >&2
+  exit 1
+fi
 
 ip -4 addr show dev wg0 | grep -q '10.77.0.2/' || { echo "ERROR: WireGuard address 10.77.0.2 is absent" >&2; exit 1; }
 systemctl cat "${UNIT}" >/dev/null 2>&1 || { echo "ERROR: ${UNIT} is not installed" >&2; exit 1; }
