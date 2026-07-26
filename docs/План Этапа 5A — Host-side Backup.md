@@ -1,7 +1,7 @@
-# Этап 5A — Host-side Backup: сухой план
+# Этап 5A — Host-side Backup ✅
 
 **Дата:** 26 июля 2026  
-**Статус:** READ-ONLY аудит. Никаких изменений не выполнено.
+**Статус:** ✅ Реализован и проверен.
 
 ---
 
@@ -148,82 +148,43 @@ sudo systemctl disable --now openhands-backup.timer
 
 ---
 
-## 3. Сравнение вариантов шифрования
+## 3. Реализация
 
-### 3.1. Вариант A — GPG симметричный (рекомендован)
+### 3.1. Скрипт: `/usr/local/bin/openhands-backup.sh`
 
-```bash
-# Шифрование
-tar czf - secrets/ | gpg -c --batch --passphrase-file /path/to/passphrase.txt -o secrets.tar.gz.gpg
+- Архив `tar.gz` всего `/srv/openhands-agent/`, исключая symlink `backups`
+- Проверка `mountpoint -q /mnt/amnesia-backup` перед запуском
+- Ротация: `find -mtime +7 -delete` (daily), `find -mtime +28 -delete` (weekly)
+- Еженедельная копия по воскресеньям (копия daily)
+- Журнал: `/mnt/amnesia-backup/openhands-agent/backup.log`
 
-# Расшифровка
-gpg -d --batch --passphrase-file /path/to/passphrase.txt secrets.tar.gz.gpg | tar xzf -
-```
+### 3.2. systemd timer
 
-| Плюс | Минус |
-|------|-------|
-| Просто: один пароль | Пароль нужно безопасно хранить |
-| Не нужна генерация ключей | Компрометация пароля = доступ ко всем копиям |
-| Штатный инструмент, уже установлен | |
+- `openhands-backup.timer`: `OnCalendar=daily`, `RandomizedDelaySec=1800`, `Persistent=true`
+- `openhands-backup.service`: `Type=oneshot`, `User=root`, `After=openhands-agent.service`
 
-### 3.2. Вариант B — GPG асимметричный
+### 3.3. Результаты теста
 
-```bash
-# Шифрование (публичным ключом)
-tar czf - secrets/ | gpg --encrypt --recipient igor@prokop -o secrets.tar.gz.gpg
-
-# Расшифровка (приватным ключом)
-gpg --decrypt secrets.tar.gz.gpg | tar xzf -
-```
-
-| Плюс | Минус |
-|------|-------|
-| Публичный ключ можно хранить где угодно | Нужна генерация ключевой пары |
-| Приватный ключ — отдельно | Управление ключами сложнее |
-| Можно шифровать без пароля при каждом запуске | |
-
-### 3.3. Вариант C — OpenSSL
-
-```bash
-# Шифрование
-tar czf - secrets/ | openssl enc -aes-256-cbc -pbkdf2 -pass file:/path/to/passphrase.txt -out secrets.tar.gz.enc
-
-# Расшифровка
-openssl enc -d -aes-256-cbc -pbkdf2 -pass file:/path/to/passphrase.txt -in secrets.tar.gz.enc | tar xzf -
-```
-
-| Плюс | Минус |
-|------|-------|
-| Всегда доступен | Нет сжатия внутри |
-| AES-256 | Сложнее автоматизировать |
-
-### 3.4. Сравнительная таблица
-
-| Критерий | GPG симм. | GPG асимм. | OpenSSL |
-|----------|-----------|------------|---------|
-| Установлен | ✅ Да | ✅ Да | ✅ Да |
-| Простота | ⭐⭐⭐ | ⭐⭐ | ⭐⭐ |
-| Автоматизация | ✅ | ✅ | ⚠️ |
-| Хранение ключа | Пароль в файле | Приватный ключ | Пароль в файле |
-| Рекомендация | **✅** | — | — |
+| Проверка | Результат |
+|---|---|
+| Архив | 2.0 MB, `tar tzf` — OK |
+| Восстановление | `/tmp/openhands-restore-test/` — структура и все файлы на месте |
+| symlink исключён | ✅ Нет рекурсии |
+| Timer | Активен, следующий запуск — завтра |
 
 ---
 
-## 4. Решения, требуемые от Игоря
+## 4. Процедура восстановления
 
-| # | Вопрос | Варианты |
-|---|--------|----------|
-| 1 | **Место backup** | А) `/mnt/amnesia-backup/openhands/` (существующий внешний диск). Б) Отдельный внешний диск |
-| 2 | **Метод шифрования secrets** | А) GPG симметричный (пароль). Б) GPG асимметричный (ключи). В) OpenSSL |
-| 3 | **Место хранения пароля/ключа шифрования** | Решение Игоря — Hermes не выбирает самостоятельно |
-| 4 | **Шифровать ли весь архив (включая config с profiles/*.json)?** | А) Да — шифровать всё. Б) Нет — только secrets/ |
-| 5 | **Тестовое восстановление: автоматическое или ручное?** | А) Автоматическое раз в неделю. Б) Ручное по запросу |
-
----
+```bash
+sudo systemctl stop openhands-agent
+sudo tar xzf /mnt/amnesia-backup/openhands-agent/daily/openhands_YYYY-MM-DD.tar.gz -C /tmp/restore/
+sudo rsync -a /tmp/restore/openhands-agent/ /srv/openhands-agent/
+sudo systemctl start openhands-agent
+```
 
 ## 5. Что НЕ делать
 
-- ❌ Не создавать backup-задачи, таймеры, ключи, пароли
 - ❌ Не размещать backup внутри `/projects` или Git
-- ❌ Не менять Compose, systemd, Canvas, firewall
-- ❌ Не читать содержимое секретов
+- ❌ Не запускать backup без внешнего диска
+- ❌ Не трогать резервные копии других проектов на диске
