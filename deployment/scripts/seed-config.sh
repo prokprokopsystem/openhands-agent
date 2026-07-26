@@ -69,15 +69,16 @@ seed_one "${TEMPLATES}/settings.json"                "${TARGET}/settings.json"
 seed_one "${TEMPLATES}/profiles/deepseek-chat.json"   "${TARGET}/profiles/deepseek-chat.json"
 seed_one "${TEMPLATES}/agent-profiles/default.json"   "${TARGET}/agent-profiles/default.json"
 
-# 5. Проверить отсутствие плейсхолдера в результате
-if [ "${FORCE}" = "true" ] || [ ! -f "${TARGET}/settings.json" ]; then
-    :
-else
-    if grep -q "${PLACEHOLDER}" "${TARGET}/settings.json" 2>/dev/null; then
-        echo "ERROR: Placeholder still present in ${TARGET}/settings.json"
+# 5. Проверить отсутствие плейсхолдера во всех созданных файлах
+for check_file in \
+    "${TARGET}/settings.json" \
+    "${TARGET}/profiles/deepseek-chat.json" \
+    "${TARGET}/agent-profiles/default.json"; do
+    if grep -q "${PLACEHOLDER}" "${check_file}" 2>/dev/null; then
+        echo "ERROR: Placeholder still present in ${check_file}"
         exit 1
     fi
-fi
+done
 
 echo ""
 echo "Config seeded successfully."

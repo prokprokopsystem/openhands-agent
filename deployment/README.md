@@ -30,23 +30,37 @@ sudo cp -a ~/openhands-agent-stage/deployment /srv/openhands-agent/
 sudo chown -R igor:igor /srv/openhands-agent/deployment
 rm -rf ~/openhands-agent-stage
 
-# Проверить каноническую структуру и подготовить runtime-каталоги
+# Проверить каноническую структуру
 test -f /srv/openhands-agent/deployment/compose.yaml
+```
+
+### 2. Секретный .env (ДО первого prepare.sh)
+
+Создать `/srv/openhands-agent/secrets/.env` (mode 600) с двумя переменными.
+Эта операция выполняется только при первой установке.
+Существующий `.env` при перезапуске или обновлении не заменять.
+
+```bash
+# Скопировать шаблон и задать ключи
+sudo cp /srv/openhands-agent/deployment/.env.example /srv/openhands-agent/secrets/.env
+sudo chmod 600 /srv/openhands-agent/secrets/.env
+
+# Сгенерировать LOCAL_BACKEND_API_KEY и записать в файл
+sudo sed -i "s|LOCAL_BACKEND_API_KEY=.*|LOCAL_BACKEND_API_KEY=$(openssl rand -base64 32 | tr -d '\n')|" \
+  /srv/openhands-agent/secrets/.env
+
+# Вписать реальный DeepSeek API-ключ (получить на https://platform.deepseek.com/api_keys)
+sudo sed -i "s|DEEPSEEK_API_KEY=.*|DEEPSEEK_API_KEY=sk-ваш-ключ|" \
+  /srv/openhands-agent/secrets/.env
+```
+
+После задания ключей — запустить `prepare.sh`:
+
+```bash
 sudo /usr/bin/bash /srv/openhands-agent/deployment/scripts/prepare.sh
 ```
 
-`prepare.sh` назначает `config/` и `test-workspace/` владельцу `10001:10001` — пользователю `openhands` внутри закреплённого образа Agent Canvas 1.6.1. `secrets/` и `logs/` остаются у пользователя `igor`. Не заменяйте эти права общим `chown -R igor:igor /srv/openhands-agent`.
-
-### 2. Создание ключа
-
-Эта операция выполняется только при первой установке. Существующий `.env` при перезапуске, обновлении или повторном запуске `prepare.sh` не заменять и новый ключ не генерировать.
-
-```bash
-umask 077
-printf 'LOCAL_BACKEND_API_KEY=%s\n' "$(openssl rand -base64 32 | tr -d '\n')" \
-  > /srv/openhands-agent/secrets/.env
-chmod 600 /srv/openhands-agent/secrets/.env
-```
+`prepare.sh` создаст runtime-каталоги, назначит `config/` и `work-workspace/` владельцу `10001:10001` (пользователь `openhands` внутри контейнера) и вызовет `seed-config.sh` для развёртывания конфигурации Canvas из шаблонов с подстановкой `DEEPSEEK_API_KEY`. `secrets/` и `logs/` остаются у пользователя `igor`. Не заменяйте эти права общим `chown -R igor:igor /srv/openhands-agent`.
 
 ### 3. Установка systemd unit
 
