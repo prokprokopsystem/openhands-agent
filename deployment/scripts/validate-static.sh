@@ -166,6 +166,19 @@ fi
 # ── 13. Docs: no manual compose launch ──
 echo ""
 echo "--- Docs: no manual compose ---"
+SSH_SESSION_LINE=$(grep -n '^ssh mini-server$' deployment/README.md | head -1 | cut -d: -f1 || true)
+KEY_SECTION_LINE=$(grep -n '^### 2\. Создание ключа$' deployment/README.md | head -1 | cut -d: -f1 || true)
+if [ -n "${SSH_SESSION_LINE}" ] && [ -n "${KEY_SECTION_LINE}" ] && [ "${SSH_SESSION_LINE}" -lt "${KEY_SECTION_LINE}" ]; then
+    pass "README: постоянная SSH-сессия открывается перед созданием ключа"
+else
+    fail "README: нет явного ssh mini-server перед созданием ключа"
+fi
+grep -q '^Все дальнейшие команды до конца инструкции выполняются внутри этой SSH-сессии на mini-server\.$' deployment/README.md \
+    && pass "README: дальнейшие команды явно относятся к mini-server" \
+    || fail "README: нет пояснения о постоянной SSH-сессии"
+grep -q '^exit$' deployment/README.md \
+    && pass "README: SSH-сессия завершается командой exit" \
+    || fail "README: нет exit в конце инструкции"
 grep -r 'docker compose up' deployment/README.md 2>/dev/null | grep -v 'запрещ\|ЗАПРЕЩ\|forbidden' >/dev/null && fail "README: docker compose up" || pass "README: без docker compose up"
 grep -r 'systemctl start' deployment/README.md 2>/dev/null && pass "README: systemctl start" || fail "README: нет systemctl start"
 grep -q 'mini-server:~/openhands-agent-stage/' deployment/README.md && pass "README: копирование через домашний staging" || fail "README: нет домашнего staging"

@@ -18,7 +18,12 @@ ssh mini-server 'sudo mkdir -p /srv/openhands-agent && sudo cp -a ~/openhands-ag
 
 # Создать каталоги и права
 ssh mini-server 'sudo /usr/bin/bash /srv/openhands-agent/deployment/scripts/prepare.sh'
+
+# Открыть постоянную SSH-сессию для дальнейших команд
+ssh mini-server
 ```
+
+Все дальнейшие команды до конца инструкции выполняются внутри этой SSH-сессии на mini-server.
 
 ### 2. Создание ключа
 
@@ -73,6 +78,12 @@ sudo /usr/bin/bash /srv/openhands-agent/deployment/scripts/purge-test.sh
 
 # Удаление
 sudo /usr/bin/bash /srv/openhands-agent/deployment/scripts/purge-test.sh --confirm-destroy-test-data
+```
+
+### 10. Завершение SSH-сессии
+
+```bash
+exit
 ```
 
 ## Lifecycle
