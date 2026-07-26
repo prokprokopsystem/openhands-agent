@@ -8,22 +8,34 @@
 
 ### 1. Подготовка
 
+На рабочем компьютере:
+
 ```bash
 # Подготовить staging в домашнем каталоге и скопировать deployment
 ssh mini-server 'rm -rf ~/openhands-agent-stage && mkdir -p ~/openhands-agent-stage'
 scp -r deployment mini-server:~/openhands-agent-stage/
 
-# Перенести deployment в /srv без вложенности deployment/deployment
-ssh mini-server 'sudo mkdir -p /srv/openhands-agent && sudo cp -a ~/openhands-agent-stage/deployment /srv/openhands-agent/ && sudo chown -R igor:igor /srv/openhands-agent && rm -rf ~/openhands-agent-stage'
-
-# Создать каталоги и права
-ssh mini-server 'sudo /usr/bin/bash /srv/openhands-agent/deployment/scripts/prepare.sh'
-
-# Открыть постоянную SSH-сессию для дальнейших команд
+# Открыть постоянную SSH-сессию
 ssh mini-server
 ```
 
-Все дальнейшие команды до конца инструкции выполняются внутри этой SSH-сессии на mini-server.
+Все дальнейшие команды до конца инструкции выполняются внутри этой SSH-сессии на mini-server. Команды с `sudo` запросят пароль пользователя `igor` локально в терминале; пароль нельзя передавать Hermes или записывать в команду.
+
+Внутри SSH-сессии:
+
+```bash
+# Перенести deployment в /srv без вложенности deployment/deployment
+sudo mkdir -p /srv/openhands-agent
+sudo cp -a ~/openhands-agent-stage/deployment /srv/openhands-agent/
+sudo chown -R igor:igor /srv/openhands-agent/deployment
+rm -rf ~/openhands-agent-stage
+
+# Проверить каноническую структуру и подготовить runtime-каталоги
+test -f /srv/openhands-agent/deployment/compose.yaml
+sudo /usr/bin/bash /srv/openhands-agent/deployment/scripts/prepare.sh
+```
+
+`prepare.sh` назначает `config/` и `test-workspace/` владельцу `10001:10001` — пользователю `openhands` внутри закреплённого образа Agent Canvas 1.6.1. `secrets/` и `logs/` остаются у пользователя `igor`. Не заменяйте эти права общим `chown -R igor:igor /srv/openhands-agent`.
 
 ### 2. Создание ключа
 
