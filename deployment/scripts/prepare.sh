@@ -47,3 +47,7 @@ ls -ld \
     "${BASE}/work-workspace" \
     "${BASE}/docs" \
     "${BASE}/logs"
+
+# Развернуть конфигурацию Canvas из шаблонов с подстановкой DEEPSEEK_API_KEY.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+"${SCRIPT_DIR}/seed-config.sh"

@@ -6,7 +6,7 @@ secrets/
 **/secrets/
 
 # Agent Canvas runtime data
-config/
+/config/
 workspace/
 logs/
 backups/

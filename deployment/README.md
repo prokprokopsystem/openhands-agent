@@ -123,6 +123,33 @@ systemd openhands-agent.service
 - **Firewall:** контейнер стартует ТОЛЬКО после применения egress-правил.
 - **Watchdog:** 3×unhealthy → перезапуск через systemd Restart=on-failure.
 - **Healthcheck:** `/canvas` HTTP 200 + TCP-проверка портов 18000/18001. TCP = доступность порта, не функциональная readiness API.
-- **LLM:** через WebUI, не через env.
+- **LLM:** через шаблоны конфигурации (`deployment/config/`), не через env. Модель: `deepseek/deepseek-v4-pro`.
 - **Авторизация:** `LOCAL_BACKEND_API_KEY` передаётся frontend автоматически. Экрана ручного ввода нет. Защита — WireGuard.
 - **Секреты:** только в `/srv/openhands-agent/secrets/.env` (mode 600). Не в Git.
+- **GitHub воспроизводимость:** `prepare.sh` → `seed-config.sh` разворачивает конфигурацию Canvas из шаблонов с подстановкой `DEEPSEEK_API_KEY` из `secrets/.env`.
+
+## Секреты, задаваемые пользователем
+
+Перед запуском создать `/srv/openhands-agent/secrets/.env` (mode 600) с двумя переменными:
+
+| Переменная | Назначение | Получить |
+|---|---|---|
+| `LOCAL_BACKEND_API_KEY` | Доступ к Agent Canvas API | `openssl rand -base64 32 \| tr -d '\n'` |
+| `DEEPSEEK_API_KEY` | DeepSeek LLM API | https://platform.deepseek.com/api_keys |
+
+Шаблон: `deployment/.env.example`.
+
+## Как GitHub восстанавливает конфигурацию Canvas
+
+1. `prepare.sh` создаёт каталоги и вызывает `seed-config.sh`.
+2. `seed-config.sh` читает `DEEPSEEK_API_KEY` из `secrets/.env`.
+3. Копирует шаблоны из `deployment/config/` → `/srv/openhands-agent/config/`.
+4. Заменяет `DEEPSEEK_API_KEY_PLACEHOLDER` на реальный ключ.
+5. Устанавливает права `10001:10001`, mode 600.
+
+Результат после `prepare.sh`:
+- `config/agent-profiles/default.json` — UUID-профиль с 10 инструментами WORK MODE, critic_enabled: true, RU system_message_suffix
+- `config/profiles/deepseek-chat.json` — модель `deepseek/deepseek-v4-pro`, base_url `https://api.deepseek.com/v1`
+- `config/settings.json` — `active_profile: deepseek-chat`, `active_agent_profile_id: 2e07efc4-...`
+
+Существующая конфигурация не перезаписывается. Для принудительного обновления: `seed-config.sh --force`.
