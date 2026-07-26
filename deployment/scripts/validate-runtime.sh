@@ -6,6 +6,10 @@ set -euo pipefail
 BASE="/srv/openhands-agent"
 COMPOSE_FILE="${BASE}/deployment/compose.yaml"
 SECRETS_FILE="${BASE}/secrets/.env"
+CONTAINER_UID="10001"
+CONTAINER_GID="10001"
+HOST_UID="$(id -u igor)"
+HOST_GID="$(id -g igor)"
 
 ok()   { printf '  [OK] %s\n' "$1"; }
 fail() { printf '  [FAIL] %s\n' "$1"; exit 1; }
@@ -32,6 +36,24 @@ for d in config secrets test-workspace logs; do
     [ "${P}" = "700" ] || fail "${DIR} права ${P}, требуется 700"
 done
 ok "Каталоги: 700"
+
+for d in config test-workspace; do
+    DIR="${BASE}/${d}"
+    U=$(stat -c "%u" "${DIR}")
+    G=$(stat -c "%g" "${DIR}")
+    [ "${U}:${G}" = "${CONTAINER_UID}:${CONTAINER_GID}" ] \
+        || fail "${DIR} владелец ${U}:${G}, требуется ${CONTAINER_UID}:${CONTAINER_GID}"
+done
+ok "Bind mounts: владелец ${CONTAINER_UID}:${CONTAINER_GID}"
+
+for d in secrets logs; do
+    DIR="${BASE}/${d}"
+    U=$(stat -c "%u" "${DIR}")
+    G=$(stat -c "%g" "${DIR}")
+    [ "${U}:${G}" = "${HOST_UID}:${HOST_GID}" ] \
+        || fail "${DIR} владелец ${U}:${G}, требуется ${HOST_UID}:${HOST_GID} (igor)"
+done
+ok "Хостовые каталоги: владелец igor"
 
 [ -f "${SECRETS_FILE}" ] || fail "${SECRETS_FILE} не существует"
 P=$(stat -c "%a" "${SECRETS_FILE}")
