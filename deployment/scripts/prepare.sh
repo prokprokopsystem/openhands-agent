@@ -4,20 +4,28 @@
 set -euo pipefail
 
 BASE="/srv/openhands-agent"
-OWNER="igor:igor"
+HOST_OWNER="igor:igor"
+CONTAINER_OWNER="10001:10001"
 
 echo "=== OpenHands Agent Canvas — подготовка каталогов ==="
 
-for d in config secrets test-workspace logs; do
+# Каталоги, в которые пишет процесс Agent Canvas внутри контейнера.
+for d in config test-workspace; do
     mkdir -p "${BASE}/${d}"
+    chown -R "${CONTAINER_OWNER}" "${BASE}/${d}"
     chmod 700 "${BASE}/${d}"
 done
 
-chown -R "${OWNER}" "${BASE}"
+# Хостовые runtime-каталоги. Секреты создаёт и обслуживает igor.
+for d in secrets logs; do
+    mkdir -p "${BASE}/${d}"
+    chown -R "${HOST_OWNER}" "${BASE}/${d}"
+    chmod 700 "${BASE}/${d}"
+done
 
 if [ -f "${BASE}/secrets/.env" ]; then
     chmod 600 "${BASE}/secrets/.env"
-    chown "${OWNER}" "${BASE}/secrets/.env"
+    chown "${HOST_OWNER}" "${BASE}/secrets/.env"
     echo "secrets/.env — права 600"
 else
     echo "⚠️  secrets/.env ещё не создан. Создайте командой:"
@@ -28,4 +36,8 @@ fi
 
 echo ""
 echo "Каталоги подготовлены:"
-ls -la "${BASE}/"
+ls -ld \
+    "${BASE}/config" \
+    "${BASE}/secrets" \
+    "${BASE}/test-workspace" \
+    "${BASE}/logs"
