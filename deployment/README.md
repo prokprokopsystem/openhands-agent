@@ -37,24 +37,34 @@ test -f /srv/openhands-agent/deployment/compose.yaml
 ### 2. Секретный .env (ДО первого prepare.sh)
 
 Создать `/srv/openhands-agent/secrets/.env` (mode 600) с двумя переменными.
-Эта операция выполняется только при первой установке.
-Существующий `.env` при перезапуске или обновлении не заменять.
+Операция выполняется только при первой установке.
+Существующий `.env` никогда не перезаписывается.
 
 ```bash
-# Скопировать шаблон и задать ключи
-sudo cp /srv/openhands-agent/deployment/.env.example /srv/openhands-agent/secrets/.env
-sudo chmod 600 /srv/openhands-agent/secrets/.env
+# Создать каталог для секретов
+sudo mkdir -p /srv/openhands-agent/secrets
+sudo chown igor:igor /srv/openhands-agent/secrets
+sudo chmod 700 /srv/openhands-agent/secrets
 
-# Сгенерировать LOCAL_BACKEND_API_KEY и записать в файл
-sudo sed -i "s|LOCAL_BACKEND_API_KEY=.*|LOCAL_BACKEND_API_KEY=$(openssl rand -base64 32 | tr -d '\n')|" \
-  /srv/openhands-agent/secrets/.env
-
-# Вписать реальный DeepSeek API-ключ (получить на https://platform.deepseek.com/api_keys)
-sudo sed -i "s|DEEPSEEK_API_KEY=.*|DEEPSEEK_API_KEY=sk-ваш-ключ|" \
-  /srv/openhands-agent/secrets/.env
+# Создать .env (только если не существует)
+if [ ! -f /srv/openhands-agent/secrets/.env ]; then
+    # LOCAL_BACKEND_API_KEY генерируется автоматически
+    LK=$(openssl rand -base64 32 | tr -d '\n')
+    # DEEPSEEK_API_KEY: вводится скрыто, не попадает в историю и не выводится
+    echo "Enter DeepSeek API key (https://platform.deepseek.com/api_keys):"
+    read -s DK
+    echo ""
+    # Записать обе переменные. Значения не выводятся.
+    sudo printf 'LOCAL_BACKEND_API_KEY=%s\nDEEPSEEK_API_KEY=%s\n' "$LK" "$DK" \
+      > /srv/openhands-agent/secrets/.env
+    sudo chmod 600 /srv/openhands-agent/secrets/.env
+    echo ".env created (mode 600)."
+else
+    echo ".env already exists — skipping."
+fi
 ```
 
-После задания ключей — запустить `prepare.sh`:
+После создания `.env` — запустить `prepare.sh`:
 
 ```bash
 sudo /usr/bin/bash /srv/openhands-agent/deployment/scripts/prepare.sh
