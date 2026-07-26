@@ -13,6 +13,7 @@ services:
 
     ports:
       - "10.77.0.2:8000:8000"
+      - "192.168.100.106:8000:8000"
 
     volumes:
       - /srv/openhands-agent/config:/home/openhands/.openhands:rw
