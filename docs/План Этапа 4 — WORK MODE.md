@@ -2,7 +2,7 @@
 
 **Дата:** 26 июля 2026  
 **Основание:** DEC-021, DEC-022, docs/Архитектура.md, исследование API Agent Canvas 1.6.1  
-**Статус:** READ-ONLY анализ. Никаких изменений не выполнено.
+**Статус:** READ-ONLY анализ. Решения Игоря зафиксированы. Никаких изменений не выполнено.
 
 ---
 
@@ -20,16 +20,33 @@
 
 **Вывод:** постоянный профиль разрешений — это agent-профиль (`agent-profiles/*.json`) + `agent_context` внутри `settings.json`. Оба переживают restart (bind mount).
 
-### 1.2. Инструменты (16 шт.)
+### 1.2. Инструменты — 16 шт., дублей не выявлено
 
 | Категория | Инструменты |
 |-----------|-------------|
 | Файлы | `file_editor`, `edit`, `read_file`, `write_file`, `list_directory`, `glob`, `grep`, `planning_file_editor` |
 | Терминал | `terminal` |
-| Задачи | `task_tool_set`, `task`, `task_tracker` |
-| Workflow | `workflow_tool_set`, `workflow` |
+| Задачи | `task_tool_set` (включает `task` + `task_tracker`) |
+| Workflow | `workflow_tool_set` (включает `workflow`) |
 | Браузер | `browser_tool_set` |
 | UI | `canvas_ui_control` |
+
+**Проверка дублей:** `file_editor` и `edit` — разные инструменты (file_editor = полноценный редактор, edit = targeted search-and-replace). `task_tool_set` — это bundle, содержащий `task` и `task_tracker`; при включении `task_tool_set` отдельные `task`/`task_tracker` не нужны. `workflow_tool_set` — bundle, содержащий `workflow`.
+
+**Для WORK MODE предложено 10 инструментов** (исключены: `browser_tool_set`, `workflow_tool_set`, `workflow`, `task`, `task_tracker`, `file_editor`, `planning_file_editor`):
+
+| # | Инструмент | Обоснование |
+|---|-----------|-------------|
+| 1 | `terminal` | Основной рабочий инструмент |
+| 2 | `read_file` | Чтение файлов |
+| 3 | `write_file` | Запись файлов |
+| 4 | `edit` | Прицельное редактирование (замена `file_editor`) |
+| 5 | `list_directory` | Навигация по каталогам |
+| 6 | `glob` | Поиск файлов по маске |
+| 7 | `grep` | Поиск по содержимому |
+| 8 | `task_tool_set` | Управление задачами (вместо отдельных `task` + `task_tracker`) |
+| 9 | `planning_file_editor` | Редактирование планов |
+| 10 | `canvas_ui_control` | Управление UI |
 
 Все инструменты доступны когда `tools: null` (текущее состояние). Можно ограничить списком.
 
@@ -48,7 +65,16 @@
 - Тонкая настройка «подтверждать опасные действия» реализуется через **prompt** (system_message_suffix в agent_context) + `security_analyzer: "llm"`.
 - Ограничение рабочей области — через `volumes` в compose (bind mount конкретных каталогов).
 
-### 1.4. Egress-политика (текущая)
+### 1.4. Текущие mount-точки
+
+| Тип | Источник | Назначение | Права |
+|-----|----------|-----------|-------|
+| bind | `/srv/openhands-agent/config` | `/home/openhands/.openhands` | RW |
+| bind | `/srv/openhands-agent/test-workspace` | `/projects` | RW |
+
+Docker named volumes не используются для `/projects` или `/home/openhands/.openhands`. Оба — bind mount.
+
+### 1.5. Egress-политика (текущая)
 
 ```
 ESTABLISHED,RELATED → RETURN
@@ -58,9 +84,39 @@ HTTP/HTTPS (80, 443) → RETURN
 ВСЁ ОСТАЛЬНОЕ → DROP
 ```
 
-**Для WORK MODE потребуется:** открыть egress к конкретным внутренним сервисам (API Notion через интернет уже доступен по 443; n8n на VPS — нужен доступ к `95.217.239.148:443`; Nextcloud — нужен доступ к `cloud.prokop-agent.duckdns.org:443`).
+### 1.6. Файловая изоляция — проверка доступа UID 10001
 
-### 1.5. Механизмы интеграции
+**Проверялся доступ изнутри контейнера (UID 10001 = пользователь `openhands`):**
+
+| Путь (внутри контейнера) | Доступ | Владелец | Права | Содержит секреты? |
+|--------------------------|--------|----------|-------|-------------------|
+| `/home/openhands/.openhands/profiles/deepseek-chat.json` | RW | 10001:10001 | 600 | ⚠️ API-ключ DeepSeek |
+| `/home/openhands/.openhands/profiles/claude.json` | RW | 10001:10001 | 600 | ⚠️ API-ключ Claude |
+| `/home/openhands/.openhands/settings.json` | RW | 10001:10001 | 600 | Нет |
+| `/home/openhands/.openhands/agent-profiles/default.json` | RW | 10001:10001 | 600 | Нет |
+| `/home/openhands/.openhands/agent-canvas/secret-key.txt` | RW | 10001:10001 | 600 | ⚠️ Внутренний ключ Canvas |
+| `/home/openhands/.ssh` | ❌ Не существует | — | — | — |
+| `/var/run/docker.sock` | ❌ Не существует | — | — | — |
+| `/.dockerenv` | R | 0:0 | 755 | Нет |
+| `.env` | ❌ Не существует | — | — | — |
+| `secrets/` (каталог) | ❌ Не существует | — | — | — |
+
+**Файлы секретов на хосте (НЕ видны контейнеру):**
+
+| Путь на хосте | Владелец | Права | Виден UID 10001? |
+|---------------|----------|-------|------------------|
+| `/srv/openhands-agent/secrets/.env` | igor:igor | 600 | ❌ Нет — каталог `secrets/` не смонтирован в контейнер |
+
+**Критическая находка:** `profiles/*.json` содержат API-ключи LLM и доступны UID 10001 на чтение и запись. Это архитектурное свойство Agent Canvas — LLM-ключи хранятся в JSON-профилях, доступных агенту. Файловая изоляция через `chmod` невозможна (сломает смену LLM через WebUI).
+
+**Меры (без изменения архитектуры):**
+- `profiles/*.json` — оставить как есть; агент по определению знает свой LLM-ключ
+- `secrets/.env` — ❌ не смонтирован → агент не видит хостовые секреты ✅
+- `docker.sock` — ❌ не смонтирован → изоляция от Docker ✅
+- `.ssh` — ❌ не существует → нет доступа к SSH-ключам ✅
+- Защита: prompt + `security_analyzer: "llm"` + `verification.critic_enabled: true`
+
+### 1.7. Механизмы интеграции
 
 | Механизм | Доступность | Для WORK MODE |
 |----------|-------------|---------------|
@@ -78,29 +134,25 @@ HTTP/HTTPS (80, 443) → RETURN
 
 | Инструмент | Разрешение | Каталоги/ресурсы | Подтверждение Игоря | Запрещено | Проверка | Откат |
 |-----------|-----------|-----------------|--------------------|-----------|----------|-------|
-| `terminal` | ✅ Разрешён | `/projects` (work-workspace) | `rm -rf`, `sudo`, systemctl, docker, перезапись конфигов | Доступ к `/srv/amnesia*`, `/srv/nextcloud`, `~/.ssh` | `history \| grep` после теста | Флаг `tools` в профиле |
-| `read_file` | ✅ Разрешён | `/projects`, `/docs` | — | `/srv/amnesia*`, `/srv/nextcloud/data`, `/home/openhands/.openhands` | `cat /projects/test.txt` | Ограничение volumes |
-| `write_file` | ✅ Разрешён | `/projects` | Массовая запись, перезапись конфигов | `/srv/*` вне `/projects` | Создатьファイル → проверить | Ограничение volumes |
-| `file_editor` | ✅ Разрешён | `/projects` | Правка конфигов | То же | `edit` тест | Флаг `tools` |
+| `terminal` | ✅ Разрешён | `/projects` (work-workspace) | `rm -rf`, `sudo`, systemctl, docker, перезапись конфигов | `/srv/amnesia*`, `/srv/nextcloud` | `history \| grep` после теста | Флаг `tools` в профиле |
+| `read_file` | ✅ Разрешён | `/projects`, `/docs` | — | `/home/openhands/.openhands` | `cat /projects/test.txt` | Ограничение volumes |
+| `write_file` | ✅ Разрешён | `/projects` | Массовая запись | `/srv/*` вне `/projects` | Создать файл → проверить | Ограничение volumes |
+| `edit` | ✅ Разрешён | `/projects` | Правка конфигов | То же | `edit` тест | Флаг `tools` |
 | `list_directory` | ✅ Разрешён | `/projects` | — | `/srv/*`, `/home` | `ls` тест | Флаг `tools` |
 | `glob`, `grep` | ✅ Разрешён | `/projects` | — | Поиск секретов | Поиск тест | Флаг `tools` |
-| `task`, `task_tracker` | ✅ Разрешён | — | — | — | Создать задачу | Флаг `tools` |
-| `browser_tool_set` | ⚠️ По умолчанию выкл | Интернет (80/443) | Включение | Внутренние адреса | N/A | Флаг `tools` |
-| `workflow_tool_set` | ⚠️ По умолчанию выкл | — | Включение, массовое удаление | Production workflows без backup | N/A | Флаг `tools` |
+| `task_tool_set` | ✅ Разрешён | — | — | — | Создать задачу | Флаг `tools` |
 | `planning_file_editor` | ✅ Разрешён | `/projects` | — | — | Создать план | Флаг `tools` |
 | `canvas_ui_control` | ✅ Разрешён | — | — | — | UI-тест | Флаг `tools` |
 
-### 2.2. Интеграции (будущие — НЕ в этом этапе)
+**Исключены из WORK MODE:**
+- `browser_tool_set` — веб-доступ (опасно)
+- `workflow_tool_set`, `workflow` — автоматизация (не нужно на этом этапе)
+- `file_editor` — заменён на `edit` + `write_file`
+- `task`, `task_tracker` — заменены на `task_tool_set` (bundle)
 
-| Интеграция | Механизм | Требует |
-|-----------|----------|---------|
-| **n8n** | MCP-сервер или HTTP-эндпоинт | API-ключ n8n (read-only), egress к VPS:443 |
-| **GitHub** | MCP-сервер или SSH-ключ | Deploy key (read-only), egress к github.com:443 |
-| **Notion** | MCP-сервер или HTTP-эндпоинт | Notion API-токен, egress к api.notion.com:443 |
-| **Nextcloud** | HTTP-эндпоинт (WebDAV/API) | Пароль приложения, egress к cloud.prokop-agent.duckdns.org:443 |
-| **AMNESIA** | MCP-сервер (существующий `amnesia-bridge`) | Auth0-токен, egress к amnesia.prokop-agent.duckdns.org:443 |
+**Итого: 10 инструментов.**
 
-### 2.3. Правила подтверждения (через system_message_suffix)
+### 2.2. Правила подтверждения (через system_message_suffix + critic)
 
 Обычные действия в `/projects` — без подтверждения.  
 **Обязательное подтверждение (через `ask_user` или `confirmation_policy`):**
@@ -112,12 +164,23 @@ HTTP/HTTPS (80, 443) → RETURN
 - Массовое удаление/перезапись
 - Работа с production-данными
 
-**Полностью запрещено (через prompt):**
+**Полностью запрещено:**
 
-- Выход за пределы `/projects`
-- Чтение `/srv/openhands-agent/config/secrets/`
+- Выход за пределы `/projects` и `/docs`
+- Чтение `/home/openhands/.openhands/profiles/` (секреты LLM)
+- Чтение `/home/openhands/.openhands/agent-canvas/secret-key.txt`
 - Изменение firewall, compose, systemd
 - Доступ к WireGuard, VPS-конфигурации
+
+### 2.3. Интеграции (будущие — НЕ в этом этапе)
+
+| Интеграция | Механизм | Требует |
+|-----------|----------|---------|
+| **n8n** | MCP-сервер или HTTP-эндпоинт | API-ключ n8n (read-only), egress к VPS:443 |
+| **GitHub** | MCP-сервер или SSH-ключ | Deploy key (read-only), egress к github.com:443 |
+| **Notion** | MCP-сервер или HTTP-эндпоинт | Notion API-токен, egress к api.notion.com:443 |
+| **Nextcloud** | HTTP-эндпоинт (WebDAV/API) | Пароль приложения, egress к cloud:443 |
+| **AMNESIA** | MCP-сервер (существующий `amnesia-bridge`) | Auth0-токен, egress к amnesia:443 |
 
 ---
 
@@ -125,16 +188,18 @@ HTTP/HTTPS (80, 443) → RETURN
 
 ### Этап 4A — Профиль WORK MODE (без интеграций)
 
-**Изменяемые позиции (3 Git-файла + 1 каталог на хосте):**
+**Изменяемые позиции (4 Git-файла + 2 каталога на хосте):**
 
 | # | Файл/Каталог | Действие | Конкретное изменение |
 |---|-------------|----------|---------------------|
-| 1 | `config/agent-profiles/work.json` | **Создать** | Новый agent-профиль с `tools: [...]` — список из 11 инструментов |
-| 2 | `config/settings.json` | **Изменить** | 4 параметра: `active_agent_profile_id` → work, `agent_context.system_message_suffix` (правила WORK MODE), `agent_context.load_memory` (по решению), `conversation_settings.confirmation_mode` (оставить `false`) |
-| 3 | `deployment/compose.yaml` | **Изменить** | Заменить volume: `test-workspace:/projects` → `work-workspace:/projects` |
-| 4 | `/srv/openhands-agent/work-workspace/` | **Создать** | Пустой каталог на хосте, `chown 10001:10001`, `chmod 700` |
+| 1 | `config/agent-profiles/work.json` | **Создать** | Новый agent-профиль с `tools: [terminal, read_file, write_file, edit, list_directory, glob, grep, task_tool_set, planning_file_editor, canvas_ui_control]` |
+| 2 | `config/settings.json` | **Изменить** | 4 параметра: `active_agent_profile_id` → work, `agent_context.system_message_suffix` (правила WORK MODE на русском), `agent_context.load_memory: true`, `verification.critic_enabled: true` |
+| 3 | `deployment/compose.yaml` | **Изменить** | 2 volume: заменить `test-workspace:/projects` → `work-workspace:/projects`; добавить `/srv/openhands-agent/docs:/docs:ro` |
+| 4 | `deployment/scripts/prepare.sh` | **Изменить** | Добавить создание `work-workspace/` (10001:10001, 700) и `docs/` (igor:igor, 755) |
+| 5 | `/srv/openhands-agent/work-workspace/` | **Создать** | Пустой каталог на хосте, `chown 10001:10001`, `chmod 700` |
+| 6 | `/srv/openhands-agent/docs/` | **Создать** | Каталог на хосте, заполнить из репозитория (`docs/Состояние.md`, `docs/План.md`, `docs/Архитектура.md`, `docs/Решения.md`, `deployment/README.md`), `chmod 755` |
 
-Итого: **3 файла в Git + 1 каталог на mini-server.**
+**Итого: 4 файла в Git + 2 каталога на mini-server.**
 
 **НЕ изменять:** systemd, firewall, egress-правила, LLM-профиль, Docker-образ, порты, WireGuard.
 
@@ -144,67 +209,47 @@ HTTP/HTTPS (80, 443) → RETURN
 
 | Файл | Изменение |
 |------|-----------|
-| `deployment/network/apply-egress-rules.sh` | Добавить RETURN для `95.217.239.148:443` (n8n) |
-| `deployment/network/apply-egress-rules.sh` | Добавить RETURN для `api.notion.com:443` |
-
-### Этап 4C — Подключение интеграций (отдельно, по одной)
-
-Для каждой: MCP-сервер или API-эндпоинт → тест → docs → commit.
+| `deployment/network/apply-egress-rules.sh` | Добавить RETURN для конкретных адресов (по одному за интеграцию) |
 
 ### Порядок действий (4A):
 
-1. **Backup**: скопировать `settings.json`, `agent-profiles/default.json`
-2. **Создать** `agent-profiles/work.json` с ограниченным списком инструментов
-3. **Обновить** `settings.json`: `active_agent_profile_id`, `system_message_suffix`, `load_memory`
-4. **Создать** `work-workspace` каталог на хосте
-5. **Обновить** `compose.yaml`: заменить `test-workspace:/projects` на `work-workspace:/projects`
-6. **Перезапустить** `systemctl restart openhands-agent`
-7. **Postcheck**: профиль active, инструменты ограничены, workspace доступен
-8. **Тест**: создать файл, прочитать, удалить — проверить правила подтверждения
-9. **Персистентность**: restart → профиль и workspace сохранились
-10. **Docs + commit**
+1. **Backup**: `settings.json`, `agent-profiles/default.json`, `compose.yaml`, `prepare.sh`
+2. **Создать** `work-workspace/` и `docs/` на mini-server, заполнить docs из репозитория
+3. **Создать** `agent-profiles/work.json` — профиль с 10 инструментами
+4. **Обновить** `settings.json`: `active_agent_profile_id`, `system_message_suffix` (русский), `load_memory: true`, `critic_enabled: true`. `confirmation_mode` — оставить `false`
+5. **Обновить** `compose.yaml`: volumes
+6. **Обновить** `prepare.sh`: создание новых каталогов
+7. **Перезапустить** `systemctl restart openhands-agent`
+8. **Проверка изоляции**: проверить, что агент НЕ читает `profiles/*.json`, `secret-key.txt`, не выходит за `/projects`
+9. **Тест**: создать/прочитать/удалить файл, задача через task_tool_set, план через planning_file_editor
+10. **Персистентность**: restart → профиль, workspace, docs сохранились
+11. **Только после успешной проверки изоляции:** `confirmation_mode: false` (если изоляция подтверждена)
+12. **Docs + commit**
 
 ---
 
-## 4. Решения, которые должен принять Игорь
+## 4. Зафиксированные решения Игоря (26.07.2026)
 
-| # | Вопрос | Варианты | Последствия |
-|---|--------|----------|-------------|
-| 1 | **Создавать новый agent-профиль `work` или переименовать `default`?** | А) Новый `work` → default остаётся как TEST MODE. Б) Переименовать default → work | А) Два профиля — можно переключаться. Меньше риск сломать. Б) Один профиль — проще, но теряется TEST MODE |
-| 2 | **Какие инструменты оставить?** Точный список: `terminal`, `read_file`, `write_file`, `file_editor`, `edit`, `list_directory`, `glob`, `grep`, `task`, `task_tracker`, `planning_file_editor`, `canvas_ui_control` (12). Без: `browser_tool_set`, `workflow_tool_set`, `workflow` | Утвердить 12 / Изменить список | 12 инструментов = полный файловый доступ + задачи. Без browser и workflow — изоляция от web и автоматизации |
-| 3 | **`load_memory` — включить память агента?** | А) `true`. Б) `false` | А) Агент запоминает контекст между сессиями. Б) Каждый чат с нуля — безопаснее |
-| 4 | **Создавать `work-workspace` или переиспользовать `test-workspace`?** | А) Новый `/srv/openhands-agent/work-workspace`. Б) Очистить test-workspace | А) Чистое разделение TEST/WORK. Б) Меньше каталогов |
-| 5 | **Монтировать `docs/` как read-only в контейнер?** | А) Да — `docs:/docs:ro`. Б) Нет | А) Агент читает документацию проекта. Б) Вся документация — вне контейнера, агент её не видит |
-| 6 | **Egress: сейчас (вместе с 4A) или отдельно (4B)?** | А) Только 4A. Б) 4A+4B вместе | А) Безопасный первый шаг. Б) Быстрее, но больше изменений за раз |
-| 7 | **Язык `system_message_suffix`?** | А) Русский. Б) Английский | А) Понятно Игорю при аудите. Б) Родной язык DeepSeek — возможно, точнее соблюдается |
-| 8 | **`verification.critic_enabled`?** | А) `true` — двойная проверка опасных действий. Б) `false` — только prompt | А) Дополнительный рубеж. Замедляет каждое действие. Б) Быстрее, но защита только текстовая |
-
-### 4.1. Предварительная позиция Игоря (зафиксирована 26.07.2026)
-
-| # | Решение | Позиция |
-|---|--------|---------|
-| 1 | Новый профиль | ✅ Создать `work`, default сохранить |
-| 2 | Инструменты | ⚠️ Утвердить после просмотра точных названий (см. список из 12 выше) |
-| 3 | `load_memory` | ✅ Включить |
-| 4 | Workspace | ✅ Отдельный `work-workspace` |
-| 5 | `docs/` mount | ❌ Не давать доступ к секретам, системным каталогам и другим проектам |
-| 6 | Egress | ⚠️ Не открывать широко — только необходимый контроль (4B отдельно) |
-| 7 | Язык prompt | ❓ Не указано |
-| 8 | `critic_enabled` | ⚠️ Опасные действия нельзя считать надёжно защищёнными одним prompt — принципиальное ограничение Canvas |
-| — | `confirmation_mode` | ✅ Оставить включённым (`true`) — вопреки предложению плана |
-
-**Нерешённые вопросы для уточнения:**
-- Язык `system_message_suffix` (русский / английский)?
-- `confirmation_mode: true` — означает, что каждое действие потребует подтверждения. Это замедлит работу. Альтернатива: `confirmation_mode: false` + строгие правила в prompt + `security_analyzer: "llm"`?
-- Доступ к `docs/`: если не монтировать — агент не видит документацию. Если монтировать read-only — агент читает, но не пишет. Какой вариант?
-- Принципиальное ограничение Canvas (п. 8): нужен ли внешний шлюз разрешений (например, прокси-слой перед контейнером) или принимаем риск текстовой защиты?
+| # | Решение | Статус | Детали |
+|---|--------|--------|--------|
+| 1 | Новый профиль `work` | ✅ Утверждено | `default` сохраняется как TEST MODE |
+| 2 | Инструменты | ✅ Утверждено | 10 инструментов: `terminal`, `read_file`, `write_file`, `edit`, `list_directory`, `glob`, `grep`, `task_tool_set`, `planning_file_editor`, `canvas_ui_control` |
+| 3 | Память агента | ✅ `load_memory: true` | Агент запоминает контекст между сессиями |
+| 4 | Workspace | ✅ Отдельный `work-workspace` | `/srv/openhands-agent/work-workspace`, 10001:10001, 700 |
+| 5 | Docs | ✅ Read-only bind mount | `/srv/openhands-agent/docs:/docs:ro` — агент читает документацию |
+| 6 | Egress | ✅ Отдельно (4B) | Не открывать широко — только конкретные адреса |
+| 7 | Язык prompt | ✅ Русский | `system_message_suffix` на русском |
+| 8 | Критик | ✅ `critic_enabled: true` | Дополнительная проверка опасных действий |
+| 9 | `confirmation_mode` | ⚠️ `false` после проверки | Сначала `false`, но только после успешной проверки файловой изоляции |
+| 10 | Доступ к секретам | ✅ Запрещён | `secrets/` не монтирован, docker.sock не монтирован, `.ssh` не существует |
+| 11 | Файловая изоляция | ⚠️ Принято ограничение | `profiles/*.json` видны агенту (архитектурное ограничение Canvas). Защита: prompt + critic |
 
 ---
 
 ## 5. Что НЕ делать в этом этапе
 
 - ❌ Не подключать GitHub, VPS, SSH, n8n, Nextcloud, Notion, AMNESIA
-- ❌ Не менять Docker, Compose (кроме volume), systemd, firewall, WireGuard, порты
+- ❌ Не менять Docker, Compose (кроме volumes), systemd, firewall, WireGuard, порты
 - ❌ Не менять LLM-профиль (deepseek-chat остаётся)
 - ❌ Не менять архитектуру (Agent Canvas, supervisor, контейнер — неизменны)
 - ❌ Не создавать новые Docker-контейнеры, сервисы, сети
