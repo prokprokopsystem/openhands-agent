@@ -1,34 +1,49 @@
 #!/usr/bin/bash
-# OpenHands Agent Canvas — проверка шаблона Nginx (этап 3.3)
+# OpenHands Agent Canvas — проверка шаблонов Nginx (этап 3.3)
 # Только read-only. Не изменяет VPS, не выводит секреты.
-# Завершается с exit 1 при ошибке.
+# Завершается с exit 1 при ошибке или если nginx -t не выполнялся.
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 NGINX_DIR="${PROJECT_ROOT}/deployment/nginx"
-CONF="${NGINX_DIR}/canvas.prokop-agent.duckdns.org.conf"
+BOOTSTRAP_CONF="${NGINX_DIR}/canvas-bootstrap.conf"
+FINAL_CONF="${NGINX_DIR}/canvas.prokop-agent.duckdns.org.conf"
+README="${NGINX_DIR}/README.md"
+
 PASSED=0
 FAILED=0
+SKIPPED=0
 
-pass() { printf '  [OK] %s\n' "$1"; PASSED=$((PASSED + 1)); }
-fail() { printf '  [FAIL] %s\n' "$1"; FAILED=$((FAILED + 1)); }
+TMP_NGINX=""  # будет создан при необходимости
+
+cleanup() {
+    [ -n "${TMP_NGINX}" ] && rm -rf "${TMP_NGINX}" || true
+}
+trap cleanup EXIT
+
+pass() { printf '  [OK]    %s\n' "$1"; PASSED=$((PASSED + 1)); }
+fail() { printf '  [FAIL]  %s\n' "$1"; FAILED=$((FAILED + 1)); }
+skip() { printf '  [SKIP]  %s\n' "$1"; SKIPPED=$((SKIPPED + 1)); }
 
 echo "=== Stage 3.3 Nginx template validation ==="
 echo ""
 
 # ── 1. Файлы существуют ──
 echo "--- Files ---"
-[ -f "${CONF}" ] && pass "canvas.prokop-agent.duckdns.org.conf" || fail "canvas.prokop-agent.duckdns.org.conf отсутствует"
-[ -f "${NGINX_DIR}/README.md" ] && pass "README.md" || fail "README.md отсутствует"
+[ -f "${FINAL_CONF}" ]     && pass "canvas.prokop-agent.duckdns.org.conf"     || fail "canvas.prokop-agent.duckdns.org.conf отсутствует"
+[ -f "${BOOTSTRAP_CONF}" ] && pass "canvas-bootstrap.conf"                    || fail "canvas-bootstrap.conf отсутствует"
+[ -f "${README}" ]         && pass "README.md"                                || fail "README.md отсутствует"
 
-# ── 2. Nginx syntax check (локальный) ──
+# ── 2. Nginx syntax check ──
 echo ""
 echo "--- Nginx syntax ---"
+
+NGINX_OK=false
 if command -v nginx >/dev/null 2>&1; then
-    # Проверить синтаксис через nginx -t с флагом -c
-    # Создать временный include-конфиг для изоляции
+
+    # ── 2a. Bootstrap config (не требует сертификатов) ──
+    echo "  Bootstrap config:"
     TMP_NGINX=$(mktemp -d /tmp/nginx-validate-XXXXXX)
-    trap "rm -rf ${TMP_NGINX}" EXIT
 
     cat > "${TMP_NGINX}/nginx.conf" <<NGX
 daemon off;
@@ -37,23 +52,86 @@ pid ${TMP_NGINX}/nginx.pid;
 events { worker_connections 16; }
 http {
     access_log off;
-    include ${CONF};
+    include ${BOOTSTRAP_CONF};
 }
 NGX
-    if nginx -t -c "${TMP_NGINX}/nginx.conf" -p "${TMP_NGINX}" 2>/dev/null; then
-        pass "nginx -t (синтаксис корректен)"
+    if nginx -t -c "${TMP_NGINX}/nginx.conf" -p "${TMP_NGINX}" 2>&1; then
+        pass "nginx -t bootstrap (синтаксис корректен)"
     else
-        fail "nginx -t (ошибка синтаксиса)"
-        nginx -t -c "${TMP_NGINX}/nginx.conf" -p "${TMP_NGINX}" 2>&1 || true
+        fail "nginx -t bootstrap (ошибка синтаксиса)"
+        NGINX_OK=false
     fi
+
+    # ── 2b. Final config (нужны тестовые сертификат и ключ) ──
+    echo "  Final config:"
+
+    # Создать временный self-signed сертификат ИСКЛЮЧИТЕЛЬНО для проверки синтаксиса
+    TEST_CERT_DIR="${TMP_NGINX}/certs"
+    mkdir -p "${TEST_CERT_DIR}"
+
+    openssl req -x509 -nodes -days 1 \
+        -newkey rsa:2048 \
+        -keyout "${TEST_CERT_DIR}/privkey.pem" \
+        -out "${TEST_CERT_DIR}/fullchain.pem" \
+        -subj "/CN=canvas.prokop-agent.duckdns.org" \
+        2>/dev/null
+
+    # Временная копия конфига с подменёнными путями
+    FINAL_TMP="${TMP_NGINX}/final.conf"
+    cp "${FINAL_CONF}" "${FINAL_TMP}"
+    sed -i "s|/etc/letsencrypt/live/canvas.prokop-agent.duckdns.org|${TEST_CERT_DIR}|g" "${FINAL_TMP}"
+
+    cat > "${TMP_NGINX}/nginx-final.conf" <<NGX
+daemon off;
+error_log /dev/null crit;
+pid ${TMP_NGINX}/nginx-final.pid;
+events { worker_connections 16; }
+http {
+    access_log off;
+    include ${FINAL_TMP};
+}
+NGX
+    if nginx -t -c "${TMP_NGINX}/nginx-final.conf" -p "${TMP_NGINX}" 2>&1; then
+        pass "nginx -t final (синтаксис корректен)"
+        NGINX_OK=true
+    else
+        fail "nginx -t final (ошибка синтаксиса)"
+        NGINX_OK=false
+    fi
+
 else
-    echo "  [SKIP] nginx не установлен локально"
+    skip "nginx не установлен локально — синтаксис НЕ проверен"
+    NGINX_OK=false
 fi
 
-# ── 3. Обязательные директивы ──
+# ── 3. Обязательные директивы (bootstrap) ──
 echo ""
-echo "--- Required directives ---"
-REQUIRED=(
+echo "--- Bootstrap required directives ---"
+BOOTSTRAP_REQUIRED=(
+    "listen 80"
+    "server_name canvas.prokop-agent.duckdns.org"
+    "\.well-known/acme-challenge"
+    "/var/www/canvas-acme"
+)
+
+for directive in "${BOOTSTRAP_REQUIRED[@]}"; do
+    if grep -qE "${directive}" "${BOOTSTRAP_CONF}"; then
+        pass "bootstrap: ${directive}"
+    else
+        fail "bootstrap: ${directive} — не найдено"
+    fi
+done
+
+# Bootstrap НЕ должен содержать HTTPS/proxy
+grep -q 'listen 443' "${BOOTSTRAP_CONF}"  && fail "bootstrap: listen 443 (не должно быть)"  || pass "bootstrap: без listen 443"
+grep -q 'proxy_pass' "${BOOTSTRAP_CONF}"  && fail "bootstrap: proxy_pass (не должно быть)"  || pass "bootstrap: без proxy_pass"
+grep -q 'auth_basic' "${BOOTSTRAP_CONF}"  && fail "bootstrap: auth_basic (не должно быть)"  || pass "bootstrap: без auth_basic"
+grep -q 'ssl_certificate' "${BOOTSTRAP_CONF}" && fail "bootstrap: ssl_certificate (не должно быть)" || pass "bootstrap: без ssl_certificate"
+
+# ── 4. Обязательные директивы (final) ──
+echo ""
+echo "--- Final required directives ---"
+FINAL_REQUIRED=(
     "listen 80"
     "listen 443 ssl http2"
     "server_name canvas.prokop-agent.duckdns.org"
@@ -69,90 +147,85 @@ REQUIRED=(
     "proxy_set_header X-Real-IP"
     "proxy_set_header X-Forwarded-Proto"
     "return 301.*canvas"
+    "/etc/letsencrypt/live/canvas.prokop-agent.duckdns.org"
+    "fullchain.pem"
+    "privkey.pem"
+    "\.well-known/acme-challenge"
 )
 
-for directive in "${REQUIRED[@]}"; do
-    if grep -qE "${directive}" "${CONF}"; then
-        pass "directive: ${directive}"
+for directive in "${FINAL_REQUIRED[@]}"; do
+    if grep -qE "${directive}" "${FINAL_CONF}"; then
+        pass "final: ${directive}"
     else
-        fail "directive: ${directive} — не найдено"
+        fail "final: ${directive} — не найдено"
     fi
 done
 
-# ── 4. Плейсхолдеры и ошибочные адреса ──
+# ── 5. Плейсхолдеры и ошибочные адреса ──
 echo ""
 echo "--- Placeholders and hardcoded errors ---"
-# Не должно быть HOSTNAME_PLACEHOLDER
-grep -q 'HOSTNAME_PLACEHOLDER' "${CONF}" && fail "HOSTNAME_PLACEHOLDER" || pass "HOSTNAME_PLACEHOLDER отсутствует"
+for conf in "${BOOTSTRAP_CONF}" "${FINAL_CONF}"; do
+    name=$(basename "${conf}")
+    grep -qi 'placeholder' "${conf}" && fail "${name}: placeholder в тексте" || pass "${name}: без placeholder"
+    grep -q 'localhost:8000\|127.0.0.1:8000' "${conf}" && fail "${name}: localhost:8000" || pass "${name}: без localhost:8000"
+    grep 'proxy_pass' "${conf}" 2>/dev/null | grep -q '0.0.0.0' && fail "${name}: 0.0.0.0 в proxy_pass" || pass "${name}: без 0.0.0.0 в proxy_pass"
+done
 
-# Не должно быть PLACEHOLDER в рабочей части
-# (PLACEHOLDER_START/END в комментариях — допустимо)
-WORKING=$(sed '/PLACEHOLDER_START/,/PLACEHOLDER_END/d' "${CONF}")
-echo "${WORKING}" | grep -qi 'placeholder' && fail "placeholder в рабочей части" || pass "placeholder отсутствует в рабочей части"
-
-# Не должно быть localhost:8000 (ошибочный прокси)
-grep -q 'localhost:8000\|127.0.0.1:8000' "${CONF}" && fail "localhost:8000 (должен быть 10.77.0.2:8000)" || pass "Нет localhost:8000"
-
-# Не должно быть 0.0.0.0 в proxy_pass
-grep 'proxy_pass' "${CONF}" | grep -q '0.0.0.0' && fail "0.0.0.0 в proxy_pass" || pass "Нет 0.0.0.0 в proxy_pass"
-
-# ── 5. Секреты ──
+# ── 6. Секреты ──
 echo ""
 echo "--- Secrets ---"
-# Пароли/хеши htpasswd
-grep -qE '\$2[aby]\$[0-9]+\$' "${CONF}" && fail "Найден bcrypt-хеш в шаблоне" || pass "Нет bcrypt-хешей"
-grep -qE ':[A-Za-z0-9+/=]{20,}' "${CONF}" && fail "Возможный base64-хеш" || pass "Нет base64-хешей"
+for conf in "${BOOTSTRAP_CONF}" "${FINAL_CONF}"; do
+    name=$(basename "${conf}")
+    grep -qE '\$2[aby]\$[0-9]+\$' "${conf}"                && fail "${name}: bcrypt-хеш"                || pass "${name}: без bcrypt-хешей"
+    grep -qE ':[A-Za-z0-9+/=]{20,}' "${conf}"               && fail "${name}: возможный base64-хеш"     || pass "${name}: без base64-хешей"
+    grep -qiE 'password\s*[:=]\s*\S' "${conf}"              && fail "${name}: password=..."              || pass "${name}: без открытых паролей"
+    grep -qE 'sk-[A-Za-z0-9]{20,}' "${conf}"                && fail "${name}: API-ключ"                 || pass "${name}: без API-ключей"
+    grep -qE 'Bearer [A-Za-z0-9]{10,}' "${conf}"            && fail "${name}: Bearer-токен"             || pass "${name}: без Bearer-токенов"
+    grep -q 'BEGIN CERTIFICATE\|BEGIN PRIVATE KEY' "${conf}" && fail "${name}: PEM-блок в шаблоне"       || pass "${name}: без PEM-блоков"
+done
 
-# Пароли в открытом виде (password=...)
-grep -qiE 'password\s*[:=]\s*\S' "${CONF}" && fail "password=... в открытом виде" || pass "Нет открытых паролей"
-
-# API-ключи
-grep -qE 'sk-[A-Za-z0-9]{20,}' "${CONF}" && fail "API-ключ (sk-...)" || pass "Нет API-ключей"
-grep -qE 'Bearer [A-Za-z0-9]{10,}' "${CONF}" && fail "Bearer-токен" || pass "Нет Bearer-токенов"
-
-# Сертификаты (не должно быть PEM-блоков)
-grep -q 'BEGIN CERTIFICATE\|BEGIN PRIVATE KEY\|BEGIN RSA PRIVATE KEY' "${CONF}" && fail "PEM-блок в шаблоне" || pass "Нет PEM-блоков"
-
-# ── 6. Сетевая безопасность ──
+# ── 7. Сетевая безопасность (final) ──
 echo ""
 echo "--- Network safety ---"
-# Canvas не опубликован напрямую (нет listen 8000)
-grep -q 'listen.*8000' "${CONF}" && fail "listen 8000 (Canvas не должен быть напрямую)" || pass "Нет listen 8000 (Canvas за прокси)"
+grep -q 'listen.*8000' "${FINAL_CONF}" && fail "final: listen 8000 (Canvas напрямую)" || pass "final: без listen 8000"
+grep -q 'ssl_protocols.*SSLv3\|ssl_protocols.*TLSv1[^.]' "${FINAL_CONF}" && fail "final: устаревшие TLS" || pass "final: без устаревших TLS"
 
-# TLS не отключён
-grep -q 'ssl_protocols.*SSLv3\|ssl_protocols.*TLSv1[^.]' "${CONF}" && fail "Устаревшие TLS-протоколы" || pass "Нет устаревших TLS-протоколов"
-
-# ── 7. HTTP → HTTPS редирект ──
+# HTTP → редирект на HTTPS (final)
 echo ""
 echo "--- HTTP redirect ---"
-grep -A10 'listen 80' "${CONF}" | grep -q 'return 301 https' && pass "HTTP → HTTPS редирект" || fail "HTTP → HTTPS редирект не найден"
-grep -q '\.well-known/acme-challenge' "${CONF}" && pass "ACME challenge path" || fail "ACME challenge path не найден"
+grep -B2 'return 301 https' "${FINAL_CONF}" | grep -q 'location /' \
+    && pass "final: HTTP → HTTPS редирект (location / → 301 https)" \
+    || fail "final: нет HTTP → HTTPS редиректа (location / → 301 https)"
+grep -q '\.well-known/acme-challenge' "${FINAL_CONF}" && pass "final: ACME challenge в final" || fail "final: нет ACME challenge"
 
-# ── 8. WireGuard endpoint ──
+# ── 9. WireGuard endpoint (final) ──
 echo ""
 echo "--- WireGuard endpoint ---"
-grep -q 'proxy_pass http://10.77.0.2:8000' "${CONF}" && pass "proxy_pass → 10.77.0.2:8000" || fail "proxy_pass должен быть http://10.77.0.2:8000"
+grep -q 'proxy_pass http://10.77.0.2:8000' "${FINAL_CONF}" && pass "final: proxy_pass → 10.77.0.2:8000" || fail "final: proxy_pass не 10.77.0.2:8000"
 
-# ── 9. README полнота ──
+# ── 10. README полнота ──
 echo ""
 echo "--- README completeness ---"
-README="${NGINX_DIR}/README.md"
-[ -f "${README}" ] || { fail "README.md отсутствует"; exit 1; }
-
 README_CHECKS=(
     "read-only провер"
     "htpasswd"
     "nginx -t"
     "systemctl reload nginx"
     "certbot"
+    "certonly"
+    "webroot"
     "Basic Auth"
     "Откат"
     "НЕ выполнялись"
-    "selfsigned"
+    "bootstrap"
+    "canvas-bootstrap"
     "sites-available"
     "sites-enabled"
     "\.well-known"
     "401"
+    "Фаза 1"
+    "Фаза 2"
+    "/var/www/canvas-acme"
 )
 
 for check in "${README_CHECKS[@]}"; do
@@ -163,15 +236,28 @@ for check in "${README_CHECKS[@]}"; do
     fi
 done
 
-# ── 10. Инструкция не содержит выполняемых команд ──
+# ── 11. README: curl без пароля в команде ──
+echo ""
+echo "--- README: no password in curl ---"
+grep -n 'curl.*-u.*:.*https' "${README}" 2>/dev/null \
+    && fail "README: пароль в curl-команде (curl -u user:password ...)" \
+    || pass "README: curl без пароля в команде"
+
+# ── 12. README: без self-signed ──
+echo ""
+echo "--- README: no self-signed ---"
+grep -qi 'self.sign\|selfsign' "${README}" \
+    && fail "README: упоминание self-signed сертификата" \
+    || pass "README: без self-signed"
+
+# ── 13. README: без призыва к немедленному выполнению ──
 echo ""
 echo "--- README: no auto-execute ---"
-# Код-блоки есть, но нет призыва «запусти сейчас»
 grep -qiE 'запустите сейчас|выполните сейчас|apply now|run now' "${README}" \
     && fail "README: призыв к немедленному выполнению" \
     || pass "README: без призыва к немедленному выполнению"
 
-# ── 11. Существующая структура deployment/ не нарушена ──
+# ── 14. Существующая структура не нарушена ──
 echo ""
 echo "--- Existing structure integrity ---"
 EXISTING=(
@@ -180,11 +266,28 @@ EXISTING=(
     "deployment/systemd/openhands-agent.service"
     "deployment/scripts/prepare.sh"
 )
-
 for f in "${EXISTING[@]}"; do
     [ -f "${PROJECT_ROOT}/${f}" ] && pass "${f}" || fail "${f} — отсутствует!"
 done
 
+# ── ИТОГ ──
 echo ""
-echo "=== Результат: ${PASSED} passed, ${FAILED} failed ==="
-[ "${FAILED}" -eq 0 ] || exit 1
+echo "=== Итог: ${PASSED} passed, ${FAILED} failed, ${SKIPPED} skipped ==="
+
+if [ "${FAILED}" -gt 0 ]; then
+    echo "FATAL: есть ошибки — пакет НЕ готов."
+    exit 1
+fi
+
+if [ "${SKIPPED}" -gt 0 ]; then
+    echo "WARNING: часть проверок пропущена — пакет проверен не полностью (exit 1)."
+    exit 1
+fi
+
+if ! ${NGINX_OK}; then
+    echo "FATAL: nginx -t не выполнялся или завершился с ошибкой — пакет НЕ готов."
+    exit 1
+fi
+
+echo "All checks passed — пакет готов."
+exit 0

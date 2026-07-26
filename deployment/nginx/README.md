@@ -15,11 +15,22 @@
 - Домен `canvas.prokop-agent.duckdns.org` резолвится на VPS
 - Существующие Nginx-сайты (`amnesia`, `nextcloud`, `default`) не трогать
 
+## Двухфазная схема
+
+| Фаза | Конфиг | Назначение |
+|---|---|---|
+| 1 — Bootstrap | `canvas-bootstrap.conf` | Только HTTP, только ACME — получить сертификат |
+| 2 — Final | `canvas.prokop-agent.duckdns.org.conf` | HTTPS + Basic Auth + proxy → Canvas |
+
 ## Инструкция
 
 Все команды выполняются на VPS (ssh vps-autolead) от root или через sudo.
 
-### Шаг 1 — Read-only проверки (перед любыми изменениями)
+---
+
+### Фаза 1 — Bootstrap: получить сертификат Let's Encrypt
+
+#### Шаг 1.1 — Read-only проверки (перед любыми изменениями)
 
 ```bash
 # Доступность Canvas через WireGuard
@@ -34,16 +45,75 @@ dig +short canvas.prokop-agent.duckdns.org
 ls /etc/nginx/sites-enabled/
 # Ожидается: amnesia.prokop-agent.duckdns.org default nextcloud
 
-# Свободен ли порт 443 для нового server_name
+# Имя canvas ещё не используется в Nginx
 nginx -T 2>/dev/null | grep -c 'canvas.prokop-agent.duckdns.org'
-# Ожидается: 0 (имя ещё не используется)
+# Ожидается: 0
 
 # Nginx в рабочем состоянии
-nginx -t && echo "OK"
+sudo nginx -t && echo "OK"
 # Ожидается: syntax is ok / test is successful / OK
 ```
 
-### Шаг 2 — Файл htpasswd (Basic Auth)
+#### Шаг 1.2 — Создать ACME webroot
+
+```bash
+# Каталог для Let's Encrypt HTTP-челленджа (.well-known/acme-challenge)
+sudo mkdir -p /var/www/canvas-acme
+sudo chown www-data:www-data /var/www/canvas-acme
+sudo chmod 755 /var/www/canvas-acme
+```
+
+#### Шаг 1.3 — Установить bootstrap-конфиг
+
+```bash
+# Скопировать из репозитория
+sudo cp deployment/nginx/canvas-bootstrap.conf \
+        /etc/nginx/sites-available/canvas.prokop-agent.duckdns.org
+
+sudo chown root:root /etc/nginx/sites-available/canvas.prokop-agent.duckdns.org
+sudo chmod 644 /etc/nginx/sites-available/canvas.prokop-agent.duckdns.org
+
+# Активировать (symlink, не перезаписывает существующие сайты)
+sudo ln -s /etc/nginx/sites-available/canvas.prokop-agent.duckdns.org \
+           /etc/nginx/sites-enabled/canvas.prokop-agent.duckdns.org
+```
+
+#### Шаг 1.4 — Проверить и reload
+
+```bash
+# Синтаксическая проверка
+sudo nginx -t
+# Ожидается: syntax is ok / test is successful
+
+# Только после успешной проверки — reload
+sudo systemctl reload nginx
+
+# Проверить статус
+sudo systemctl status nginx
+# Ожидается: active (running)
+```
+
+#### Шаг 1.5 — Получить сертификат (certonly, без изменения конфига)
+
+```bash
+# certonly --webroot — не трогает Nginx-конфиг
+sudo certbot certonly --webroot \
+    -w /var/www/canvas-acme \
+    -d canvas.prokop-agent.duckdns.org \
+    --non-interactive --agree-tos \
+    -m admin@prokop-agent.duckdns.org
+
+# Убедиться, что файлы сертификата существуют (содержимое не выводить)
+sudo test -f /etc/letsencrypt/live/canvas.prokop-agent.duckdns.org/fullchain.pem && echo "OK: fullchain"
+sudo test -f /etc/letsencrypt/live/canvas.prokop-agent.duckdns.org/privkey.pem   && echo "OK: privkey"
+# Ожидается: OK: fullchain / OK: privkey
+```
+
+---
+
+### Фаза 2 — Final: HTTPS + Basic Auth + Canvas
+
+#### Шаг 2.1 — Создать htpasswd
 
 ```bash
 # Установить apache2-utils (если нет)
@@ -60,62 +130,26 @@ sudo chown root:root /etc/nginx/.htpasswd-canvas
 sudo chmod 640 /etc/nginx/.htpasswd-canvas
 ```
 
-### Шаг 3 — Установка Nginx-сайта
+#### Шаг 2.2 — Заменить bootstrap на окончательный конфиг
 
 ```bash
-# Копировать конфиг из репозитория в sites-available
+# Перезаписать sites-available окончательным конфигом
 sudo cp deployment/nginx/canvas.prokop-agent.duckdns.org.conf \
         /etc/nginx/sites-available/canvas.prokop-agent.duckdns.org
 
-# Владелец и права
+# Права
 sudo chown root:root /etc/nginx/sites-available/canvas.prokop-agent.duckdns.org
 sudo chmod 644 /etc/nginx/sites-available/canvas.prokop-agent.duckdns.org
 
-# Активировать сайт (symlink, не перезаписывает существующие)
-sudo ln -s /etc/nginx/sites-available/canvas.prokop-agent.duckdns.org \
-           /etc/nginx/sites-enabled/canvas.prokop-agent.duckdns.org
+# Symlink уже существует с фазы 1 — обновлять не нужно.
 ```
 
-### Шаг 4 — Проверка до применения
+#### Шаг 2.3 — Проверить и reload
 
 ```bash
 # Синтаксическая проверка
 sudo nginx -t
 # Ожидается: syntax is ok / test is successful
-
-# Проверить, что новые директивы не конфликтуют с существующими
-sudo nginx -T 2>/dev/null | grep -A2 'server_name canvas'
-# Должен показать новый server-блок без ошибок
-```
-
-### Шаг 5 — Временный self-signed сертификат (для первого reload до certbot)
-
-```bash
-# Создать каталог для временных сертификатов
-sudo mkdir -p /etc/nginx/ssl
-
-# Self-signed сертификат (только для прохождения первого nginx reload)
-sudo openssl req -x509 -nodes -days 1 \
-    -newkey rsa:2048 \
-    -keyout /etc/nginx/ssl/canvas-selfsigned.key \
-    -out /etc/nginx/ssl/canvas-selfsigned.crt \
-    -subj "/CN=canvas.prokop-agent.duckdns.org"
-
-sudo chmod 600 /etc/nginx/ssl/canvas-selfsigned.key
-sudo chmod 644 /etc/nginx/ssl/canvas-selfsigned.crt
-
-# Раскомментировать SSL-строки в конфиге:
-# В файле /etc/nginx/sites-available/canvas.prokop-agent.duckdns.org
-# убрать «# » перед строками:
-#   ssl_certificate     /etc/nginx/ssl/canvas-selfsigned.crt;
-#   ssl_certificate_key /etc/nginx/ssl/canvas-selfsigned.key;
-```
-
-### Шаг 6 — Reload Nginx
-
-```bash
-# Повторная проверка (после правок)
-sudo nginx -t
 
 # Только после успешной проверки — reload
 sudo systemctl reload nginx
@@ -125,23 +159,7 @@ sudo systemctl status nginx
 # Ожидается: active (running)
 ```
 
-### Шаг 7 — Получение Let's Encrypt сертификата
-
-```bash
-# Nginx уже настроен на обслуживание .well-known/acme-challenge
-# (см. конфиг: HTTP-блок location /.well-known/acme-challenge/)
-
-# Запустить certbot только для нового домена
-sudo certbot --nginx -d canvas.prokop-agent.duckdns.org
-
-# Certbot заменит временный self-signed на реальный сертификат
-# и добавит свои директивы в server-блок.
-
-# После certbot — проверить конфиг
-sudo nginx -t && sudo systemctl reload nginx
-```
-
-### Шаг 8 — Проверки после развёртывания
+#### Шаг 2.4 — Проверки после развёртывания
 
 ```bash
 # HTTP → редирект на HTTPS
@@ -153,11 +171,13 @@ curl -sS -o /dev/null -w '%{http_code}\n' https://canvas.prokop-agent.duckdns.or
 # Ожидается: 401
 
 # HTTPS с Basic Auth → Canvas
-curl -sS -o /dev/null -w '%{http_code}\n' -u igor:ПАРОЛЬ https://canvas.prokop-agent.duckdns.org/canvas
+# Пароль запрашивается интерактивно, не попадает в историю shell.
+curl -sS -o /dev/null -w '%{http_code}\n' -u igor https://canvas.prokop-agent.duckdns.org/canvas
+# При запросе пароля — ввести пароль из htpasswd.
 # Ожидается: 200
 
 # / → редирект на /canvas
-curl -sS -o /dev/null -w '%{http_code} %{redirect_url}\n' -u igor:ПАРОЛЬ https://canvas.prokop-agent.duckdns.org/
+curl -sS -o /dev/null -w '%{http_code} %{redirect_url}\n' -u igor https://canvas.prokop-agent.duckdns.org/
 # Ожидается: 301 /canvas
 
 # Прямой порт 8000 НЕ доступен из интернета
@@ -171,18 +191,11 @@ echo | openssl s_client -servername canvas.prokop-agent.duckdns.org \
 # Ожидается: subject=CN=canvas.prokop-agent.duckdns.org, даты актуальны
 ```
 
-### Шаг 9 — Очистка временного self-signed
-
-```bash
-# После успешного получения сертификата Let's Encrypt
-# временный self-signed больше не нужен:
-sudo rm /etc/nginx/ssl/canvas-selfsigned.crt /etc/nginx/ssl/canvas-selfsigned.key
-# (каталог /etc/nginx/ssl можно оставить для будущих нужд)
-```
+---
 
 ## Откат
 
-Откат только Canvas-сайта, без влияния на другие сайты:
+Только Canvas-сайт, без влияния на другие сайты:
 
 ```bash
 # Удалить symlink из sites-enabled
@@ -194,27 +207,27 @@ sudo nginx -t
 # Reload
 sudo systemctl reload nginx
 
-# Файл конфига в sites-available можно удалить позже:
+# Удалить файлы (опционально):
 sudo rm /etc/nginx/sites-available/canvas.prokop-agent.duckdns.org
-
-# Файл паролей (опционально):
 sudo rm /etc/nginx/.htpasswd-canvas
 
 # Сертификат Let's Encrypt остаётся — удалить при необходимости:
 # sudo certbot delete --cert-name canvas.prokop-agent.duckdns.org
 ```
 
+---
+
 ## Команды, которые документированы, но НЕ выполнялись
 
 | Команда | Статус |
 |---|---|
-| `sudo cp ... sites-available/` | Не выполнена (production не тронут) |
+| `sudo mkdir -p /var/www/canvas-acme` | Не выполнена |
+| `sudo cp ... sites-available/` | Не выполнена |
 | `sudo ln -s ... sites-enabled/` | Не выполнена |
 | `sudo htpasswd -c ...` | Не выполнена |
-| `sudo openssl req -x509 ...` | Не выполнена |
 | `sudo nginx -t` (на VPS) | Не выполнена |
 | `sudo systemctl reload nginx` | Не выполнена |
-| `sudo certbot --nginx -d ...` | Не выполнена |
-| Проверки HTTP/HTTPS (шаг 8) | Не выполнены |
+| `sudo certbot certonly --webroot ...` | Не выполнена |
+| Проверки HTTP/HTTPS (шаг 2.4) | Не выполнены |
 
 **Следующий шаг:** ручное применение инструкции (этап 3.3 APPLY).
