@@ -10,6 +10,7 @@ Type=simple
 WorkingDirectory=/srv/openhands-agent
 TimeoutStartSec=180
 TimeoutStopSec=90
+KillMode=mixed
 Restart=on-failure
 RestartSec=10
 
@@ -34,11 +35,8 @@ ExecStartPre=/usr/bin/bash /srv/openhands-agent/deployment/network/apply-egress-
 # Supervised lifecycle: compose foreground + watchdog
 ExecStart=/usr/bin/bash /srv/openhands-agent/deployment/scripts/run-supervised.sh
 
-# Штатная остановка: Compose down
-ExecStop=/usr/bin/docker compose -f /srv/openhands-agent/deployment/compose.yaml down --remove-orphans
-
-# Снятие firewall ПОСЛЕ остановки
-ExecStopPost=/usr/bin/bash /srv/openhands-agent/deployment/network/remove-egress-rules.sh
+# Защитная очистка ПОСЛЕ supervisor: Compose down, затем снятие firewall
+ExecStopPost=/usr/bin/bash -c '/usr/bin/docker compose -f /srv/openhands-agent/deployment/compose.yaml down --remove-orphans && /usr/bin/bash /srv/openhands-agent/deployment/network/remove-egress-rules.sh'
 
 [Install]
 WantedBy=multi-user.target

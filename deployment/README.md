@@ -9,11 +9,15 @@
 ### 1. Подготовка
 
 ```bash
-# Копировать файлы на mini-server
-scp -r deployment/ mini-server:/srv/openhands-agent/
+# Подготовить staging в домашнем каталоге и скопировать deployment
+ssh mini-server 'rm -rf ~/openhands-agent-stage && mkdir -p ~/openhands-agent-stage'
+scp -r deployment mini-server:~/openhands-agent-stage/
+
+# Перенести deployment в /srv без вложенности deployment/deployment
+ssh mini-server 'sudo mkdir -p /srv/openhands-agent && sudo cp -a ~/openhands-agent-stage/deployment /srv/openhands-agent/ && sudo chown -R igor:igor /srv/openhands-agent && rm -rf ~/openhands-agent-stage'
 
 # Создать каталоги и права
-sudo /usr/bin/bash /srv/openhands-agent/deployment/scripts/prepare.sh
+ssh mini-server 'sudo /usr/bin/bash /srv/openhands-agent/deployment/scripts/prepare.sh'
 ```
 
 ### 2. Создание ключа
@@ -82,8 +86,8 @@ systemd openhands-agent.service
   ├─ ExecStartPre: docker compose create
   ├─ ExecStartPre: apply-egress-rules.sh
   ├─ ExecStart: run-supervised.sh (compose up + watchdog)
-  ├─ ExecStop: docker compose down
-  └─ ExecStopPost: remove-egress-rules.sh
+  ├─ SIGTERM: supervisor → watchdog stop → compose down → сбор обоих PID
+  └─ ExecStopPost: compose down --remove-orphans → remove-egress-rules.sh
 ```
 
 ## Ключевые решения

@@ -6,37 +6,78 @@
 set -euo pipefail
 
 CONTAINER="openhands-agent"
-MAX_UNHEALTHY=3
-START_PERIOD=90
-CHECK_INTERVAL=10
+MAX_UNHEALTHY="${WATCHDOG_MAX_UNHEALTHY:-3}"
+START_PERIOD="${WATCHDOG_START_PERIOD:-90}"
+CHECK_INTERVAL="${WATCHDOG_CHECK_INTERVAL:-10}"
+DOCKER_BIN="${DOCKER_BIN:-docker}"
+STOP_REQUESTED=false
+SLEEP_PID=""
+
+on_signal() {
+    local rc
+
+    STOP_REQUESTED=true
+    if [ -n "${SLEEP_PID}" ] && kill -0 "${SLEEP_PID}" 2>/dev/null; then
+        kill -TERM "${SLEEP_PID}" 2>/dev/null || true
+    fi
+    if [ -n "${SLEEP_PID}" ]; then
+        set +e
+        wait "${SLEEP_PID}"
+        rc=$?
+        set -e
+        SLEEP_PID=""
+        echo "[watchdog] Управляемый sleep завершён: ${rc}"
+    fi
+    exit 0
+}
+
+managed_sleep() {
+    local duration="$1"
+    local rc
+
+    sleep "${duration}" &
+    SLEEP_PID=$!
+    set +e
+    wait "${SLEEP_PID}"
+    rc=$?
+    set -e
+    SLEEP_PID=""
+
+    if ${STOP_REQUESTED}; then
+        exit 0
+    fi
+    return "${rc}"
+}
+
+trap on_signal SIGTERM SIGINT
 
 echo "[watchdog] Ожидание контейнера ${CONTAINER}..."
 
 for i in $(seq 1 30); do
-    if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "${CONTAINER}"; then
+    if "${DOCKER_BIN}" ps --format '{{.Names}}' 2>/dev/null | grep -qx "${CONTAINER}"; then
         echo "[watchdog] Контейнер найден."
         break
     fi
-    sleep 2
+    managed_sleep 2
 done
 
-if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "${CONTAINER}"; then
+if ! "${DOCKER_BIN}" ps --format '{{.Names}}' 2>/dev/null | grep -qx "${CONTAINER}"; then
     echo "[watchdog] ❌ Контейнер не появился"
     exit 1
 fi
 
 echo "[watchdog] Ожидание start_period (${START_PERIOD}s)..."
-sleep "${START_PERIOD}"
+managed_sleep "${START_PERIOD}"
 
 UNHEALTHY_COUNT=0
 
 while true; do
-    if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "${CONTAINER}"; then
+    if ! "${DOCKER_BIN}" ps --format '{{.Names}}' 2>/dev/null | grep -qx "${CONTAINER}"; then
         echo "[watchdog] ❌ Контейнер исчез или завершился"
         exit 1
     fi
 
-    STATUS=$(docker inspect -f '{{.State.Health.Status}}' "${CONTAINER}" 2>/dev/null || echo "unknown")
+    STATUS=$("${DOCKER_BIN}" inspect -f '{{.State.Health.Status}}' "${CONTAINER}" 2>/dev/null || echo "unknown")
 
     case "${STATUS}" in
         healthy)
@@ -50,9 +91,9 @@ while true; do
             if [ "${UNHEALTHY_COUNT}" -ge "${MAX_UNHEALTHY}" ]; then
                 echo "[watchdog] ❌ ${MAX_UNHEALTHY} последовательных unhealthy"
                 echo "[watchdog] Последние логи (без секретов):"
-                docker logs --tail 30 "${CONTAINER}" 2>/dev/null | grep -viE 'token|key|secret|password|bearer|api_key' || true
+                "${DOCKER_BIN}" logs --tail 30 "${CONTAINER}" 2>/dev/null | grep -viE 'token|key|secret|password|bearer|api_key' || true
                 echo "[watchdog] Остановка контейнера..."
-                docker stop "${CONTAINER}" 2>/dev/null || true
+                "${DOCKER_BIN}" stop "${CONTAINER}" 2>/dev/null || true
                 exit 1
             fi
             ;;
@@ -62,5 +103,5 @@ while true; do
             ;;
     esac
 
-    sleep "${CHECK_INTERVAL}"
+    managed_sleep "${CHECK_INTERVAL}"
 done

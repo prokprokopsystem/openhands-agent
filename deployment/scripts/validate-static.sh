@@ -63,7 +63,23 @@ grep -q 'ExecStartPre=.*validate-runtime.sh' "${SVC}" && pass "ExecStartPre: val
 grep -q 'ExecStartPre=.*compose.*create' "${SVC}" && pass "ExecStartPre: compose create" || fail "ExecStartPre: нет compose create"
 grep -q 'ExecStartPre=.*apply-egress-rules' "${SVC}" && pass "ExecStartPre: apply-egress-rules" || fail "ExecStartPre: нет apply-egress-rules"
 grep -q 'ExecStart=.*run-supervised' "${SVC}" && pass "ExecStart: run-supervised" || fail "ExecStart: не run-supervised"
-grep -q 'ExecStopPost=.*remove-egress-rules' "${SVC}" && pass "ExecStopPost: remove-egress-rules" || fail "ExecStopPost: нет remove-egress-rules"
+grep -q '^KillMode=mixed$' "${SVC}" && pass "KillMode=mixed" || fail "KillMode должен быть mixed"
+grep -q '^ExecStop=.*docker compose.*down' "${SVC}" && fail "ExecStop: прямой compose down запрещён" || pass "ExecStop: прямого compose down нет"
+EXEC_STOP_POST=$(grep '^ExecStopPost=' "${SVC}" || true)
+if grep -q 'docker compose.*down --remove-orphans' <<<"${EXEC_STOP_POST}"; then
+    pass "ExecStopPost: compose down --remove-orphans"
+else
+    fail "ExecStopPost: нет compose down --remove-orphans"
+fi
+if grep -q 'remove-egress-rules.sh' <<<"${EXEC_STOP_POST}" &&
+    [[ "${EXEC_STOP_POST}" == *"docker compose"*"remove-egress-rules.sh"* ]]; then
+    pass "ExecStopPost: firewall удаляется после Compose"
+else
+    fail "ExecStopPost: неверный порядок Compose/firewall"
+fi
+grep -q 'down --remove-orphans && .*remove-egress-rules.sh' <<<"${EXEC_STOP_POST}" \
+    && pass "ExecStopPost: ошибка Compose сохраняет firewall" \
+    || fail "ExecStopPost: firewall может сняться после ошибки Compose"
 
 # ── 6. No direct docker compose up -d ──
 echo ""
@@ -125,17 +141,20 @@ fi
 echo ""
 echo "--- systemd-analyze verify ---"
 if command -v systemd-analyze >/dev/null 2>&1; then
+    SYSTEMD_TMP=$(mktemp -d "${VALIDATION_TMP}/systemd.XXXXXX")
+    SYSTEMD_TEST_UNIT="${SYSTEMD_TMP}/openhands-agent.service"
+    sed "s|/srv/openhands-agent|${PROJECT_ROOT}|g" "${SVC}" > "${SYSTEMD_TEST_UNIT}"
     set +e
-    RESULT=$(systemd-analyze verify "${SVC}" 2>&1)
+    RESULT=$(systemd-analyze verify "${SYSTEMD_TEST_UNIT}" 2>&1)
     SYSTEMD_VERIFY_RC=$?
     set -e
     REAL=$(
-        echo "${RESULT}" \
-            | grep -vE 'does not exist|cannot stat|No such file|Failed to create .*: Unit (docker\.service|wg-quick@wg0\.service) not found\.' \
+        printf '%s\n' "${RESULT}" \
+            | grep -vE '^.*Failed to create .*: Unit (docker\.service|wg-quick@wg0\.service) not found\.$' \
             || true
     )
     if [ "${SYSTEMD_VERIFY_RC}" -eq 0 ] || [ -z "${REAL}" ]; then
-        pass "systemd-analyze verify (внешние docker/wg-quick units могут отсутствовать на машине ревью)"
+        pass "systemd-analyze verify: checkout paths valid; only external units may be absent"
     else
         fail "systemd-analyze: ошибки"
         echo "${RESULT}"
@@ -149,6 +168,11 @@ echo ""
 echo "--- Docs: no manual compose ---"
 grep -r 'docker compose up' deployment/README.md 2>/dev/null | grep -v 'запрещ\|ЗАПРЕЩ\|forbidden' >/dev/null && fail "README: docker compose up" || pass "README: без docker compose up"
 grep -r 'systemctl start' deployment/README.md 2>/dev/null && pass "README: systemctl start" || fail "README: нет systemctl start"
+grep -q 'mini-server:~/openhands-agent-stage/' deployment/README.md && pass "README: копирование через домашний staging" || fail "README: нет домашнего staging"
+grep -q 'sudo mkdir -p /srv/openhands-agent' deployment/README.md && pass "README: /srv создаётся через sudo" || fail "README: /srv не создаётся через sudo"
+grep -q 'sudo cp -a ~/openhands-agent-stage/deployment /srv/openhands-agent/' deployment/README.md && pass "README: staging копируется без deployment/deployment" || fail "README: недетерминированное копирование deployment"
+grep -q "ssh mini-server 'sudo /usr/bin/bash /srv/openhands-agent/deployment/scripts/prepare.sh'" deployment/README.md && pass "README: prepare.sh запускается на mini-server" || fail "README: prepare.sh запускается не через mini-server"
+grep -Eq 'scp .*mini-server:/srv' deployment/README.md && fail "README: прямой scp в /srv запрещён" || pass "README: нет прямого scp в /srv"
 
 # ── 14. Docs: no key entry screen claim ──
 echo ""
@@ -430,7 +454,135 @@ else
     wait "${SIGTERM_SUPERVISOR_PID}" 2>/dev/null || true
 fi
 
-# ── 17. Supervisor static invariants ──
+# ── 17. Production watchdog SIGTERM/no-child test ──
+echo ""
+echo "--- Watchdog SIGTERM/no-child test ---"
+WATCHDOG_TEST_DIR=$(mktemp -d "${VALIDATION_TMP}/watchdog.XXXXXX")
+WATCHDOG_DOCKER="${WATCHDOG_TEST_DIR}/mock-docker"
+cat > "${WATCHDOG_DOCKER}" <<'EOF'
+#!/usr/bin/bash
+set -euo pipefail
+
+case "$1" in
+    ps)
+        printf '%s\n' 'openhands-agent'
+        ;;
+    inspect)
+        printf '%s\n' 'healthy'
+        ;;
+    *)
+        exit 2
+        ;;
+esac
+EOF
+chmod +x "${WATCHDOG_DOCKER}"
+
+WATCHDOG_RC=0
+WATCHDOG_CHILD_PID=""
+DOCKER_BIN="${WATCHDOG_DOCKER}" \
+WATCHDOG_START_PERIOD=30 \
+WATCHDOG_CHECK_INTERVAL=30 \
+WATCHDOG_MAX_UNHEALTHY=3 \
+    /usr/bin/bash deployment/scripts/health-watchdog.sh > "${WATCHDOG_TEST_DIR}/watchdog.log" 2>&1 &
+WATCHDOG_TEST_PID=$!
+
+for attempt in $(seq 1 100); do
+    if [ -r "/proc/${WATCHDOG_TEST_PID}/task/${WATCHDOG_TEST_PID}/children" ]; then
+        WATCHDOG_CHILD_PID=$(awk '{print $1}' "/proc/${WATCHDOG_TEST_PID}/task/${WATCHDOG_TEST_PID}/children")
+        [ -n "${WATCHDOG_CHILD_PID}" ] && break
+    fi
+    sleep 0.05
+done
+
+if [ -n "${WATCHDOG_CHILD_PID}" ]; then
+    pass "watchdog: managed sleep child detected (${WATCHDOG_CHILD_PID})"
+    kill -TERM "${WATCHDOG_TEST_PID}"
+    if ! wait_for_process_exit "${WATCHDOG_TEST_PID}"; then
+        fail "watchdog: did not stop after SIGTERM"
+        kill -KILL "${WATCHDOG_TEST_PID}" 2>/dev/null || true
+    fi
+    set +e
+    wait "${WATCHDOG_TEST_PID}"
+    WATCHDOG_RC=$?
+    set -e
+    [ "${WATCHDOG_RC}" -eq 0 ] \
+        && pass "watchdog: SIGTERM exit 0" \
+        || fail "watchdog: SIGTERM exit ${WATCHDOG_RC}, expected 0"
+    if kill -0 "${WATCHDOG_CHILD_PID}" 2>/dev/null; then
+        fail "watchdog: managed sleep ${WATCHDOG_CHILD_PID} still running"
+        kill -KILL "${WATCHDOG_CHILD_PID}" 2>/dev/null || true
+    else
+        pass "watchdog: managed sleep reaped"
+    fi
+else
+    fail "watchdog: managed sleep child not detected"
+    kill -TERM "${WATCHDOG_TEST_PID}" 2>/dev/null || true
+    wait "${WATCHDOG_TEST_PID}" 2>/dev/null || true
+fi
+
+# ── 18. stop.sh firewall verification ──
+echo ""
+echo "--- stop.sh firewall verification ---"
+STOP_TEST_DIR=$(mktemp -d "${VALIDATION_TMP}/stop.XXXXXX")
+STOP_SUDO="${STOP_TEST_DIR}/sudo"
+STOP_DOCKER="${STOP_TEST_DIR}/docker"
+cat > "${STOP_SUDO}" <<'EOF'
+#!/usr/bin/bash
+set -euo pipefail
+
+if [ "$1" = "systemctl" ] && [ "$2" = "stop" ]; then
+    exit 0
+fi
+if [ "$1" = "iptables" ] && [ "$2" = "-nL" ]; then
+    if [ "$3" = "OPENHANDS-EGRESS" ]; then
+        exit 0
+    fi
+    echo 'iptables: No chain/target/match by that name.' >&2
+    exit 1
+fi
+exit 2
+EOF
+cat > "${STOP_DOCKER}" <<'EOF'
+#!/usr/bin/bash
+set -euo pipefail
+[ "$1" = "ps" ] || exit 2
+exit 0
+EOF
+chmod +x "${STOP_SUDO}" "${STOP_DOCKER}"
+
+STOP_RC=0
+set +e
+PATH="${STOP_TEST_DIR}:${PATH}" \
+DOCKER_BIN="${STOP_DOCKER}" \
+STOP_VERIFY_DELAY=0 \
+    /usr/bin/bash deployment/scripts/stop.sh > "${STOP_TEST_DIR}/stop.log" 2>&1
+STOP_RC=$?
+set -e
+
+grep -q 'sudo iptables' deployment/scripts/stop.sh \
+    && pass "stop.sh: iptables checks use sudo" \
+    || fail "stop.sh: iptables checks do not use sudo"
+grep -q 'OPENHANDS-EGRESS' deployment/scripts/stop.sh \
+    && pass "stop.sh: checks OPENHANDS-EGRESS" \
+    || fail "stop.sh: missing OPENHANDS-EGRESS check"
+grep -q 'OPENHANDS-INPUT' deployment/scripts/stop.sh \
+    && pass "stop.sh: checks OPENHANDS-INPUT" \
+    || fail "stop.sh: missing OPENHANDS-INPUT check"
+[ "${STOP_RC}" -ne 0 ] \
+    && pass "stop.sh: remaining chain forces non-zero (rc=${STOP_RC})" \
+    || fail "stop.sh: remaining chain incorrectly returned success"
+
+# ── 19. Egress positive checks ──
+echo ""
+echo "--- Egress positive checks ---"
+grep -q 'expect_ok "External HTTP"' deployment/network/check-egress.sh \
+    && pass "egress: External HTTP positive test" \
+    || fail "egress: missing External HTTP test"
+grep -q 'expect_ok "External HTTPS"' deployment/network/check-egress.sh \
+    && pass "egress: External HTTPS positive test" \
+    || fail "egress: missing External HTTPS test"
+
+# ── 20. Supervisor static invariants ──
 echo ""
 echo "--- Supervisor static invariants ---"
 grep -q 'wait_pid' deployment/scripts/run-supervised.sh 2>/dev/null && pass "supervisor: wait_pid функция" || fail "supervisor: нет wait_pid"
@@ -440,7 +592,7 @@ grep -q 'COMPOSE_COLLECTED=false' deployment/scripts/run-supervised.sh 2>/dev/nu
 grep -q 'WATCHDOG_COLLECTED=false' deployment/scripts/run-supervised.sh 2>/dev/null && pass "supervisor: WATCHDOG_COLLECTED" || fail "supervisor: нет WATCHDOG_COLLECTED"
 grep -q 'eval ' deployment/scripts/run-supervised.sh 2>/dev/null && fail "supervisor: eval запрещён" || pass "supervisor: без eval"
 
-# ── 18. Purge extended checks ──
+# ── 21. Purge extended checks ──
 echo ""
 echo "--- Purge extended checks ---"
 grep -q '\${1:-}' deployment/scripts/purge-test.sh && pass "purge: \${1:-}" || fail "purge: нет \${1:-}"
@@ -449,7 +601,7 @@ grep -q 'OPENHANDS-INPUT' deployment/scripts/purge-test.sh && pass "purge: пр�
 grep -q '\-\-one-file-system' deployment/scripts/purge-test.sh && pass "purge: --one-file-system" || fail "purge: нет --one-file-system"
 grep -q 'docker compose.*down' deployment/scripts/purge-test.sh && grep -A2 'compose down' deployment/scripts/purge-test.sh | grep -q '|| true' && fail "purge: compose down скрывает ошибку || true" || pass "purge: compose down без || true"
 
-# ── 19. Path consistency ──
+# ── 22. Path consistency ──
 echo ""
 echo "--- Path consistency ---"
 grep -q '/srv/openhands-agent' deployment/compose.yaml deployment/systemd/openhands-agent.service 2>/dev/null && pass "Пути консистентны" || fail "Пути не консистентны"

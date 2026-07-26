@@ -36,6 +36,7 @@ expect_blocked() {
 
 # External services required for model/API use.
 expect_ok "DNS resolution" "getent ahostsv4 example.com"
+expect_ok "External HTTP" "curl -sS -o /dev/null --connect-timeout 5 --max-time 10 http://example.com/"
 expect_ok "External HTTPS" "curl -sS -o /dev/null --connect-timeout 5 --max-time 10 https://example.com/"
 
 # Internal and non-web destinations must be unreachable.
