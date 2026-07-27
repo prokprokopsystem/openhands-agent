@@ -1,0 +1,145 @@
+# OpenHands Agent — реестр инструментов broker
+# Формат: YAML. Секции по серверам.
+# Добавление нового инструмента — новая запись без изменения wrapper.
+# Версия: 1.0
+
+server: mini-server
+user: openhands-broker
+tools:
+  - name: ping
+    description: Проверка доступности хоста
+    risk: A
+    execute: "echo pong"
+    verify: null
+    rollback: null
+    secrets: []
+
+  - name: system_status
+    description: Проверка статуса systemd-службы
+    risk: A
+    params:
+      service:
+        type: string
+        required: false
+        default: "openhands-agent"
+    execute: "systemctl status {{service}} --no-pager -l 2>&1 | head -80"
+    verify: null
+    rollback: null
+    secrets: []
+
+  - name: journal_logs
+    description: Чтение журнала systemd-службы
+    risk: A
+    params:
+      service:
+        type: string
+        required: false
+        default: "openhands-agent"
+      lines:
+        type: integer
+        required: false
+        default: 50
+    execute: "journalctl -u {{service}} -n {{lines}} --no-pager 2>&1"
+    verify: null
+    rollback: null
+    secrets: []
+
+  - name: docker_ps
+    description: Список запущенных контейнеров
+    risk: A
+    execute: "docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' 2>&1"
+    verify: null
+    rollback: null
+    secrets: []
+
+  - name: docker_compose_ps
+    description: Статус проекта Docker Compose
+    risk: A
+    execute: "docker compose -f /srv/openhands-agent/deployment/compose.yaml ps 2>&1"
+    verify: null
+    rollback: null
+    secrets: []
+
+  - name: docker_compose_logs
+    description: Логи Docker Compose проекта
+    risk: A
+    params:
+      lines:
+        type: integer
+        required: false
+        default: 50
+    execute: >-
+      docker compose -f /srv/openhands-agent/deployment/compose.yaml
+      logs -n {{lines}} --no-color 2>&1 | tail -{{lines}}
+    verify: null
+    rollback: null
+    secrets: []
+
+  - name: disk_usage
+    description: Использование диска
+    risk: A
+    execute: "df -h / /srv 2>&1"
+    verify: null
+    rollback: null
+    secrets: []
+
+  - name: memory_usage
+    description: Использование памяти
+    risk: A
+    execute: "free -h 2>&1"
+    verify: null
+    rollback: null
+    secrets: []
+
+  - name: validate_runtime
+    description: Запуск валидации runtime
+    risk: A
+    execute: "sudo /srv/openhands-agent/deployment/scripts/validate-runtime.sh 2>&1"
+    verify: null
+    rollback: null
+    secrets: []
+
+  - name: backup_create
+    description: Создать резервную копию проекта
+    risk: B
+    execute: "sudo /usr/local/bin/openhands-backup.sh 2>&1"
+    verify: "ls -lt /mnt/amnesia-backup/openhands-agent/daily/ 2>&1 | head -3"
+    rollback: null
+    secrets: []
+
+  - name: service_restart
+    description: Перезапуск systemd-службы проекта
+    risk: B
+    params:
+      service:
+        type: string
+        required: true
+    check: "systemctl is-active {{service}} 2>&1"
+    execute: "sudo systemctl restart {{service}} 2>&1"
+    verify: "systemctl is-active {{service}} 2>&1 | grep -q active"
+    rollback: "sudo systemctl restart {{service}} 2>&1"
+    secrets: []
+
+  - name: service_start
+    description: Запуск systemd-службы проекта
+    risk: B
+    params:
+      service:
+        type: string
+        required: true
+    execute: "sudo systemctl start {{service}} 2>&1"
+    verify: "systemctl is-active {{service}} 2>&1 | grep -q active"
+    rollback: "sudo systemctl stop {{service}} 2>&1"
+    secrets: []
+
+  - name: service_stop
+    description: Остановка systemd-службы проекта
+    risk: B
+    params:
+      service:
+        type: string
+        required: true
+    execute: "sudo systemctl stop {{service}} 2>&1"
+    verify: "systemctl is-active {{service}} 2>&1 | grep -q inactive"
+    rollback: "sudo systemctl start {{service}} 2>&1"
+    secrets: []
