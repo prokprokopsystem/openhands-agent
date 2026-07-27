@@ -36,6 +36,10 @@ iptables -I INPUT 1 -s "${SUBNET}" -j "${INPUT_CHAIN}"
 iptables -A "${EGRESS_CHAIN}" -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
 
 # Internal/private destinations are denied before any service allow-list.
+# Exception: SSH from container to mini-server host (10.89.0.1) for broker — level C.
+# When setting up broker, uncomment the line below and re-apply rules.
+# iptables -A "${EGRESS_CHAIN}" -d 10.89.0.1 -p tcp --dport 22 -j RETURN
+
 iptables -A "${EGRESS_CHAIN}" -d 127.0.0.0/8 -j DROP
 iptables -A "${EGRESS_CHAIN}" -d 169.254.0.0/16 -j DROP
 iptables -A "${EGRESS_CHAIN}" -d 10.0.0.0/8 -j DROP

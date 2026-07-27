@@ -1,21 +1,33 @@
 # OpenHands Agent — реестр инструментов broker
+# Версия: 1.1
+#
+# Топология:
+#   VPS: 95.217.239.148, WG: 10.77.0.1
+#   Mini-server: LAN 192.168.100.106, WG: 10.77.0.2
+#   Docker bridge openhands-net: 10.89.0.0/28
+#     gateway (хост): 10.89.0.1
+#     контейнер Canvas: 10.89.0.2
+#   Broker: пользователь openhands-broker на mini-server
+#     SSH: 10.89.0.1:22 (требует исключения в egress)
+#
 # Формат: YAML. Секции по серверам.
 # Добавление нового инструмента — новая запись без изменения wrapper.
-# Версия: 1.0
 
 server: mini-server
+host: 10.89.0.1
 user: openhands-broker
 tools:
   - name: ping
     description: Проверка доступности хоста
     risk: A
+    params: {}
     execute: "echo pong"
     verify: null
     rollback: null
     secrets: []
 
   - name: system_status
-    description: Проверка статуса systemd-службы
+    description: Статус systemd-службы
     risk: A
     params:
       service:
@@ -28,7 +40,7 @@ tools:
     secrets: []
 
   - name: journal_logs
-    description: Чтение журнала systemd-службы
+    description: Журнал systemd-службы
     risk: A
     params:
       service:
@@ -45,23 +57,25 @@ tools:
     secrets: []
 
   - name: docker_ps
-    description: Список запущенных контейнеров
+    description: Список контейнеров (sudo)
     risk: A
-    execute: "docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' 2>&1"
+    params: {}
+    execute: "sudo docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' 2>&1"
     verify: null
     rollback: null
     secrets: []
 
   - name: docker_compose_ps
-    description: Статус проекта Docker Compose
+    description: Статус проекта compose (sudo)
     risk: A
-    execute: "docker compose -f /srv/openhands-agent/deployment/compose.yaml ps 2>&1"
+    params: {}
+    execute: "sudo docker compose -f /srv/openhands-agent/deployment/compose.yaml ps 2>&1"
     verify: null
     rollback: null
     secrets: []
 
   - name: docker_compose_logs
-    description: Логи Docker Compose проекта
+    description: Логи compose проекта (sudo)
     risk: A
     params:
       lines:
@@ -69,7 +83,7 @@ tools:
         required: false
         default: 50
     execute: >-
-      docker compose -f /srv/openhands-agent/deployment/compose.yaml
+      sudo docker compose -f /srv/openhands-agent/deployment/compose.yaml
       logs -n {{lines}} --no-color 2>&1 | tail -{{lines}}
     verify: null
     rollback: null
@@ -78,6 +92,7 @@ tools:
   - name: disk_usage
     description: Использование диска
     risk: A
+    params: {}
     execute: "df -h / /srv 2>&1"
     verify: null
     rollback: null
@@ -86,29 +101,32 @@ tools:
   - name: memory_usage
     description: Использование памяти
     risk: A
+    params: {}
     execute: "free -h 2>&1"
     verify: null
     rollback: null
     secrets: []
 
   - name: validate_runtime
-    description: Запуск валидации runtime
+    description: Валидация runtime проекта (sudo)
     risk: A
+    params: {}
     execute: "sudo /srv/openhands-agent/deployment/scripts/validate-runtime.sh 2>&1"
     verify: null
     rollback: null
     secrets: []
 
   - name: backup_create
-    description: Создать резервную копию проекта
+    description: Создать backup проекта (sudo)
     risk: B
+    params: {}
     execute: "sudo /usr/local/bin/openhands-backup.sh 2>&1"
     verify: "ls -lt /mnt/amnesia-backup/openhands-agent/daily/ 2>&1 | head -3"
     rollback: null
     secrets: []
 
   - name: service_restart
-    description: Перезапуск systemd-службы проекта
+    description: Перезапуск службы проекта (sudo)
     risk: B
     params:
       service:
@@ -121,7 +139,7 @@ tools:
     secrets: []
 
   - name: service_start
-    description: Запуск systemd-службы проекта
+    description: Запуск службы проекта (sudo)
     risk: B
     params:
       service:
@@ -133,7 +151,7 @@ tools:
     secrets: []
 
   - name: service_stop
-    description: Остановка systemd-службы проекта
+    description: Остановка службы проекта (sudo)
     risk: B
     params:
       service:
@@ -143,3 +161,4 @@ tools:
     verify: "systemctl is-active {{service}} 2>&1 | grep -q inactive"
     rollback: "sudo systemctl start {{service}} 2>&1"
     secrets: []
+

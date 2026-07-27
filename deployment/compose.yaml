@@ -19,6 +19,7 @@ services:
       - /srv/openhands-agent/config:/home/openhands/.openhands:rw
       - /srv/openhands-agent/work-workspace:/projects:rw
       - /srv/openhands-agent/docs:/docs:ro
+      - /srv/openhands-agent/secrets:/secrets:ro
 
     env_file:
       - /srv/openhands-agent/secrets/.env

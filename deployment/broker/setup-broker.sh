@@ -1,10 +1,15 @@
 #!/usr/bin/bash
 # OpenHands Agent — установка broker на хост mini-server
-# Запускать на mini-server. Проверяет, создаёт, копирует.
+# Идемпотентная. Запускать только из зафиксированного коммита.
 #
-# Usage: sudo ./setup-broker.sh [--force]
+# Usage: sudo ./setup-broker.sh <commit-sha>
+#   commit-sha: проверенный SHA коммита, из которого установка разрешена
+#
+# Пример: sudo ./setup-broker.sh fcb532a
 #
 set -euo pipefail
+
+COMMIT_SHA="${1:-}"
 
 BROKER_USER="openhands-broker"
 BROKER_HOME="/home/${BROKER_USER}"
@@ -14,83 +19,126 @@ BROKER_LOG="/var/log/openhands-broker"
 SUDOERS_FILE="/etc/sudoers.d/openhands-broker"
 SSH_DIR="${BROKER_HOME}/.ssh"
 AUTH_KEYS="${SSH_DIR}/authorized_keys"
-
-FORCE="${1:-}"
+LOCKFILE="/tmp/.openhands-broker-setup.lock"
 
 ok()   { printf '  [OK] %s\n' "$1"; }
 warn() { printf '  [WARN] %s\n' "$1"; }
 fail() { printf '  [FAIL] %s\n' "$1"; exit 1; }
-info() { printf '  [INFO] %s\n' "$1"; }
 
-# --- Проверка ---
-[ "$(id -u)" -eq 0 ] || fail "Запустите с sudo"
+# --- Блокировка ---
+exec 9>"${LOCKFILE}"
+flock -n 9 || fail "Another setup is running"
 
-# --- Создание пользователя ---
-if id "${BROKER_USER}" &>/dev/null; then
-    if [ "${FORCE}" = "--force" ]; then
-        warn "Пользователь ${BROKER_USER} уже существует — продолжаем (--force)"
-    else
-        ok "Пользователь ${BROKER_USER} уже существует"
-    fi
-else
+# --- Root check ---
+[ "$(id -u)" -eq 0 ] || fail "Run with sudo"
+
+# --- Проверка SHA ---
+[ -n "${COMMIT_SHA}" ] || fail "Usage: sudo $0 <commit-sha>"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "${SCRIPT_DIR}/../.."
+CURRENT_SHA=$(git rev-parse --short HEAD 2>/dev/null || echo "not-a-git-repo")
+[ "${CURRENT_SHA}" = "${COMMIT_SHA}" ] || fail "SHA mismatch: current=${CURRENT_SHA} required=${COMMIT_SHA}. Run only from verified commit."
+
+# --- Проверка зависимостей ---
+command -v python3 >/dev/null 2>&1 || fail "python3 required"
+python3 -c "import yaml" 2>/dev/null || fail "PyYAML required (pip3 install pyyaml)"
+command -v docker >/dev/null 2>&1 || fail "docker required"
+
+# --- Создание пользователя (идемпотентно) ---
+if ! id "${BROKER_USER}" &>/dev/null; then
     useradd --system --no-create-home --shell /usr/sbin/nologin \
         --comment "OpenHands Agent Broker" "${BROKER_USER}"
-    ok "Создан пользователь ${BROKER_USER}"
-fi
-
-# --- Каталоги ---
-for dir in "${BROKER_LIB}" "${BROKER_ETC}/secrets" "${BROKER_LOG}" "${SSH_DIR}"; do
-    install -d -o "${BROKER_USER}" -g "${BROKER_USER}" -m 755 "${dir}"
-    ok "Каталог ${dir}"
-done
-chmod 700 "${SSH_DIR}"
-ok "SSH_DIR: 700"
-
-# --- Копирование wrapper ---
-SCRIPT_SRC="$(dirname "$0")/broker-wrapper.sh"
-if [ -f "${SCRIPT_SRC}" ]; then
-    install -o root -g root -m 755 "${SCRIPT_SRC}" "${BROKER_LIB}/broker-wrapper.sh"
-    ok "broker-wrapper.sh"
+    ok "User created: ${BROKER_USER}"
 else
-    fail "${SCRIPT_SRC} не найден"
+    ok "User already exists: ${BROKER_USER}"
 fi
 
-# --- Копирование tools.yaml ---
-YAML_SRC="$(dirname "$0")/tools.yaml"
-if [ -f "${YAML_SRC}" ]; then
-    install -o root -g "${BROKER_USER}" -m 644 "${YAML_SRC}" "${BROKER_ETC}/tools.yaml"
-    ok "tools.yaml"
+# --- Каталоги (только root, пользователь не пишет) ---
+install -d -o root -g root -m 755 "${BROKER_LIB}"
+install -d -o root -g root -m 755 "${BROKER_ETC}"
+install -d -o root -g root -m 755 "${BROKER_ETC}/secrets"
+install -d -o root -g root -m 755 "${BROKER_LOG}"
+ok "Directories created"
+
+# --- SSH home (.ssh владельцем root, 700) ---
+install -d -o root -g root -m 700 "${BROKER_HOME}"
+install -d -o root -g root -m 700 "${SSH_DIR}"
+ok "SSH home: ${SSH_DIR}"
+
+# --- Копирование wrapper (root:root, 755) ---
+SCRIPT_SRC="${SCRIPT_DIR}/broker-wrapper.sh"
+[ -f "${SCRIPT_SRC}" ] || fail "${SCRIPT_SRC} not found"
+install -o root -g root -m 755 "${SCRIPT_SRC}" "${BROKER_LIB}/broker-wrapper.sh"
+ok "broker-wrapper.sh"
+
+# --- Копирование tools.yaml (root:root, 644) ---
+YAML_SRC="${SCRIPT_DIR}/tools.yaml"
+[ -f "${YAML_SRC}" ] || fail "${YAML_SRC} not found"
+install -o root -g root -m 644 "${YAML_SRC}" "${BROKER_ETC}/tools.yaml"
+ok "tools.yaml"
+
+# --- authorized_keys с forced command ---
+if [ ! -f "${AUTH_KEYS}" ]; then
+    cat > "${AUTH_KEYS}" << 'AUTH'
+# OpenHands Broker — SSH forced command
+# Добавьте публичный ключ ниже с префиксом:
+# no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-pty,command="/usr/local/lib/openhands-broker/broker-wrapper.sh"
+AUTH
+    chmod 600 "${AUTH_KEYS}"
+    chown root:root "${AUTH_KEYS}"
+    ok "authorized_keys template created"
+    warn "Add public key: echo 'no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-pty,command=\"/usr/local/lib/openhands-broker/broker-wrapper.sh\" <pubkey>' >> ${AUTH_KEYS}"
 else
-    fail "${YAML_SRC} не найден"
+    ok "authorized_keys already exists"
+    # Проверка, что все ключи имеют forced command
+    HAS_FC=$(grep -c 'command="/usr/local/lib/openhands-broker/broker-wrapper.sh"' "${AUTH_KEYS}" 2>/dev/null || echo 0)
+    if [ "${HAS_FC}" -eq 0 ]; then
+        warn "No keys with forced command found in ${AUTH_KEYS}"
+    fi
 fi
 
-# --- Sudo-правила ---
+# --- Sudo-правила (только команды из tools.yaml) ---
 cat > "${SUDOERS_FILE}" << 'SUDO'
 # OpenHands Agent Broker — разрешённые команды
+# Должны соответствовать tools.yaml. Проверено visudo -cf.
+openhands-broker ALL=(root) NOPASSWD: /usr/bin/docker ps
+openhands-broker ALL=(root) NOPASSWD: /usr/bin/docker compose -f /srv/openhands-agent/deployment/compose.yaml ps
+openhands-broker ALL=(root) NOPASSWD: /usr/bin/docker compose -f /srv/openhands-agent/deployment/compose.yaml logs -n *
 openhands-broker ALL=(root) NOPASSWD: /usr/bin/systemctl restart openhands-agent.service
 openhands-broker ALL=(root) NOPASSWD: /usr/bin/systemctl stop openhands-agent.service
 openhands-broker ALL=(root) NOPASSWD: /usr/bin/systemctl start openhands-agent.service
-openhands-broker ALL=(root) NOPASSWD: /usr/bin/systemctl status openhands-agent.service
+openhands-broker ALL=(root) NOPASSWD: /usr/sbin/visudo -c -f *
 openhands-broker ALL=(root) NOPASSWD: /usr/local/bin/openhands-backup.sh
 openhands-broker ALL=(root) NOPASSWD: /srv/openhands-agent/deployment/scripts/validate-runtime.sh
 SUDO
 chmod 440 "${SUDOERS_FILE}"
-ok "sudo-правила: ${SUDOERS_FILE}"
 
-# --- SSH authorised_keys (ожидается публичный ключ) ---
-# Ключ нужно добавить вручную или через --pubkey
-if [ -f "${AUTH_KEYS}" ] && [ -s "${AUTH_KEYS}" ]; then
-    ok "authorized_keys существует (${AUTH_KEYS})"
+# Проверка sudoers через visudo -cf
+visudo -cf "${SUDOERS_FILE}" >/dev/null 2>&1 || fail "sudoers syntax check failed"
+ok "sudo rules: ${SUDOERS_FILE} (visudo -cf passed)"
+
+# --- Ограничения openhands-broker (без права записи в реестр и secrets) ---
+chmod 755 "${BROKER_LIB}"
+chmod 755 "${BROKER_ETC}"
+chmod 755 "${BROKER_ETC}/secrets"
+chmod 755 "${BROKER_LOG}"
+# Пользователь не может менять файлы
+chown -R root:root "${BROKER_LIB}" "${BROKER_ETC}" "${BROKER_LOG}"
+ok "Broker user cannot modify registry, wrapper, or secrets"
+
+# --- SSH доступ (только forced command, no shell) ---
+# Shell уже /usr/sbin/nologin — forced command срабатывает до shell
+BROKER_SHELL=$(getent passwd "${BROKER_USER}" | cut -d: -f7)
+if [ "${BROKER_SHELL}" != "/usr/sbin/nologin" ]; then
+    usermod -s /usr/sbin/nologin "${BROKER_USER}"
+    ok "Shell set to /usr/sbin/nologin"
 else
-    warn "authorized_keys пуст. Добавьте публичный ключ:"
-    echo "  echo '<публичный-ключ>' | sudo tee -a ${AUTH_KEYS}"
-    echo "  sudo chmod 600 ${AUTH_KEYS}"
+    ok "Shell is /usr/sbin/nologin"
 fi
 
 # --- Logrotate ---
-LOG_ROTATE="/etc/logrotate.d/openhands-broker"
-if [ ! -f "${LOG_ROTATE}" ]; then
-    cat > "${LOG_ROTATE}" << 'LOGROTATE'
+if [ ! -f /etc/logrotate.d/openhands-broker ]; then
+    cat > /etc/logrotate.d/openhands-broker << 'LOGROTATE'
 /var/log/openhands-broker/*.log {
     weekly
     rotate 4
@@ -99,34 +147,14 @@ if [ ! -f "${LOG_ROTATE}" ]; then
     missingok
     notifempty
     copytruncate
+    create 640 root root
 }
 LOGROTATE
-    ok "logrotate: ${LOG_ROTATE}"
+    ok "logrotate installed"
+else
+    ok "logrotate already exists"
 fi
-
-# --- Проверка зависимостей ---
-for cmd in yq python3; do
-    if command -v "${cmd}" &>/dev/null; then
-        ok "${cmd} доступен"
-        break  # Достаточно одного
-    fi
-done || {
-    # python3 есть всегда, PyYAML может не быть
-    if python3 -c "import yaml" 2>/dev/null; then
-        ok "python3 + PyYAML"
-    else
-        warn "PyYAML не установлен. Установите: pip3 install pyyaml"
-    fi
-}
 
 echo ""
 echo "=== Setup complete ==="
-echo ""
-echo "Добавьте публичный SSH-ключ:"
-echo "  echo '<pubkey>' | sudo tee -a ${AUTH_KEYS}"
-echo "  sudo chmod 600 ${AUTH_KEYS}"
-echo ""
-echo "Проверка:"
-echo "  sudo -u ${BROKER_USER} ssh localhost ping"
-echo "  echo 'system_status' | sudo -u ${BROKER_USER} ssh localhost -T"
-echo ""
+echo "Add SSH key manually (see warning above for format)."
