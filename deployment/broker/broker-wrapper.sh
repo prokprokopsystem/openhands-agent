@@ -18,8 +18,12 @@ ACTIONS_LOG="${LOG_DIR}/actions.log"
 ERROR_LOG="${LOG_DIR}/error.log"
 TIMEOUT_SEC=120
 
-# --- Блокировка (simple flock, optional) ---
-flock -n /tmp/.openhands-broker-wrapper.lock -c "" 2>/dev/null || :
+# --- Блокировка на всё время выполнения wrapper ---
+exec 8>/tmp/.openhands-broker-wrapper.lock
+flock -n 8 || {
+    echo "ERROR: another broker command is running" >&2
+    exit 1
+}
 
 # --- Утилиты ---
 log_action_json() {
@@ -68,31 +72,23 @@ fi
 TOOL_NAME="$1"
 shift
 
-# --- Защита от injection: базовые паттерны ---
+# Имя инструмента и аргументы имеют закрытый синтаксис. Значения затем
+# дополнительно проверяются по type/allowed_values из tools.yaml.
+[[ "${TOOL_NAME}" =~ ^[a-z][a-z0-9_]*$ ]] || die "Invalid tool name"
+
 for arg in "$@"; do
     if [ "${arg}" = "--dry-run" ]; then
         continue
     fi
-    # Проверяем только param=value
     if [[ "${arg}" != *=* ]]; then
         die "Invalid argument format: ${arg}"
     fi
-    # Injection-паттерны
-    if echo "${arg}" | grep -qE '[;&$()`|]'; then
-        die "Rejected: argument contains shell metacharacters"
-    fi
-    if echo "${arg}" | grep -qE '`'; then
-        die "Rejected: argument contains backtick"
-    fi
-    if echo "${arg}" | grep -qE '\$\('; then
-        die "Rejected: argument contains $()"
-    fi
-    if echo "${arg}" | grep -qE '\.\./'; then
-        die "Rejected: argument contains path traversal"
-    fi
-    if echo "${arg}" | grep -qE '^\s*/'; then
-        die "Rejected: argument starts with absolute path"
-    fi
+    key="${arg%%=*}"
+    val="${arg#*=}"
+    [[ "${key}" =~ ^[a-z][a-z0-9_]*$ ]] || die "Invalid parameter name"
+    [ -n "${val}" ] || die "Empty parameter value: ${key}"
+    [[ "${val}" =~ ^[A-Za-z0-9_.:@%+,-]+$ ]] \
+        || die "Rejected: parameter contains forbidden characters"
 done
 
 # --- Dry-run флаг ---
@@ -158,6 +154,23 @@ for t in data.get('tools', []):
         sys.exit(0)
 print('[]')
 " 2>/dev/null || echo "[]"
+}
+
+read_param_field() {
+    local param="$1" field="$2"
+    python3 -c "
+import yaml
+with open('${TOOLS_FILE}') as f:
+    data = yaml.safe_load(f)
+for tool in data.get('tools', []):
+    if tool.get('name') == '${TOOL_NAME}':
+        value = tool.get('params', {}).get('${param}', {}).get('${field}')
+        if isinstance(value, list):
+            print('\n'.join(str(item) for item in value))
+        elif value is not None:
+            print(value)
+        break
+" 2>/dev/null
 }
 
 TOOL_EXECUTE=$(read_tool_field '.execute')
@@ -244,6 +257,24 @@ for rparam in ${REQUIRED_PARAMS:-}; do
     fi
 done
 
+# --- Проверка типов и закрытых списков значений ---
+for key in "${!PARAMS[@]}"; do
+    val="${PARAMS[$key]}"
+    param_type="$(read_param_field "${key}" type)"
+    if [ "${param_type}" = "integer" ] && ! [[ "${val}" =~ ^[0-9]+$ ]]; then
+        die "Parameter ${key} must be an integer"
+    fi
+
+    allowed_values="$(read_param_field "${key}" allowed_values)"
+    if [ -n "${allowed_values}" ]; then
+        allowed=false
+        while IFS= read -r item; do
+            [ "${val}" = "${item}" ] && allowed=true && break
+        done <<< "${allowed_values}"
+        [ "${allowed}" = true ] || die "Parameter ${key} has a forbidden value"
+    fi
+done
+
 # --- Подстановка параметров в команду ---
 EXECUTE_CMD="${TOOL_EXECUTE}"
 VERIFY_CMD="${TOOL_VERIFY}"
@@ -261,7 +292,7 @@ done
 # --- Подстановка секретов (на хосте, ДО вывода куда-либо) ---
 SECRET_SUBSTITUTED=false
 if [ "${SECRETS_LIST}" != "[]" ] && [ -n "${SECRETS_LIST}" ]; then
-    echo "${SECRETS_LIST}" | python3 -c "
+    mapfile -t SECRET_LINES < <(echo "${SECRETS_LIST}" | python3 -c "
 import json, sys, os
 secrets = json.loads(sys.stdin.read())
 for s in secrets:
@@ -273,7 +304,9 @@ for s in secrets:
     else:
         print(s + '=__MISSING__')
         sys.exit(1)
-" 2>/dev/null | while IFS='=' read -r sname sval; do
+" 2>/dev/null)
+    for secret_line in "${SECRET_LINES[@]}"; do
+        IFS='=' read -r sname sval <<< "${secret_line}"
         if [ "${sval}" = "__MISSING__" ]; then
             die "Secret not found: ${sname}"
         fi

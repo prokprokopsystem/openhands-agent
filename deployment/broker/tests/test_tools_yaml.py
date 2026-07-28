@@ -8,6 +8,7 @@ import yaml
 import json
 import os
 import subprocess
+import tempfile
 import pytest
 
 TOOLS_YAML = os.path.join(os.path.dirname(__file__), "..", "tools.yaml")
@@ -23,6 +24,23 @@ def load_yaml():
 def get_tool_names():
     data = load_yaml()
     return [t["name"] for t in data.get("tools", [])]
+
+
+def run_wrapper(command, broker_base=None):
+    with tempfile.TemporaryDirectory() as log_dir:
+        env = os.environ.copy()
+        env.update({
+            "OPENHANDS_BROKER_BASE": broker_base or os.path.dirname(TOOLS_YAML),
+            "OPENHANDS_BROKER_LOG_DIR": log_dir,
+            "SSH_ORIGINAL_COMMAND": command,
+        })
+        return subprocess.run(
+            ["bash", WRAPPER_SH],
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=10,
+        )
 
 
 # ======================================================================
@@ -78,9 +96,9 @@ def test_ping_returns_pong():
 
 def test_unknown_tool_rejected():
     """Неизвестный инструмент должен быть отклонён"""
-    data = load_yaml()
-    names = get_tool_names()
-    assert "nonexistent_tool_xyz" not in names, "Test tool should not exist"
+    result = run_wrapper("nonexistent_tool_xyz")
+    assert result.returncode != 0
+    assert "Unknown tool" in result.stderr
 
 
 # ======================================================================
@@ -90,25 +108,9 @@ def test_unknown_tool_rejected():
 def test_unknown_param_rejected():
     """tools.yaml не должен содержать инструментов с неописанными параметрами
     (проверка что params содержит все возможные ключи)"""
-    data = load_yaml()
-    for t in data["tools"]:
-        # Проверяем, что execute, verify, rollback используют только
-        # параметры из params и секреты из secrets
-        cmd_text = f"{t.get('execute', '')} {t.get('verify', '')} {t.get('rollback', '')}"
-        # Ищем {{something}} — это должны быть только param или secret:
-        import re
-        placeholders = re.findall(r'\{\{([^}]+)\}\}', cmd_text)
-        for ph in placeholders:
-            # {{.Names}} — Go-шаблон Docker, не подстановка wrapper
-            if ph.startswith("."):
-                continue
-            if ph.startswith("secret:"):
-                secret_name = ph[7:]
-                assert secret_name in t.get("secrets", []), \
-                    f"Tool {t['name']}: secret '{secret_name}' used but not in secrets list"
-            else:
-                assert ph in t.get("params", {}), \
-                    f"Tool {t['name']}: param '{ph}' used but not defined in params"
+    result = run_wrapper("system_status unknown=value --dry-run")
+    assert result.returncode != 0
+    assert "Unknown parameter" in result.stderr
 
 
 # ======================================================================
@@ -147,19 +149,16 @@ INJECTION_PATTERNS = [
 def test_tools_yaml_no_injection_in_commands():
     """Команды в tools.yaml не должны содержать очевидных injection-паттернов
     в execute/verify/rollback сами по себе"""
-    data = load_yaml()
-    for t in data["tools"]:
-        for field in ("execute", "verify", "rollback", "check"):
-            cmd = t.get(field)
-            if not cmd:
-                continue
-            # {{param}} подстановки — ок, но сам YAML не должен содержать shell injection
-            # Пропускаем подстановки
-            clean_cmd = cmd.replace("{{", "").replace("}}", "")
-            for pattern in [";", "&&", "||", "$(", "`"]:
-                if pattern in clean_cmd:
-                    # Проверяем что это часть шаблона, не literal injection
-                    pass  # Пропускаем — шаблонные команды с {{param}} содержат безопасные паттерны
+    commands = [
+        "system_status service=/etc/passwd --dry-run",
+        "system_status service=../etc/passwd --dry-run",
+        "system_status service=openhands-agent;id --dry-run",
+        "journal_logs lines=not-an-integer --dry-run",
+        "service_restart service=ssh --dry-run",
+    ]
+    for command in commands:
+        result = run_wrapper(command)
+        assert result.returncode != 0, command
 
 
 # ======================================================================
@@ -167,9 +166,7 @@ def test_tools_yaml_no_injection_in_commands():
 # ======================================================================
 
 def test_forced_command_prevents_shell():
-    """Проверка что forced command не даёт оболочки: /usr/sbin/nologin не проблема.
-    Это архитектурная проверка — setup-broker.sh устанавливает shell = nologin,
-    а SSH forced command работает ДО shell."""
+    """sshd needs a working login shell to launch the forced command."""
     data = load_yaml()
     assert data["user"] == "openhands-broker"
     # Проверка: authorized_keys должен содержать command=... в template и docs
@@ -180,7 +177,9 @@ def test_forced_command_prevents_shell():
     assert "no-agent-forwarding" in setup_content
     assert "no-X11-forwarding" in setup_content
     assert "no-pty" in setup_content
-    assert "nologin" in setup_content
+    assert "--shell /bin/bash" in setup_content
+    assert "usermod -s /bin/bash" in setup_content
+    assert "/usr/sbin/nologin" not in setup_content
 
 
 # ======================================================================
@@ -189,17 +188,35 @@ def test_forced_command_prevents_shell():
 
 def test_secrets_not_in_dry_run_or_logs():
     """Проверяем что wrapper не выводит секреты в dry-run"""
-    data = load_yaml()
-    for t in data["tools"]:
-        if t["secrets"]:
-            # Если есть секреты — dry-run должен их маскировать
-            # Это проверяется через wrapper, а не статически
-            pass
-    # wrapper проверяет SECRET_SUBSTITUTED и выводит "(secrets masked)"
     with open(WRAPPER_SH) as f:
         wrapper = f.read()
     assert "secrets masked" in wrapper
     assert "Would execute (secrets masked)" in wrapper
+    assert "| while IFS=" not in wrapper
+
+    with tempfile.TemporaryDirectory() as broker_base:
+        os.mkdir(os.path.join(broker_base, "secrets"))
+        secret_value = "test-secret-value"
+        with open(os.path.join(broker_base, "secrets", "TOKEN"), "w") as f:
+            f.write(secret_value)
+        registry = {
+            "tools": [{
+                "name": "secret_probe",
+                "risk": "A",
+                "params": {},
+                "execute": "printf '%s' '{{secret:TOKEN}}'",
+                "verify": None,
+                "rollback": None,
+                "secrets": ["TOKEN"],
+            }]
+        }
+        with open(os.path.join(broker_base, "tools.yaml"), "w") as f:
+            yaml.safe_dump(registry, f)
+        result = run_wrapper("secret_probe --dry-run", broker_base)
+        assert result.returncode == 0
+        assert "secrets masked" in result.stdout
+        assert secret_value not in result.stdout
+        assert secret_value not in result.stderr
 
 
 # ======================================================================
@@ -220,10 +237,9 @@ def test_verify_and_rollback():
         # Инструменты уровня A обычно не имеют verify/rollback — ок
         if t["risk"] == "A":
             continue
-        # Инструменты уровня B должны иметь verify и rollback
-        if t["risk"] == "B" and t.get("params"):
-            # Только если есть params — verify/rollback с подстановкой
-            pass
+        if t["risk"] == "B" and name != "backup_create":
+            assert verify, f"{name} must define verify"
+            assert rollback, f"{name} must define rollback"
 
 
 # ======================================================================
@@ -283,3 +299,29 @@ def test_docker_commands_use_sudo():
     for t in data["tools"]:
         if t["name"] in docker_tools:
             assert t["execute"].startswith("sudo"), f"{t['name']} should use sudo: {t['execute']}"
+
+
+def test_compose_mounts_only_broker_key():
+    compose = os.path.join(REPO_ROOT, "deployment", "compose.yaml")
+    with open(compose) as f:
+        content = f.read()
+    assert "/srv/openhands-agent/secrets:/secrets" not in content
+    assert "secrets/broker-mini-server.key:/secrets/broker-mini-server.key:ro" in content
+
+
+def test_firewall_allows_only_broker_host_port():
+    firewall = os.path.join(REPO_ROOT, "deployment", "network", "apply-egress-rules.sh")
+    with open(firewall) as f:
+        content = f.read()
+    active = [
+        line.strip() for line in content.splitlines()
+        if line.strip().startswith("iptables ")
+    ]
+    assert any(
+        '"${EGRESS_CHAIN}" -d 10.89.0.1 -p tcp --dport 22 -j RETURN' in line
+        for line in active
+    )
+    assert any(
+        '"${INPUT_CHAIN}" -d 10.89.0.1 -p tcp --dport 22 -j ACCEPT' in line
+        for line in active
+    )

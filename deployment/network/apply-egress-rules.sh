@@ -36,9 +36,8 @@ iptables -I INPUT 1 -s "${SUBNET}" -j "${INPUT_CHAIN}"
 iptables -A "${EGRESS_CHAIN}" -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
 
 # Internal/private destinations are denied before any service allow-list.
-# Exception: SSH from container to mini-server host (10.89.0.1) for broker — level C.
-# When setting up broker, uncomment the line below and re-apply rules.
-# iptables -A "${EGRESS_CHAIN}" -d 10.89.0.1 -p tcp --dport 22 -j RETURN
+# The only permitted host service is the forced-command broker over SSH.
+iptables -A "${EGRESS_CHAIN}" -d 10.89.0.1 -p tcp --dport 22 -j RETURN
 
 iptables -A "${EGRESS_CHAIN}" -d 127.0.0.0/8 -j DROP
 iptables -A "${EGRESS_CHAIN}" -d 169.254.0.0/16 -j DROP
@@ -54,8 +53,9 @@ iptables -A "${EGRESS_CHAIN}" -p tcp --dport 53 -j RETURN
 iptables -A "${EGRESS_CHAIN}" -p tcp -m multiport --dports 80,443 -j RETURN
 iptables -A "${EGRESS_CHAIN}" -j DROP
 
-# New connections from OpenHands to the mini-server itself are forbidden.
+# The INPUT path must independently allow the same narrowly scoped broker flow.
 iptables -A "${INPUT_CHAIN}" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+iptables -A "${INPUT_CHAIN}" -d 10.89.0.1 -p tcp --dport 22 -j ACCEPT
 iptables -A "${INPUT_CHAIN}" -j DROP
 
 iptables -C DOCKER-USER -s "${SUBNET}" -j "${EGRESS_CHAIN}" >/dev/null

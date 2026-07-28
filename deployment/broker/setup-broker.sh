@@ -36,7 +36,8 @@ flock -n 9 || fail "Another setup is running"
 [ -n "${COMMIT_SHA}" ] || fail "Usage: sudo $0 <commit-sha>"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "${SCRIPT_DIR}/../.."
-CURRENT_SHA=$(git rev-parse --short HEAD 2>/dev/null || echo "not-a-git-repo")
+[[ "${COMMIT_SHA}" =~ ^[0-9a-f]{40}$ ]] || fail "A full 40-character commit SHA is required"
+CURRENT_SHA=$(git rev-parse HEAD 2>/dev/null || echo "not-a-git-repo")
 [ "${CURRENT_SHA}" = "${COMMIT_SHA}" ] || fail "SHA mismatch: current=${CURRENT_SHA} required=${COMMIT_SHA}. Run only from verified commit."
 
 # --- Проверка зависимостей ---
@@ -46,7 +47,7 @@ command -v docker >/dev/null 2>&1 || fail "docker required"
 
 # --- Создание пользователя (идемпотентно) ---
 if ! id "${BROKER_USER}" &>/dev/null; then
-    useradd --system --no-create-home --shell /usr/sbin/nologin \
+    useradd --system --no-create-home --shell /bin/bash \
         --comment "OpenHands Agent Broker" "${BROKER_USER}"
     ok "User created: ${BROKER_USER}"
 else
@@ -90,10 +91,14 @@ AUTH
     warn "Add public key: echo 'no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-pty,command=\"/usr/local/lib/openhands-broker/broker-wrapper.sh\" <pubkey>' >> ${AUTH_KEYS}"
 else
     ok "authorized_keys already exists"
-    # Проверка, что все ключи имеют forced command
-    HAS_FC=$(grep -c 'command="/usr/local/lib/openhands-broker/broker-wrapper.sh"' "${AUTH_KEYS}" 2>/dev/null || echo 0)
-    if [ "${HAS_FC}" -eq 0 ]; then
-        warn "No keys with forced command found in ${AUTH_KEYS}"
+    KEY_LINES=$(grep -Ev '^[[:space:]]*(#|$)' "${AUTH_KEYS}" || true)
+    REQUIRED_KEY_OPTIONS='no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-pty,command="/usr/local/lib/openhands-broker/broker-wrapper.sh"'
+    if [ -n "${KEY_LINES}" ] && echo "${KEY_LINES}" \
+        | grep -qvF "${REQUIRED_KEY_OPTIONS}"; then
+        fail "authorized_keys contains a key without all required restrictions"
+    fi
+    if [ -z "${KEY_LINES}" ]; then
+        warn "No broker public key configured in ${AUTH_KEYS}"
     fi
 fi
 
@@ -107,7 +112,6 @@ openhands-broker ALL=(root) NOPASSWD: /usr/bin/docker compose -f /srv/openhands-
 openhands-broker ALL=(root) NOPASSWD: /usr/bin/systemctl restart openhands-agent.service
 openhands-broker ALL=(root) NOPASSWD: /usr/bin/systemctl stop openhands-agent.service
 openhands-broker ALL=(root) NOPASSWD: /usr/bin/systemctl start openhands-agent.service
-openhands-broker ALL=(root) NOPASSWD: /usr/sbin/visudo -c -f *
 openhands-broker ALL=(root) NOPASSWD: /usr/local/bin/openhands-backup.sh
 openhands-broker ALL=(root) NOPASSWD: /srv/openhands-agent/deployment/scripts/validate-runtime.sh
 SUDO
@@ -126,14 +130,13 @@ chmod 755 "${BROKER_LOG}"
 chown -R root:root "${BROKER_LIB}" "${BROKER_ETC}" "${BROKER_LOG}"
 ok "Broker user cannot modify registry, wrapper, or secrets"
 
-# --- SSH доступ (только forced command, no shell) ---
-# Shell уже /usr/sbin/nologin — forced command срабатывает до shell
+# --- SSH доступ (обычный shell нужен sshd для запуска forced command) ---
 BROKER_SHELL=$(getent passwd "${BROKER_USER}" | cut -d: -f7)
-if [ "${BROKER_SHELL}" != "/usr/sbin/nologin" ]; then
-    usermod -s /usr/sbin/nologin "${BROKER_USER}"
-    ok "Shell set to /usr/sbin/nologin"
+if [ "${BROKER_SHELL}" != "/bin/bash" ]; then
+    usermod -s /bin/bash "${BROKER_USER}"
+    ok "Shell set to /bin/bash"
 else
-    ok "Shell is /usr/sbin/nologin"
+    ok "Shell is /bin/bash"
 fi
 
 # --- Logrotate ---

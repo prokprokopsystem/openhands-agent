@@ -34,6 +34,7 @@ tools:
         type: string
         required: false
         default: "openhands-agent"
+        allowed_values: ["openhands-agent", "openhands-agent.service"]
     execute: "systemctl status {{service}} --no-pager -l 2>&1 | head -80"
     verify: null
     rollback: null
@@ -47,6 +48,7 @@ tools:
         type: string
         required: false
         default: "openhands-agent"
+        allowed_values: ["openhands-agent", "openhands-agent.service"]
       lines:
         type: integer
         required: false
@@ -132,6 +134,7 @@ tools:
       service:
         type: string
         required: true
+        allowed_values: ["openhands-agent.service"]
     check: "systemctl is-active {{service}} 2>&1"
     execute: "sudo systemctl restart {{service}} 2>&1"
     verify: "systemctl is-active {{service}} 2>&1 | grep -q active"
@@ -145,6 +148,7 @@ tools:
       service:
         type: string
         required: true
+        allowed_values: ["openhands-agent.service"]
     execute: "sudo systemctl start {{service}} 2>&1"
     verify: "systemctl is-active {{service}} 2>&1 | grep -q active"
     rollback: "sudo systemctl stop {{service}} 2>&1"
@@ -157,8 +161,8 @@ tools:
       service:
         type: string
         required: true
+        allowed_values: ["openhands-agent.service"]
     execute: "sudo systemctl stop {{service}} 2>&1"
     verify: "systemctl is-active {{service}} 2>&1 | grep -q inactive"
     rollback: "sudo systemctl start {{service}} 2>&1"
     secrets: []
-
