@@ -7,7 +7,10 @@
 
 services:
   openhands:
-    image: ghcr.io/openhands/agent-canvas:1.6.1@sha256:fc24163754bee2ab0115b117d57512cc01b4d99770e7ac17c3607e76290deeb6
+    build:
+      context: ..
+      dockerfile: deployment/broker-client/Dockerfile
+    image: openhands-agent-canvas-broker:1.6.1-4d
     container_name: openhands-agent
     restart: "no"
 

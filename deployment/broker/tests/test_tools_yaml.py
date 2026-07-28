@@ -309,6 +309,17 @@ def test_compose_mounts_only_broker_key():
     assert "secrets/broker-mini-server.key:/secrets/broker-mini-server.key:ro" in content
 
 
+def test_canvas_image_contains_minimal_ssh_client():
+    dockerfile = os.path.join(
+        REPO_ROOT, "deployment", "broker-client", "Dockerfile"
+    )
+    with open(dockerfile) as f:
+        content = f.read()
+    assert "agent-canvas:1.6.1@sha256:" in content
+    assert "openssh-client" in content
+    assert "USER openhands" in content
+
+
 def test_firewall_allows_only_broker_host_port():
     firewall = os.path.join(REPO_ROOT, "deployment", "network", "apply-egress-rules.sh")
     with open(firewall) as f:

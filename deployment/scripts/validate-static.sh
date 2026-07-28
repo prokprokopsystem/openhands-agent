@@ -53,7 +53,7 @@ grep -q 'docker.sock' deployment/compose.yaml && fail "docker.sock найден 
 grep -q 'test-workspace' deployment/compose.yaml && pass "test-workspace : не общий workspace" || fail "нет test-workspace"
 grep -q 'enable_ipv6: false' deployment/compose.yaml && pass "IPv6 отключён : сеть" || fail "IPv6 не отключён в сети"
 grep -q 'disable_ipv6' deployment/compose.yaml && pass "IPv6 отключён : sysctl" || fail "IPv6 sysctl отсутствует"
-grep -q 'sha256:fc24163754bee' deployment/compose.yaml && pass "digest зафиксирован" || fail "digest отсутствует"
+grep -q 'sha256:fc24163754bee' deployment/broker-client/Dockerfile && pass "digest зафиксирован" || fail "digest отсутствует"
 
 # ── 5. Systemd invariants ──
 echo ""
