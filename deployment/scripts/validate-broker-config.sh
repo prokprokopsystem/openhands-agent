@@ -49,6 +49,14 @@ for i, t in enumerate(tools):
     if 'secrets' not in t: errors.append(f'tool[{i}]: no secrets field')
     if 'verify' not in t: errors.append(f'tool[{i}]: no verify field')
     if 'rollback' not in t: errors.append(f'tool[{i}]: no rollback field')
+    for name, cfg in t.get('params', {}).items():
+        if cfg.get('type') == 'integer':
+            minimum = cfg.get('min')
+            maximum = cfg.get('max')
+            if minimum is not None and maximum is not None and minimum > maximum:
+                errors.append(f'tool[{i}].{name}: min greater than max')
+            if name == 'lines' and (minimum != 1 or maximum != 500):
+                errors.append(f'tool[{i}].{name}: expected bounds 1..500')
 if errors:
     for e in errors: print(e)
     sys.exit(1)
@@ -63,6 +71,18 @@ print(f'OK: {len(tools)} tools')
 else
     skip "python3 not available — skip YAML validation"
 fi
+
+# --- Level A hardening invariants ---
+grep -q 'audit_required.*"STARTED"' "${WRAPPER}" \
+    && ok "audit is required before execute" || fail "fail-closed audit missing"
+grep -q 'MAX_OUTPUT_BYTES=65536' "${WRAPPER}" \
+    && ok "output limit configured" || fail "output limit missing"
+grep -q 'LOCK_DIR="/run/lock/openhands-broker"' "${SETUP}" \
+    && ok "safe setup lock path" || fail "unsafe setup lock path"
+grep -q 'git ls-files --others --exclude-standard' "${SETUP}" \
+    && ok "clean worktree check" || fail "untracked worktree check missing"
+grep -q 'ForceCommand /usr/local/lib/openhands-broker/broker-wrapper.sh' "${SETUP}" \
+    && ok "sshd ForceCommand policy" || fail "sshd ForceCommand policy missing"
 
 # --- Проверка уровней риска в tools.yaml ---
 if command -v python3 &>/dev/null; then

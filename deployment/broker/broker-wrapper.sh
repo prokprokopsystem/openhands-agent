@@ -13,10 +13,10 @@ set -euo pipefail
 BROKER_BASE="${OPENHANDS_BROKER_BASE:-/etc/openhands-broker}"
 TOOLS_FILE="${BROKER_BASE}/tools.yaml"
 SECRETS_DIR="${BROKER_BASE}/secrets"
-LOG_DIR="${OPENHANDS_BROKER_LOG_DIR:-/var/log/openhands-broker}"
-ACTIONS_LOG="${LOG_DIR}/actions.log"
-ERROR_LOG="${LOG_DIR}/error.log"
 TIMEOUT_SEC=120
+CHECK_TIMEOUT_SEC=10
+MAX_OUTPUT_BYTES=65536
+MAX_DIAG_BYTES=8192
 
 # --- Блокировка на всё время выполнения wrapper ---
 exec 8>/tmp/.openhands-broker-wrapper.lock
@@ -26,31 +26,35 @@ flock -n 8 || {
 }
 
 # --- Утилиты ---
-log_action_json() {
+LOGGER_BIN="$(command -v logger 2>/dev/null || true)"
+
+audit_event() {
     local tool="$1" params="$2" exit_code="$3" duration="$4" status="$5"
-    python3 -c "
+    local record
+    [ -n "${LOGGER_BIN}" ] || return 1
+    record="$(python3 -c '
 import json, sys
-record = {
-    'ts': '$(date --utc +"%Y-%m-%dT%H:%M:%SZ")',
-    'tool': $(python3 -c "import json; print(json.dumps('$tool'))"),
-    'params': $(python3 -c "import json; print(json.dumps('$params'))"),
-    'exit_code': ${exit_code},
-    'duration_sec': ${duration},
-    'status': $(python3 -c "import json; print(json.dumps('$status'))")
-}
-sys.stdout.write(json.dumps(record) + chr(10))
-" >> "${ACTIONS_LOG}" 2>/dev/null || true
+print(json.dumps({
+    "tool": sys.argv[1],
+    "params": sys.argv[2],
+    "exit_code": int(sys.argv[3]),
+    "duration_sec": int(sys.argv[4]),
+    "status": sys.argv[5],
+}, separators=(",", ":")))
+' "${tool}" "${params}" "${exit_code}" "${duration}" "${status}")" || return 1
+    "${LOGGER_BIN}" -p authpriv.notice -t openhands-broker -- "${record}"
 }
 
-log_error() {
-    local ts
-    ts="$(date --utc +"%Y-%m-%dT%H:%M:%SZ")"
-    echo "${ts} $*" >> "${ERROR_LOG}" 2>/dev/null || true
+audit_required() {
+    audit_event "$@" || {
+        echo "ERROR: broker audit unavailable; command not permitted" >&2
+        exit 70
+    }
 }
 
 die() {
     echo "ERROR: $*" >&2
-    log_error "$*"
+    audit_event "${TOOL_NAME:-request}" "" 1 0 "REJECTED" >/dev/null 2>&1 || true
     exit 1
 }
 
@@ -58,6 +62,26 @@ sanitize_log_param() {
     local val="$1"
     # Заменяем любые подозрительные символы
     echo "${val}" | tr -d '[:cntrl:]' | head -c 200
+}
+
+run_bounded() {
+    local timeout_sec="$1" command_text="$2" output_limit="$3"
+    local capture_limit output_bytes
+    capture_limit=$((output_limit + 1))
+    set +e
+    RUN_OUTPUT="$(
+        set +e
+        timeout "${timeout_sec}" bash -c "${command_text}" 2>&1 | head -c "${capture_limit}"
+        pipeline_status=("${PIPESTATUS[@]}")
+        exit "${pipeline_status[0]}"
+    )"
+    RUN_CODE=$?
+    set -e
+    output_bytes="$(printf '%s' "${RUN_OUTPUT}" | wc -c)"
+    if [ "${output_bytes}" -gt "${output_limit}" ]; then
+        RUN_CODE=125
+        RUN_OUTPUT="$(printf '%s' "${RUN_OUTPUT}" | head -c "${output_limit}")"$'\n''ERROR: output limit exceeded'
+    fi
 }
 
 # --- Чтение SSH_ORIGINAL_COMMAND ---
@@ -264,6 +288,16 @@ for key in "${!PARAMS[@]}"; do
     if [ "${param_type}" = "integer" ] && ! [[ "${val}" =~ ^[0-9]+$ ]]; then
         die "Parameter ${key} must be an integer"
     fi
+    if [ "${param_type}" = "integer" ]; then
+        min_value="$(read_param_field "${key}" min)"
+        max_value="$(read_param_field "${key}" max)"
+        if [ -n "${min_value}" ] && [ "${val}" -lt "${min_value}" ]; then
+            die "Parameter ${key} must be at least ${min_value}"
+        fi
+        if [ -n "${max_value}" ] && [ "${val}" -gt "${max_value}" ]; then
+            die "Parameter ${key} must be at most ${max_value}"
+        fi
+    fi
 
     allowed_values="$(read_param_field "${key}" allowed_values)"
     if [ -n "${allowed_values}" ]; then
@@ -348,47 +382,48 @@ if [ "${DRY_RUN}" = "true" ]; then
     if [ "${ROLLBACK_CMD}" != "__NULL__" ] && [ -n "${ROLLBACK_CMD}" ]; then
         echo "DRY-RUN: Rollback available"
     fi
-    log_action_json "${TOOL_NAME}" "${LOG_PARAMS}" 0 0 "DRY-RUN"
+    audit_required "${TOOL_NAME}" "${LOG_PARAMS}" 0 0 "DRY_RUN"
     exit 0
 fi
 
 # --- Pre-check ---
+audit_required "${TOOL_NAME}" "${LOG_PARAMS}" 0 0 "STARTED"
 if [ -n "${CHECK_CMD}" ] && [ "${CHECK_CMD}" != "__NULL__" ]; then
-    set +e
-    CHECK_OUTPUT=$(timeout 10 bash -c "${CHECK_CMD}" 2>&1)
-    CHECK_CODE=$?
-    set -e
+    run_bounded "${CHECK_TIMEOUT_SEC}" "${CHECK_CMD}" "${MAX_DIAG_BYTES}"
+    CHECK_OUTPUT="${RUN_OUTPUT}"
+    CHECK_CODE="${RUN_CODE}"
+    if [ "${CHECK_CODE}" -ne 0 ]; then
+        audit_required "${TOOL_NAME}" "${LOG_PARAMS}" "${CHECK_CODE}" 0 "PRECHECK_FAILED"
+        echo "ERROR: pre-check failed" >&2
+        exit "${CHECK_CODE}"
+    fi
 fi
 
 # --- Выполнение ---
-set +e
-OUTPUT=$(timeout "${TIMEOUT_SEC}" bash -c "${EXECUTE_CMD}" 2>&1)
-EXIT_CODE=$?
-set -e
+run_bounded "${TIMEOUT_SEC}" "${EXECUTE_CMD}" "${MAX_OUTPUT_BYTES}"
+OUTPUT="${RUN_OUTPUT}"
+EXIT_CODE="${RUN_CODE}"
 
 DURATION=$(( $(date +%s) - START_TS ))
 
 # --- Verify ---
 VERIFY_FAILED=false
 if [ ${EXIT_CODE} -eq 0 ] && [ "${VERIFY_CMD}" != "__NULL__" ] && [ -n "${VERIFY_CMD}" ]; then
-    set +e
-    VERIFY_OUTPUT=$(timeout 10 bash -c "${VERIFY_CMD}" 2>&1)
-    VERIFY_CODE=$?
-    set -e
+    run_bounded "${CHECK_TIMEOUT_SEC}" "${VERIFY_CMD}" "${MAX_DIAG_BYTES}"
+    VERIFY_OUTPUT="${RUN_OUTPUT}"
+    VERIFY_CODE="${RUN_CODE}"
     if [ ${VERIFY_CODE} -ne 0 ]; then
         VERIFY_FAILED=true
-        log_action_json "${TOOL_NAME}" "${LOG_PARAMS}" "${EXIT_CODE}" "${DURATION}" "VERIFY_FAILED"
-        log_error "${TOOL_NAME}: execute OK but verify failed"
+        audit_required "${TOOL_NAME}" "${LOG_PARAMS}" "${VERIFY_CODE}" "${DURATION}" "VERIFY_FAILED"
         echo "WARN: execute OK but verify failed"
 
         # Rollback
         if [ "${ROLLBACK_CMD}" != "__NULL__" ] && [ -n "${ROLLBACK_CMD}" ]; then
             echo "ROLLBACK: executing..."
-            set +e
-            RB_OUTPUT=$(timeout "${TIMEOUT_SEC}" bash -c "${ROLLBACK_CMD}" 2>&1)
-            RB_CODE=$?
-            set -e
-            log_action_json "${TOOL_NAME}" "${LOG_PARAMS}" "${RB_CODE}" "${DURATION}" "ROLLBACK"
+            run_bounded "${TIMEOUT_SEC}" "${ROLLBACK_CMD}" "${MAX_DIAG_BYTES}"
+            RB_OUTPUT="${RUN_OUTPUT}"
+            RB_CODE="${RUN_CODE}"
+            audit_required "${TOOL_NAME}" "${LOG_PARAMS}" "${RB_CODE}" "${DURATION}" "ROLLBACK"
             echo "ROLLBACK: exit code ${RB_CODE}"
         fi
         exit ${VERIFY_CODE}
@@ -397,5 +432,10 @@ fi
 
 # --- Успех ---
 echo "${OUTPUT}"
-log_action_json "${TOOL_NAME}" "${LOG_PARAMS}" "${EXIT_CODE}" "${DURATION}" "OK"
+if [ "${EXIT_CODE}" -eq 0 ]; then
+    FINAL_STATUS="OK"
+else
+    FINAL_STATUS="EXECUTE_FAILED"
+fi
+audit_required "${TOOL_NAME}" "${LOG_PARAMS}" "${EXIT_CODE}" "${DURATION}" "${FINAL_STATUS}"
 exit ${EXIT_CODE}

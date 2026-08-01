@@ -26,21 +26,45 @@ def get_tool_names():
     return [t["name"] for t in data.get("tools", [])]
 
 
-def run_wrapper(command, broker_base=None):
-    with tempfile.TemporaryDirectory() as log_dir:
+def run_wrapper(command, broker_base=None, audit_ok=True):
+    with tempfile.TemporaryDirectory() as test_dir:
+        logger_dir = os.path.join(test_dir, "bin")
+        os.mkdir(logger_dir)
+        audit_file = os.path.join(test_dir, "audit.jsonl")
+        logger_path = os.path.join(logger_dir, "logger")
+        with open(logger_path, "w") as f:
+            f.write("#!/usr/bin/bash\n")
+            if audit_ok:
+                f.write("for last; do :; done\nprintf '%s\\n' \"$last\" >> \"$MOCK_AUDIT_FILE\"\n")
+            else:
+                f.write("exit 1\n")
+        os.chmod(logger_path, 0o755)
         env = os.environ.copy()
         env.update({
             "OPENHANDS_BROKER_BASE": broker_base or os.path.dirname(TOOLS_YAML),
-            "OPENHANDS_BROKER_LOG_DIR": log_dir,
             "SSH_ORIGINAL_COMMAND": command,
+            "MOCK_AUDIT_FILE": audit_file,
+            "PATH": logger_dir + os.pathsep + env["PATH"],
         })
-        return subprocess.run(
+        result = subprocess.run(
             ["bash", WRAPPER_SH],
             env=env,
             text=True,
             capture_output=True,
             timeout=10,
         )
+        if os.path.exists(audit_file):
+            with open(audit_file) as f:
+                result.audit_log = f.read()
+        else:
+            result.audit_log = ""
+        return result
+
+
+def write_registry(base, tool):
+    os.mkdir(os.path.join(base, "secrets"))
+    with open(os.path.join(base, "tools.yaml"), "w") as f:
+        yaml.safe_dump({"tools": [tool]}, f)
 
 
 # ======================================================================
@@ -75,6 +99,10 @@ def test_tool_structure():
             assert pcfg["type"] in ("string", "integer"), f"Tool {t['name']} param {pname} invalid type"
             if pcfg.get("required") is True:
                 assert "default" not in pcfg, f"Tool {t['name']} param {pname}: required + default conflict"
+            if pcfg["type"] == "integer":
+                assert pcfg.get("min", 0) >= 0
+                if "max" in pcfg:
+                    assert pcfg["max"] >= pcfg.get("min", 0)
         for secret in t["secrets"]:
             assert isinstance(secret, str), f"Tool {t['name']} secret not a string: {secret}"
 
@@ -129,6 +157,17 @@ def test_params_required_default():
                     f"Tool {t['name']}: required param '{pname}' unused in commands"
 
 
+@pytest.mark.parametrize("command", [
+    "journal_logs lines=0 --dry-run",
+    "journal_logs lines=501 --dry-run",
+    "docker_compose_logs lines=999999 --dry-run",
+])
+def test_lines_bounds_rejected(command):
+    result = run_wrapper(command)
+    assert result.returncode != 0
+    assert "must be" in result.stderr
+
+
 # ======================================================================
 # 6. Injection protection patterns
 # ======================================================================
@@ -169,17 +208,52 @@ def test_forced_command_prevents_shell():
     """sshd needs a working login shell to launch the forced command."""
     data = load_yaml()
     assert data["user"] == "openhands-broker"
-    # Проверка: authorized_keys должен содержать command=... в template и docs
     with open(os.path.join(os.path.dirname(__file__), "..", "setup-broker.sh")) as f:
         setup_content = f.read()
     assert 'command="/usr/local/lib/openhands-broker/broker-wrapper.sh"' in setup_content
-    assert "no-port-forwarding" in setup_content
-    assert "no-agent-forwarding" in setup_content
-    assert "no-X11-forwarding" in setup_content
-    assert "no-pty" in setup_content
+    assert 'from="10.89.0.2",restrict,command=' in setup_content
+    assert "Match User openhands-broker" in setup_content
+    assert "ForceCommand /usr/local/lib/openhands-broker/broker-wrapper.sh" in setup_content
+    assert "DisableForwarding yes" in setup_content
+    assert "PasswordAuthentication no" in setup_content
+    assert "PermitTTY no" in setup_content
     assert "--shell /bin/bash" in setup_content
     assert "usermod -s /bin/bash" in setup_content
     assert "/usr/sbin/nologin" not in setup_content
+
+
+def test_setup_is_fail_closed_before_mutation():
+    setup_path = os.path.join(os.path.dirname(__file__), "..", "setup-broker.sh")
+    with open(setup_path) as f:
+        setup = f.read()
+    assert setup.index('[ "$(id -u)" -eq 0 ]') < setup.index('exec 9>"${LOCKFILE}"')
+    assert 'LOCK_DIR="/run/lock/openhands-broker"' in setup
+    assert "git diff --quiet --ignore-submodules HEAD --" in setup
+    assert "git diff --cached --quiet --ignore-submodules HEAD --" in setup
+    assert "git ls-files --others --exclude-standard" in setup
+    assert "git hash-object" in setup
+
+
+def test_sudoers_is_validated_before_atomic_install():
+    setup_path = os.path.join(os.path.dirname(__file__), "..", "setup-broker.sh")
+    with open(setup_path) as f:
+        setup = f.read()
+    visudo = setup.index('visudo -cf "${SUDOERS_TMP}"')
+    install = setup.index('mv -f "${SUDOERS_TMP}" "${SUDOERS_FILE}"')
+    assert visudo < install
+    assert "cat > \"${SUDOERS_FILE}\"" not in setup
+
+
+def test_broker_key_permissions_match_container_identity():
+    setup_path = os.path.join(os.path.dirname(__file__), "..", "setup-broker.sh")
+    runtime_path = os.path.join(REPO_ROOT, "deployment", "scripts", "validate-runtime.sh")
+    with open(setup_path) as f:
+        setup = f.read()
+    with open(runtime_path) as f:
+        runtime = f.read()
+    assert 'chown root:10001 "${CLIENT_KEY}"' in setup
+    assert 'chmod 0640 "${CLIENT_KEY}"' in setup
+    assert '"0:10001:640"' in runtime
 
 
 # ======================================================================
@@ -217,6 +291,82 @@ def test_secrets_not_in_dry_run_or_logs():
         assert "secrets masked" in result.stdout
         assert secret_value not in result.stdout
         assert secret_value not in result.stderr
+        assert secret_value not in result.audit_log
+
+
+def test_audit_failure_blocks_execution():
+    with tempfile.TemporaryDirectory() as broker_base:
+        marker = os.path.join(broker_base, "executed")
+        write_registry(broker_base, {
+            "name": "audit_probe",
+            "risk": "A",
+            "params": {},
+            "execute": f"touch {marker}",
+            "verify": None,
+            "rollback": None,
+            "secrets": [],
+        })
+        result = run_wrapper("audit_probe", broker_base, audit_ok=False)
+        assert result.returncode == 70
+        assert "audit unavailable" in result.stderr
+        assert not os.path.exists(marker)
+
+
+def test_precheck_failure_blocks_execution():
+    with tempfile.TemporaryDirectory() as broker_base:
+        marker = os.path.join(broker_base, "executed")
+        write_registry(broker_base, {
+            "name": "precheck_probe",
+            "risk": "A",
+            "params": {},
+            "check": "exit 9",
+            "execute": f"touch {marker}",
+            "verify": None,
+            "rollback": None,
+            "secrets": [],
+        })
+        result = run_wrapper("precheck_probe", broker_base)
+        assert result.returncode == 9
+        assert "pre-check failed" in result.stderr
+        assert "PRECHECK_FAILED" in result.audit_log
+        assert not os.path.exists(marker)
+
+
+def test_failed_execute_has_failed_audit_status():
+    with tempfile.TemporaryDirectory() as broker_base:
+        write_registry(broker_base, {
+            "name": "failure_probe",
+            "risk": "A",
+            "params": {},
+            "execute": "exit 7",
+            "verify": None,
+            "rollback": None,
+            "secrets": [],
+        })
+        result = run_wrapper("failure_probe", broker_base)
+        assert result.returncode == 7
+        assert "EXECUTE_FAILED" in result.audit_log
+        records = [json.loads(line) for line in result.audit_log.splitlines()]
+        assert records[-1]["status"] == "EXECUTE_FAILED"
+        assert records[-1]["exit_code"] == 7
+
+
+def test_output_is_bounded():
+    with tempfile.TemporaryDirectory() as broker_base:
+        write_registry(broker_base, {
+            "name": "output_probe",
+            "risk": "A",
+            "params": {},
+            "execute": "yes X",
+            "verify": None,
+            "rollback": None,
+            "secrets": [],
+        })
+        result = run_wrapper("output_probe", broker_base)
+        assert result.returncode == 125
+        assert "output limit exceeded" in result.stdout
+        assert len(result.stdout.encode()) < 67000
+        assert "EXECUTE_FAILED" in result.audit_log
 
 
 # ======================================================================
@@ -240,6 +390,15 @@ def test_verify_and_rollback():
         if t["risk"] == "B" and name != "backup_create":
             assert verify, f"{name} must define verify"
             assert rollback, f"{name} must define rollback"
+
+
+def test_systemd_verification_is_exact():
+    data = load_yaml()
+    by_name = {tool["name"]: tool for tool in data["tools"]}
+    for name in ("service_restart", "service_start"):
+        assert by_name[name]["verify"] == "systemctl is-active --quiet {{service}}"
+        assert "grep" not in by_name[name]["verify"]
+    assert ' = inactive' in by_name["service_stop"]["verify"]
 
 
 # ======================================================================
@@ -299,6 +458,16 @@ def test_docker_commands_use_sudo():
     for t in data["tools"]:
         if t["name"] in docker_tools:
             assert t["execute"].startswith("sudo"), f"{t['name']} should use sudo: {t['execute']}"
+
+
+def test_docker_ps_matches_exact_sudoers_rule():
+    data = load_yaml()
+    docker_ps = next(t for t in data["tools"] if t["name"] == "docker_ps")
+    assert docker_ps["execute"] == "sudo docker ps 2>&1"
+    setup = os.path.join(os.path.dirname(__file__), "..", "setup-broker.sh")
+    with open(setup) as f:
+        setup_content = f.read()
+    assert "NOPASSWD: /usr/bin/docker ps\n" in setup_content
 
 
 def test_compose_mounts_only_broker_key():

@@ -6,6 +6,7 @@ set -euo pipefail
 BASE="/srv/openhands-agent"
 COMPOSE_FILE="${BASE}/deployment/compose.yaml"
 SECRETS_FILE="${BASE}/secrets/.env"
+BROKER_KEY="${BASE}/secrets/broker-mini-server.key"
 CONTAINER_UID="10001"
 CONTAINER_GID="10001"
 HOST_UID="$(id -u igor)"
@@ -74,6 +75,12 @@ echo "${KEY}" | grep -q '\*\*\*' && fail "LOCAL_BACKEND_API_KEY содержит
 echo "${KEY}" | grep -q '[[:space:]]' && fail "LOCAL_BACKEND_API_KEY содержит пробелы" || true
 
 ok "LOCAL_BACKEND_API_KEY задан, длина ${#KEY}"
+
+[ -f "${BROKER_KEY}" ] || fail "${BROKER_KEY} не существует"
+BROKER_KEY_STATE="$(stat -c '%u:%g:%a' "${BROKER_KEY}")"
+[ "${BROKER_KEY_STATE}" = "0:10001:640" ] \
+    || fail "${BROKER_KEY}: ${BROKER_KEY_STATE}, требуется root:10001 640"
+ok "Broker key доступен только root и container GID 10001"
 
 for s in run-supervised.sh health-watchdog.sh prepare.sh; do
     [ -f "${BASE}/deployment/scripts/${s}" ] || fail "${s} не найден"

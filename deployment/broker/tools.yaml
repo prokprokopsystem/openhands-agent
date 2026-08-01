@@ -53,6 +53,8 @@ tools:
         type: integer
         required: false
         default: 50
+        min: 1
+        max: 500
     execute: "journalctl -u {{service}} -n {{lines}} --no-pager 2>&1"
     verify: null
     rollback: null
@@ -62,7 +64,7 @@ tools:
     description: Список контейнеров (sudo)
     risk: A
     params: {}
-    execute: "sudo docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' 2>&1"
+    execute: "sudo docker ps 2>&1"
     verify: null
     rollback: null
     secrets: []
@@ -84,6 +86,8 @@ tools:
         type: integer
         required: false
         default: 50
+        min: 1
+        max: 500
     execute: >-
       sudo docker compose -f /srv/openhands-agent/deployment/compose.yaml
       logs -n {{lines}} --no-color 2>&1 | tail -{{lines}}
@@ -135,9 +139,9 @@ tools:
         type: string
         required: true
         allowed_values: ["openhands-agent.service"]
-    check: "systemctl is-active {{service}} 2>&1"
+    check: "systemctl is-active --quiet {{service}}"
     execute: "sudo systemctl restart {{service}} 2>&1"
-    verify: "systemctl is-active {{service}} 2>&1 | grep -q active"
+    verify: "systemctl is-active --quiet {{service}}"
     rollback: "sudo systemctl restart {{service}} 2>&1"
     secrets: []
 
@@ -150,7 +154,7 @@ tools:
         required: true
         allowed_values: ["openhands-agent.service"]
     execute: "sudo systemctl start {{service}} 2>&1"
-    verify: "systemctl is-active {{service}} 2>&1 | grep -q active"
+    verify: "systemctl is-active --quiet {{service}}"
     rollback: "sudo systemctl stop {{service}} 2>&1"
     secrets: []
 
@@ -163,6 +167,6 @@ tools:
         required: true
         allowed_values: ["openhands-agent.service"]
     execute: "sudo systemctl stop {{service}} 2>&1"
-    verify: "systemctl is-active {{service}} 2>&1 | grep -q inactive"
+    verify: "test \"$(systemctl is-active {{service}} 2>/dev/null)\" = inactive"
     rollback: "sudo systemctl start {{service}} 2>&1"
     secrets: []
