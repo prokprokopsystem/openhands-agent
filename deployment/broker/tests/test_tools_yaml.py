@@ -222,6 +222,17 @@ def test_forced_command_prevents_shell():
     assert "/usr/sbin/nologin" not in setup_content
 
 
+def test_broker_account_is_not_locked_for_public_key_auth():
+    setup_path = os.path.join(os.path.dirname(__file__), "..", "setup-broker.sh")
+    with open(setup_path) as f:
+        setup = f.read()
+    assert "usermod -p '*NP*' \"${BROKER_USER}\"" in setup
+    assert "usermod -L" not in setup
+    assert "AuthenticationMethods publickey" in setup
+    assert "PasswordAuthentication no" in setup
+    assert "KbdInteractiveAuthentication no" in setup
+
+
 def test_setup_is_fail_closed_before_mutation():
     setup_path = os.path.join(os.path.dirname(__file__), "..", "setup-broker.sh")
     with open(setup_path) as f:

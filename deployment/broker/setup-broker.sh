@@ -167,7 +167,8 @@ if [ "${BROKER_SHELL}" != "/bin/bash" ]; then
 else
     ok "Shell is /bin/bash"
 fi
-usermod -L "${BROKER_USER}"
+# Непригодный для password login marker без "!": OpenSSH не считает account locked.
+usermod -p '*NP*' "${BROKER_USER}"
 
 # --- sshd defense-in-depth: forced command действует для любого ключа пользователя ---
 SSHD_TMP="$(mktemp /run/openhands-broker-sshd.XXXXXX)"
