@@ -32,7 +32,7 @@ ok "wg0: 10.77.0.2"
 [ -f "${COMPOSE_FILE}" ] || fail "${COMPOSE_FILE} не существует"
 ok "compose.yaml"
 
-for d in config secrets test-workspace logs; do
+for d in config secrets work-workspace logs; do
     DIR="${BASE}/${d}"
     [ -d "${DIR}" ] || fail "${DIR} не существует. Запустите prepare.sh"
     P=$(stat -c "%a" "${DIR}")
@@ -40,7 +40,7 @@ for d in config secrets test-workspace logs; do
 done
 ok "Каталоги: 700"
 
-for d in config test-workspace; do
+for d in config work-workspace; do
     DIR="${BASE}/${d}"
     U=$(stat -c "%u" "${DIR}")
     G=$(stat -c "%g" "${DIR}")
@@ -82,7 +82,11 @@ ok "LOCAL_BACKEND_API_KEY задан, длина ${#KEY}"
 BROKER_KEY_STATE="$(stat -c '%u:%g:%a' "${BROKER_KEY}")"
 [ "${BROKER_KEY_STATE}" = "0:10001:640" ] \
     || fail "${BROKER_KEY}: ${BROKER_KEY_STATE}, требуется root:10001 640"
-ok "Broker key доступен только root и container GID 10001"
+grep -Fq \
+    "${BROKER_KEY}:/secrets/broker-mini-server.key:ro" \
+    "${COMPOSE_FILE}" \
+    || fail "Broker key должен монтироваться в Canvas только read-only"
+ok "Broker key: root:10001 640, Canvas mount read-only"
 
 [ -f "${BROKER_KNOWN_HOSTS}" ] || fail "${BROKER_KNOWN_HOSTS} не существует"
 KNOWN_HOSTS_STATE="$(stat -c '%u:%g:%a' "${BROKER_KNOWN_HOSTS}")"
@@ -90,6 +94,10 @@ KNOWN_HOSTS_STATE="$(stat -c '%u:%g:%a' "${BROKER_KNOWN_HOSTS}")"
     || fail "${BROKER_KNOWN_HOSTS}: ${KNOWN_HOSTS_STATE}, требуется root:10001 640"
 [ "$(stat -c '%u:%g:%a' "$(dirname "${BROKER_KNOWN_HOSTS}")")" = "0:0:755" ] \
     || fail "Каталог pinned known_hosts должен быть root:root 755"
+grep -Fq \
+    "${BROKER_KNOWN_HOSTS}:/home/openhands/.ssh/known_hosts:ro" \
+    "${COMPOSE_FILE}" \
+    || fail "Pinned known_hosts должен монтироваться в Canvas только read-only"
 [ "$(grep -cEv '^[[:space:]]*$' "${BROKER_KNOWN_HOSTS}")" -eq 1 ] \
     || fail "${BROKER_KNOWN_HOSTS}: требуется ровно одна запись"
 awk 'NF == 3 && $1 == "10.89.0.1" && $2 == "ssh-ed25519" {ok=1} END {exit !ok}' \
@@ -99,7 +107,7 @@ PINNED_FINGERPRINT="$(ssh-keygen -lf "${BROKER_KNOWN_HOSTS}" -E sha256 | awk 'NR
 HOST_FINGERPRINT="$(ssh-keygen -lf "${HOST_KEY_PUBLIC}" -E sha256 | awk 'NR == 1 {print $2}')"
 [ -n "${PINNED_FINGERPRINT}" ] && [ "${PINNED_FINGERPRINT}" = "${HOST_FINGERPRINT}" ] \
     || fail "Pinned broker host key mismatch; refusing to start Canvas"
-ok "Pinned broker known_hosts: root-controlled, exact host fingerprint"
+ok "Pinned broker known_hosts: root:10001 640, read-only, exact host fingerprint"
 
 for s in run-supervised.sh health-watchdog.sh prepare.sh; do
     [ -f "${BASE}/deployment/scripts/${s}" ] || fail "${s} не найден"

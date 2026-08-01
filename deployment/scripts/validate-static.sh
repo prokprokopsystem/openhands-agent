@@ -58,6 +58,31 @@ grep -q '/etc/openhands-broker/client_known_hosts:/home/openhands/.ssh/known_hos
     && pass "broker known_hosts: persistent read-only mount" \
     || fail "broker known_hosts: нет read-only mount"
 
+echo ""
+echo "--- Broker lifecycle persistence ---"
+PREPARE="deployment/scripts/prepare.sh"
+RUNTIME_VALIDATOR="deployment/scripts/validate-runtime.sh"
+BROKER_SETUP="deployment/broker/setup-broker.sh"
+grep -Fq 'chown -R "${HOST_OWNER}" "${BASE}/secrets"' "${PREPARE}" \
+    && fail "prepare: recursive secrets chown ломает broker key" \
+    || pass "prepare: broker key исключён из recursive secrets chown"
+grep -Fq '! -path "${BROKER_KEY}"' "${PREPARE}" \
+    && pass "prepare: broker key исключён из общей ownership policy" \
+    || fail "prepare: broker key не исключён из общей ownership policy"
+grep -Fq 'chown root:10001 "${BROKER_KEY}"' "${PREPARE}" \
+    && grep -Fq 'chmod 0640 "${BROKER_KEY}"' "${PREPARE}" \
+    && pass "prepare: broker key root:10001 0640" \
+    || fail "prepare: broker key permissions не закреплены"
+grep -Fq '[ "${BROKER_KEY_STATE}" = "0:10001:640" ]' "${RUNTIME_VALIDATOR}" \
+    && grep -Fq '[ "${KNOWN_HOSTS_STATE}" = "0:10001:640" ]' "${RUNTIME_VALIDATOR}" \
+    && pass "runtime: broker SSH files fail-closed permissions" \
+    || fail "runtime: нет точной проверки broker SSH permissions"
+grep -Fq 'deployment/scripts/prepare.sh' "${BROKER_SETUP}" \
+    && grep -Fq 'deployment/scripts/validate-runtime.sh' "${BROKER_SETUP}" \
+    && grep -Fq 'diverges from every authorized update base' "${BROKER_SETUP}" \
+    && pass "setup: lifecycle scripts delivered from authorized base" \
+    || fail "setup: lifecycle delivery не fail-closed"
+
 # ── 5. Systemd invariants ──
 echo ""
 echo "--- Systemd invariants ---"

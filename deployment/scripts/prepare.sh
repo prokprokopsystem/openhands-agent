@@ -6,6 +6,7 @@ set -euo pipefail
 BASE="/srv/openhands-agent"
 HOST_OWNER="igor:igor"
 CONTAINER_OWNER="10001:10001"
+BROKER_KEY="${BASE}/secrets/broker-mini-server.key"
 
 echo "=== OpenHands Agent Canvas — подготовка каталогов ==="
 
@@ -21,12 +22,21 @@ mkdir -p "${BASE}/docs"
 chown -R "${HOST_OWNER}" "${BASE}/docs"
 chmod 755 "${BASE}/docs"
 
-# Хостовые runtime-каталоги. Секреты создаёт и обслуживает igor.
-for d in secrets logs; do
-    mkdir -p "${BASE}/${d}"
-    chown -R "${HOST_OWNER}" "${BASE}/${d}"
-    chmod 700 "${BASE}/${d}"
-done
+# Хостовые runtime-каталоги. Обычные secrets обслуживает igor, но broker key
+# исключён из общей рекурсивной политики: он доступен только root и Canvas GID.
+mkdir -p "${BASE}/secrets" "${BASE}/logs"
+chown "${HOST_OWNER}" "${BASE}/secrets" "${BASE}/logs"
+chmod 700 "${BASE}/secrets" "${BASE}/logs"
+find "${BASE}/secrets" -mindepth 1 ! -path "${BROKER_KEY}" \
+    -exec chown -h "${HOST_OWNER}" -- {} +
+chown -R "${HOST_OWNER}" "${BASE}/logs"
+
+if [ -e "${BROKER_KEY}" ] || [ -L "${BROKER_KEY}" ]; then
+    [ -f "${BROKER_KEY}" ] && [ ! -L "${BROKER_KEY}" ] \
+        || { echo "broker-mini-server.key должен быть обычным файлом" >&2; exit 1; }
+    chown root:10001 "${BROKER_KEY}"
+    chmod 0640 "${BROKER_KEY}"
+fi
 
 if [ -f "${BASE}/secrets/.env" ]; then
     chmod 600 "${BASE}/secrets/.env"

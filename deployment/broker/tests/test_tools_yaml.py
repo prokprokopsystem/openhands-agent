@@ -323,14 +323,78 @@ def test_journal_access_is_narrow_and_root_controlled():
 
 def test_broker_key_permissions_match_container_identity():
     setup_path = os.path.join(os.path.dirname(__file__), "..", "setup-broker.sh")
+    prepare_path = os.path.join(REPO_ROOT, "deployment", "scripts", "prepare.sh")
     runtime_path = os.path.join(REPO_ROOT, "deployment", "scripts", "validate-runtime.sh")
     with open(setup_path) as f:
         setup = f.read()
+    with open(prepare_path) as f:
+        prepare = f.read()
     with open(runtime_path) as f:
         runtime = f.read()
     assert 'chown root:10001 "${CLIENT_KEY}"' in setup
     assert 'chmod 0640 "${CLIENT_KEY}"' in setup
+    assert 'chown root:10001 "${BROKER_KEY}"' in prepare
+    assert 'chmod 0640 "${BROKER_KEY}"' in prepare
     assert '"0:10001:640"' in runtime
+
+
+def test_prepare_preserves_broker_key_across_repeated_restart():
+    prepare_path = os.path.join(REPO_ROOT, "deployment", "scripts", "prepare.sh")
+    with open(prepare_path) as f:
+        prepare = f.read()
+    assert 'BROKER_KEY="${BASE}/secrets/broker-mini-server.key"' in prepare
+    assert 'chown -R "${HOST_OWNER}" "${BASE}/secrets"' not in prepare
+    assert '! -path "${BROKER_KEY}"' in prepare
+    general_secrets = prepare.index('find "${BASE}/secrets"')
+    restore_owner = prepare.index('chown root:10001 "${BROKER_KEY}"')
+    restore_mode = prepare.index('chmod 0640 "${BROKER_KEY}"')
+    assert general_secrets < restore_owner < restore_mode
+
+
+def test_runtime_validator_fails_closed_on_broker_file_permissions():
+    runtime_path = os.path.join(REPO_ROOT, "deployment", "scripts", "validate-runtime.sh")
+    with open(runtime_path) as f:
+        runtime = f.read()
+    assert 'BROKER_KEY_STATE="$(stat -c \'%u:%g:%a\' "${BROKER_KEY}")"' in runtime
+    assert '[ "${BROKER_KEY_STATE}" = "0:10001:640" ]' in runtime
+    assert 'KNOWN_HOSTS_STATE="$(stat -c \'%u:%g:%a\' "${BROKER_KNOWN_HOSTS}")"' in runtime
+    assert '[ "${KNOWN_HOSTS_STATE}" = "0:10001:640" ]' in runtime
+    assert '"${BROKER_KEY}:/secrets/broker-mini-server.key:ro"' in runtime
+    assert (
+        '"${BROKER_KNOWN_HOSTS}:/home/openhands/.ssh/known_hosts:ro"'
+        in runtime
+    )
+    assert "work-workspace" in runtime
+    assert "test-workspace" not in runtime
+    compose_validation = runtime.index('docker compose -f "${COMPOSE_FILE}" config')
+    assert runtime.index('BROKER_KEY_STATE=') < compose_validation
+    assert runtime.index('KNOWN_HOSTS_STATE=') < compose_validation
+
+
+def test_setup_atomically_delivers_authorized_lifecycle_scripts():
+    setup_path = os.path.join(os.path.dirname(__file__), "..", "setup-broker.sh")
+    with open(setup_path) as f:
+        setup = f.read()
+    for source in (
+        "deployment/scripts/prepare.sh",
+        "deployment/scripts/validate-runtime.sh",
+    ):
+        assert source in setup
+    assert 'PREPARE_TARGET="/srv/openhands-agent/deployment/scripts/prepare.sh"' in setup
+    assert (
+        'VALIDATE_RUNTIME_TARGET="/srv/openhands-agent/deployment/scripts/validate-runtime.sh"'
+        in setup
+    )
+    assert "77cece874846d56b058a9f0932f8188674ec11c3" in setup
+    assert "11707aa434ceb324dec704b3e47374604a2f45c6" in setup
+    assert "diverges from every authorized update base" in setup
+    assert setup.count("require_authorized_runtime_target") >= 7
+    assert setup.index('PREPARE_TMP="$(mktemp') < setup.index(
+        'mv -f "${PREPARE_TMP}" "${PREPARE_TARGET}"'
+    )
+    assert setup.index('VALIDATE_RUNTIME_TMP="$(mktemp') < setup.index(
+        'mv -f "${VALIDATE_RUNTIME_TMP}" "${VALIDATE_RUNTIME_TARGET}"'
+    )
 
 
 # ======================================================================
@@ -625,7 +689,7 @@ def test_host_key_mismatch_is_fail_closed_before_install():
     setup = os.path.join(os.path.dirname(__file__), "..", "setup-broker.sh")
     with open(setup) as f:
         content = f.read()
-    mismatch = content.index("Live SSH host key does not match")
+    mismatch = content.index("Live SSH host fingerprint does not match")
     install = content.index('mv -f "${KNOWN_HOSTS_TMP}" "${CLIENT_KNOWN_HOSTS}"')
     assert mismatch < install
     runtime = os.path.join(REPO_ROOT, "deployment", "scripts", "validate-runtime.sh")
