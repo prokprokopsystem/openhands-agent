@@ -233,6 +233,16 @@ def test_broker_account_is_not_locked_for_public_key_auth():
     assert "KbdInteractiveAuthentication no" in setup
 
 
+def test_authorized_keys_path_is_readable_but_not_writable_by_broker():
+    setup_path = os.path.join(os.path.dirname(__file__), "..", "setup-broker.sh")
+    with open(setup_path) as f:
+        setup = f.read()
+    assert 'install -d -o root -g root -m 711 "${BROKER_HOME}"' in setup
+    assert 'install -d -o root -g root -m 711 "${SSH_DIR}"' in setup
+    assert 'chown root:"${BROKER_USER}" "${AUTH_KEYS_TMP}"' in setup
+    assert 'chmod 440 "${AUTH_KEYS_TMP}"' in setup
+
+
 def test_setup_is_fail_closed_before_mutation():
     setup_path = os.path.join(os.path.dirname(__file__), "..", "setup-broker.sh")
     with open(setup_path) as f:

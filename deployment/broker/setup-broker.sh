@@ -102,9 +102,9 @@ chmod 0640 "${CLIENT_KEY}"
     || fail "Broker private key permissions are not root:10001 0640"
 ok "Broker client key permissions: root:10001 0640"
 
-# --- SSH home (.ssh владельцем root, 700) ---
-install -d -o root -g root -m 700 "${BROKER_HOME}"
-install -d -o root -g root -m 700 "${SSH_DIR}"
+# --- SSH home: root-controlled, broker может только пройти к authorized_keys ---
+install -d -o root -g root -m 711 "${BROKER_HOME}"
+install -d -o root -g root -m 711 "${SSH_DIR}"
 ok "SSH home: ${SSH_DIR}"
 
 # --- Копирование wrapper (root:root, 755) ---
@@ -124,8 +124,8 @@ AUTH_KEYS_TMP="$(mktemp "${SSH_DIR}/.authorized_keys.XXXXXX")"
 printf '%s %s\n' \
     'from="10.89.0.2",restrict,command="/usr/local/lib/openhands-broker/broker-wrapper.sh"' \
     "${PUBLIC_KEY}" > "${AUTH_KEYS_TMP}"
-chown root:root "${AUTH_KEYS_TMP}"
-chmod 600 "${AUTH_KEYS_TMP}"
+chown root:"${BROKER_USER}" "${AUTH_KEYS_TMP}"
+chmod 440 "${AUTH_KEYS_TMP}"
 mv -f "${AUTH_KEYS_TMP}" "${AUTH_KEYS}"
 ok "authorized_keys installed with source restriction and forced command"
 
