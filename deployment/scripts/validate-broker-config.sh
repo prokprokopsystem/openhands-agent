@@ -9,6 +9,7 @@ BROKER_DIR="${BASE}/deployment/broker"
 TOOLS_FILE="${BROKER_DIR}/tools.yaml"
 WRAPPER="${BROKER_DIR}/broker-wrapper.sh"
 SETUP="${BROKER_DIR}/setup-broker.sh"
+JOURNAL_HELPER="${BROKER_DIR}/journal-logs.sh"
 
 ok()    { printf '  [OK] %s\n' "$1"; }
 warn()  { printf '  [WARN] %s\n' "$1"; }
@@ -23,8 +24,10 @@ echo "=== Broker config validation ==="
 [ -f "${TOOLS_FILE}" ]  && ok "tools.yaml exists"     || fail "tools.yaml not found"
 [ -f "${WRAPPER}" ]     && ok "broker-wrapper.sh exists" || fail "broker-wrapper.sh not found"
 [ -f "${SETUP}" ]       && ok "setup-broker.sh exists"   || fail "setup-broker.sh not found"
+[ -f "${JOURNAL_HELPER}" ] && ok "journal-logs.sh exists" || fail "journal-logs.sh not found"
 [ -x "${WRAPPER}" ]     && ok "broker-wrapper.sh executable" || fail "broker-wrapper.sh not executable"
 [ -x "${SETUP}" ]       && ok "setup-broker.sh executable"   || fail "setup-broker.sh not executable"
+[ -x "${JOURNAL_HELPER}" ] && ok "journal-logs.sh executable" || fail "journal-logs.sh not executable"
 
 # --- tools.yaml структура ---
 if command -v python3 &>/dev/null; then
@@ -83,6 +86,17 @@ grep -q 'git ls-files --others --exclude-standard' "${SETUP}" \
     && ok "clean worktree check" || fail "untracked worktree check missing"
 grep -q 'ForceCommand /usr/local/lib/openhands-broker/broker-wrapper.sh' "${SETUP}" \
     && ok "sshd ForceCommand policy" || fail "sshd ForceCommand policy missing"
+grep -q 'exec /usr/bin/journalctl' "${JOURNAL_HELPER}" \
+    && ok "journal helper uses fixed journalctl path" || fail "journal helper boundary missing"
+grep -q 'openhands-agent|openhands-agent.service' "${JOURNAL_HELPER}" \
+    && ok "journal helper service allowlist" || fail "journal helper service allowlist missing"
+grep -q 'NOPASSWD: /usr/local/lib/openhands-broker/journal-logs' "${SETUP}" \
+    && ok "narrow journal helper sudo rule" || fail "journal helper sudo rule missing"
+if grep -Eq 'usermod .*\b(adm|systemd-journal)\b' "${SETUP}"; then
+    fail "broker receives a broad journal group"
+else
+    ok "broker receives no broad journal group"
+fi
 
 # --- Проверка уровней риска в tools.yaml ---
 if command -v python3 &>/dev/null; then

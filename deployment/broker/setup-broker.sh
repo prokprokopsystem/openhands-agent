@@ -52,6 +52,7 @@ git diff --cached --quiet --ignore-submodules HEAD -- || fail "Installation sour
 for source_path in \
     deployment/broker/setup-broker.sh \
     deployment/broker/broker-wrapper.sh \
+    deployment/broker/journal-logs.sh \
     deployment/broker/tools.yaml; do
     git ls-files --error-unmatch "${source_path}" >/dev/null 2>&1 \
         || fail "Untracked installation source: ${source_path}"
@@ -65,8 +66,10 @@ python3 -c "import yaml" 2>/dev/null || fail "PyYAML required (pip3 install pyya
 command -v docker >/dev/null 2>&1 || fail "docker required"
 command -v logger >/dev/null 2>&1 || fail "logger required for fail-closed audit"
 command -v visudo >/dev/null 2>&1 || fail "visudo required"
+command -v sudo >/dev/null 2>&1 || fail "sudo required"
 command -v sshd >/dev/null 2>&1 || fail "sshd required"
 command -v ssh-keygen >/dev/null 2>&1 || fail "ssh-keygen required"
+[ -x /usr/bin/journalctl ] || fail "/usr/bin/journalctl required"
 logger -p authpriv.notice -t openhands-broker-setup -- '{"status":"AUDIT_PREFLIGHT"}' \
     || fail "journald audit transport unavailable"
 
@@ -113,6 +116,13 @@ SCRIPT_SRC="${SCRIPT_DIR}/broker-wrapper.sh"
 install -o root -g root -m 755 "${SCRIPT_SRC}" "${BROKER_LIB}/broker-wrapper.sh"
 ok "broker-wrapper.sh"
 
+# --- Узкий root helper для чтения только журнала openhands-agent ---
+JOURNAL_HELPER_SRC="${SCRIPT_DIR}/journal-logs.sh"
+[ -f "${JOURNAL_HELPER_SRC}" ] || fail "${JOURNAL_HELPER_SRC} not found"
+install -o root -g root -m 755 \
+    "${JOURNAL_HELPER_SRC}" "${BROKER_LIB}/journal-logs"
+ok "journal-logs"
+
 # --- Копирование tools.yaml (root:root, 644) ---
 YAML_SRC="${SCRIPT_DIR}/tools.yaml"
 [ -f "${YAML_SRC}" ] || fail "${YAML_SRC} not found"
@@ -138,6 +148,7 @@ cat > "${SUDOERS_TMP}" << 'SUDO'
 openhands-broker ALL=(root) NOPASSWD: /usr/bin/docker ps
 openhands-broker ALL=(root) NOPASSWD: /usr/bin/docker compose -f /srv/openhands-agent/deployment/compose.yaml ps
 openhands-broker ALL=(root) NOPASSWD: /usr/bin/docker compose -f /srv/openhands-agent/deployment/compose.yaml logs -n *
+openhands-broker ALL=(root) NOPASSWD: /usr/local/lib/openhands-broker/journal-logs
 openhands-broker ALL=(root) NOPASSWD: /usr/bin/systemctl restart openhands-agent.service
 openhands-broker ALL=(root) NOPASSWD: /usr/bin/systemctl stop openhands-agent.service
 openhands-broker ALL=(root) NOPASSWD: /usr/bin/systemctl start openhands-agent.service
@@ -150,6 +161,12 @@ visudo -cf "${SUDOERS_TMP}" >/dev/null 2>&1 || fail "sudoers syntax check failed
 mv -f "${SUDOERS_TMP}" "${SUDOERS_FILE}"
 SUDOERS_TMP=""
 ok "sudo rules installed atomically: ${SUDOERS_FILE}"
+
+sudo -u "${BROKER_USER}" -- \
+    sudo -n "${BROKER_LIB}/journal-logs" openhands-agent 1 \
+    >/dev/null 2>&1 \
+    || fail "journal_logs sudo rule cannot read the openhands-agent journal"
+ok "journal_logs has narrow broker-controlled journal access"
 
 # --- Ограничения openhands-broker (без права записи в реестр и secrets) ---
 chmod 755 "${BROKER_LIB}"

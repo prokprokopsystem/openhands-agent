@@ -13,6 +13,7 @@ import pytest
 
 TOOLS_YAML = os.path.join(os.path.dirname(__file__), "..", "tools.yaml")
 WRAPPER_SH = os.path.join(os.path.dirname(__file__), "..", "broker-wrapper.sh")
+JOURNAL_HELPER_SH = os.path.join(os.path.dirname(__file__), "..", "journal-logs.sh")
 REPO_ROOT = os.path.join(os.path.dirname(__file__), "..", "..", "..")
 
 
@@ -168,6 +169,44 @@ def test_lines_bounds_rejected(command):
     assert "must be" in result.stderr
 
 
+def test_journal_logs_uses_narrow_root_helper():
+    data = load_yaml()
+    tool = next(t for t in data["tools"] if t["name"] == "journal_logs")
+    assert tool["execute"] == (
+        "sudo /usr/local/lib/openhands-broker/journal-logs "
+        "{{service}} {{lines}} 2>&1"
+    )
+
+
+@pytest.mark.parametrize("args", [
+    [],
+    ["openhands-agent"],
+    ["openhands-agent", "1", "extra"],
+    ["ssh.service", "10"],
+    ["openhands-agent", "not-an-integer"],
+    ["openhands-agent", "0"],
+    ["openhands-agent", "501"],
+])
+def test_journal_helper_rejects_invalid_scope(args):
+    result = subprocess.run(
+        ["bash", JOURNAL_HELPER_SH, *args],
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+    assert result.returncode == 64
+
+
+def test_journal_helper_has_fixed_journalctl_boundary():
+    with open(JOURNAL_HELPER_SH) as f:
+        helper = f.read()
+    assert "exec /usr/bin/journalctl" in helper
+    assert '--unit="${service}"' in helper
+    assert '--lines="${line_count}"' in helper
+    assert "systemd-journal" not in helper
+    assert " adm" not in helper
+
+
 # ======================================================================
 # 6. Injection protection patterns
 # ======================================================================
@@ -263,6 +302,23 @@ def test_sudoers_is_validated_before_atomic_install():
     install = setup.index('mv -f "${SUDOERS_TMP}" "${SUDOERS_FILE}"')
     assert visudo < install
     assert "cat > \"${SUDOERS_FILE}\"" not in setup
+
+
+def test_journal_access_is_narrow_and_root_controlled():
+    setup_path = os.path.join(os.path.dirname(__file__), "..", "setup-broker.sh")
+    with open(setup_path) as f:
+        setup = f.read()
+    assert 'deployment/broker/journal-logs.sh' in setup
+    assert 'install -o root -g root -m 755 \\' in setup
+    assert '"${JOURNAL_HELPER_SRC}" "${BROKER_LIB}/journal-logs"' in setup
+    assert (
+        "openhands-broker ALL=(root) NOPASSWD: "
+        "/usr/local/lib/openhands-broker/journal-logs"
+    ) in setup
+    assert 'sudo -n "${BROKER_LIB}/journal-logs" openhands-agent 1' in setup
+    assert "usermod -a" not in setup
+    assert "systemd-journal" not in setup
+    assert " adm" not in setup
 
 
 def test_broker_key_permissions_match_container_identity():
