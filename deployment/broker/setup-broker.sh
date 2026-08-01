@@ -113,10 +113,17 @@ LOCAL_HOST_KEY="$(awk 'NF >= 2 { print $1 " " $2; exit }' "${HOST_KEY_PUBLIC}")"
 [[ "${LOCAL_HOST_KEY}" =~ ^ssh-ed25519[[:space:]][A-Za-z0-9+/=]+$ ]] \
     || fail "Mini-server SSH host key is not ED25519"
 DERIVED_HOST_KEY="$(ssh-keygen -y -f "${HOST_KEY_PRIVATE}")"
-[ "${DERIVED_HOST_KEY}" = "${LOCAL_HOST_KEY}" ] \
-    || fail "SSH host public key does not match its private key"
-LOCAL_HOST_FINGERPRINT="$(ssh-keygen -lf "${HOST_KEY_PUBLIC}" -E sha256 | awk '{print $2}')"
+DERIVED_HOST_FINGERPRINT="$(
+    printf '%s\n' "${DERIVED_HOST_KEY}" \
+        | ssh-keygen -lf - -E sha256 2>/dev/null \
+        | awk 'NR == 1 {print $2}'
+)"
+[ -n "${DERIVED_HOST_FINGERPRINT}" ] \
+    || fail "Cannot fingerprint SSH host key derived from private key"
+LOCAL_HOST_FINGERPRINT="$(ssh-keygen -lf "${HOST_KEY_PUBLIC}" -E sha256 | awk 'NR == 1 {print $2}')"
 [ -n "${LOCAL_HOST_FINGERPRINT}" ] || fail "Cannot fingerprint local SSH host key"
+[ "${DERIVED_HOST_FINGERPRINT}" = "${LOCAL_HOST_FINGERPRINT}" ] \
+    || fail "SSH host public key does not match its private key"
 
 HOST_SCAN_TMP="$(mktemp /run/openhands-broker-host-scan.XXXXXX)"
 ssh-keyscan -4 -T 5 -p "${BROKER_PORT}" -t ed25519 "${BROKER_HOST}" \
@@ -127,10 +134,9 @@ mapfile -t OBSERVED_HOST_KEYS < <(
 )
 [ "${#OBSERVED_HOST_KEYS[@]}" -eq 1 ] \
     || fail "Expected exactly one live ED25519 host key"
-OBSERVED_HOST_KEY="${OBSERVED_HOST_KEYS[0]}"
 OBSERVED_HOST_FINGERPRINT="$(ssh-keygen -lf "${HOST_SCAN_TMP}" -E sha256 | awk 'NR == 1 {print $2}')"
-[ "${OBSERVED_HOST_KEY}" = "${LOCAL_HOST_KEY}" ] \
-    || fail "Live SSH host key does not match mini-server sshd host key"
+[ -n "${OBSERVED_HOST_FINGERPRINT}" ] \
+    || fail "Cannot fingerprint live SSH host key"
 [ "${OBSERVED_HOST_FINGERPRINT}" = "${LOCAL_HOST_FINGERPRINT}" ] \
     || fail "Live SSH host fingerprint does not match mini-server sshd host key"
 rm -f "${HOST_SCAN_TMP}"

@@ -567,8 +567,10 @@ def test_pinned_known_hosts_is_verified_and_root_controlled():
     assert 'HOST_KEY_PRIVATE="/etc/ssh/ssh_host_ed25519_key"' in content
     assert 'ssh-keygen -y -f "${HOST_KEY_PRIVATE}"' in content
     assert 'ssh-keyscan -4 -T 5 -p "${BROKER_PORT}" -t ed25519 "${BROKER_HOST}"' in content
-    assert '"${OBSERVED_HOST_KEY}" = "${LOCAL_HOST_KEY}"' in content
+    assert '"${DERIVED_HOST_FINGERPRINT}" = "${LOCAL_HOST_FINGERPRINT}"' in content
     assert '"${OBSERVED_HOST_FINGERPRINT}" = "${LOCAL_HOST_FINGERPRINT}"' in content
+    assert '"${DERIVED_HOST_KEY}" = "${LOCAL_HOST_KEY}"' not in content
+    assert '"${OBSERVED_HOST_KEY}" = "${LOCAL_HOST_KEY}"' not in content
     assert 'CLIENT_KNOWN_HOSTS="${BROKER_ETC}/client_known_hosts"' in content
     assert 'chown root:10001 "${KNOWN_HOSTS_TMP}"' in content
     assert 'chmod 0640 "${KNOWN_HOSTS_TMP}"' in content
@@ -576,6 +578,47 @@ def test_pinned_known_hosts_is_verified_and_root_controlled():
     assert 'Pinned known_hosts parent is not root-controlled' in content
     assert "accept-new" not in content
     assert "StrictHostKeyChecking=no" not in content
+
+
+def test_host_key_fingerprint_ignores_comment_and_line_ending():
+    with tempfile.TemporaryDirectory() as key_dir:
+        private_key = os.path.join(key_dir, "host_ed25519")
+        public_key = private_key + ".pub"
+        subprocess.run(
+            ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "original", "-f", private_key],
+            check=True,
+            timeout=5,
+        )
+        with open(public_key, encoding="ascii") as f:
+            key_type, key_blob, _ = f.read().strip().split(maxsplit=2)
+        with open(public_key, "wb") as f:
+            f.write(f"{key_type} {key_blob} different-comment\r\n".encode("ascii"))
+
+        derived = subprocess.run(
+            ["ssh-keygen", "-y", "-f", private_key],
+            check=True,
+            text=True,
+            capture_output=True,
+            timeout=5,
+        ).stdout
+        derived_fingerprint = subprocess.run(
+            ["ssh-keygen", "-lf", "-", "-E", "sha256"],
+            input=derived,
+            check=True,
+            text=True,
+            capture_output=True,
+            timeout=5,
+        ).stdout.split()[1]
+        public_fingerprint = subprocess.run(
+            ["ssh-keygen", "-lf", public_key, "-E", "sha256"],
+            check=True,
+            text=True,
+            capture_output=True,
+            timeout=5,
+        ).stdout.split()[1]
+
+        assert derived.strip() != f"{key_type} {key_blob} different-comment"
+        assert derived_fingerprint == public_fingerprint
 
 
 def test_host_key_mismatch_is_fail_closed_before_install():
