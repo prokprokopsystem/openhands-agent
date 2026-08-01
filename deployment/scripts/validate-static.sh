@@ -54,6 +54,9 @@ grep -q 'work-workspace' deployment/compose.yaml && pass "work-workspace : вы�
 grep -q 'enable_ipv6: false' deployment/compose.yaml && pass "IPv6 отключён : сеть" || fail "IPv6 не отключён в сети"
 grep -q 'disable_ipv6' deployment/compose.yaml && pass "IPv6 отключён : sysctl" || fail "IPv6 sysctl отсутствует"
 grep -q 'sha256:fc24163754bee' deployment/broker-client/Dockerfile && pass "digest зафиксирован" || fail "digest отсутствует"
+grep -q '/etc/openhands-broker/client_known_hosts:/home/openhands/.ssh/known_hosts:ro' deployment/compose.yaml \
+    && pass "broker known_hosts: persistent read-only mount" \
+    || fail "broker known_hosts: нет read-only mount"
 
 # ── 5. Systemd invariants ──
 echo ""

@@ -21,8 +21,22 @@ SSHD_DROPIN="/etc/ssh/sshd_config.d/99-openhands-broker.conf"
 SSH_DIR="${BROKER_HOME}/.ssh"
 AUTH_KEYS="${SSH_DIR}/authorized_keys"
 CLIENT_KEY="/srv/openhands-agent/secrets/broker-mini-server.key"
+CLIENT_KNOWN_HOSTS="${BROKER_ETC}/client_known_hosts"
+HOST_KEY_PRIVATE="/etc/ssh/ssh_host_ed25519_key"
+HOST_KEY_PUBLIC="/etc/ssh/ssh_host_ed25519_key.pub"
+BROKER_HOST="10.89.0.1"
+BROKER_PORT="22"
+COMPOSE_TARGET="/srv/openhands-agent/deployment/compose.yaml"
+AUTHORIZED_PREVIOUS_COMPOSE_HASH="957995f428b050c5a41dea0926ea2140d0bf29fa"
 LOCK_DIR="/run/lock/openhands-broker"
 LOCKFILE="${LOCK_DIR}/setup.lock"
+HOST_SCAN_TMP=""
+KNOWN_HOSTS_TMP=""
+COMPOSE_TMP=""
+SUDOERS_TMP=""
+SSHD_CANDIDATE=""
+SSHD_TMP=""
+SSHD_OLD=""
 
 ok()   { printf '  [OK] %s\n' "$1"; }
 warn() { printf '  [WARN] %s\n' "$1"; }
@@ -30,6 +44,13 @@ fail() { printf '  [FAIL] %s\n' "$1"; exit 1; }
 
 # --- Root check ---
 [ "$(id -u)" -eq 0 ] || fail "Run with sudo"
+
+cleanup() {
+    rm -f "${HOST_SCAN_TMP:-}" "${KNOWN_HOSTS_TMP:-}" \
+        "${COMPOSE_TMP:-}" "${SUDOERS_TMP:-}" \
+        "${SSHD_CANDIDATE:-}" "${SSHD_TMP:-}" "${SSHD_OLD:-}"
+}
+trap cleanup EXIT
 
 # --- Блокировка ---
 install -d -o root -g root -m 755 "${LOCK_DIR}"
@@ -53,7 +74,8 @@ for source_path in \
     deployment/broker/setup-broker.sh \
     deployment/broker/broker-wrapper.sh \
     deployment/broker/journal-logs.sh \
-    deployment/broker/tools.yaml; do
+    deployment/broker/tools.yaml \
+    deployment/compose.yaml; do
     git ls-files --error-unmatch "${source_path}" >/dev/null 2>&1 \
         || fail "Untracked installation source: ${source_path}"
     [ "$(git hash-object "${source_path}")" = "$(git rev-parse "${COMMIT_SHA}:${source_path}")" ] \
@@ -69,6 +91,7 @@ command -v visudo >/dev/null 2>&1 || fail "visudo required"
 command -v sudo >/dev/null 2>&1 || fail "sudo required"
 command -v sshd >/dev/null 2>&1 || fail "sshd required"
 command -v ssh-keygen >/dev/null 2>&1 || fail "ssh-keygen required"
+command -v ssh-keyscan >/dev/null 2>&1 || fail "ssh-keyscan required"
 [ -x /usr/bin/journalctl ] || fail "/usr/bin/journalctl required"
 logger -p authpriv.notice -t openhands-broker-setup -- '{"status":"AUDIT_PREFLIGHT"}' \
     || fail "journald audit transport unavailable"
@@ -82,6 +105,46 @@ PUBLIC_KEY="$(awk 'NF { print $1 " " $2; exit }' "${PUBLIC_KEY_FILE}")"
 [[ "${PUBLIC_KEY}" =~ ^(ssh-ed25519|ecdsa-sha2-nistp256)[[:space:]][A-Za-z0-9+/=]+$ ]] \
     || fail "Unsupported broker public key type"
 [ -f "${CLIENT_KEY}" ] || fail "Broker private key not found: ${CLIENT_KEY}"
+
+# --- Pin host key: local sshd key is the trust anchor; live scan is verified ---
+[ -f "${HOST_KEY_PRIVATE}" ] || fail "SSH host private key not found: ${HOST_KEY_PRIVATE}"
+[ -f "${HOST_KEY_PUBLIC}" ] || fail "SSH host public key not found: ${HOST_KEY_PUBLIC}"
+LOCAL_HOST_KEY="$(awk 'NF >= 2 { print $1 " " $2; exit }' "${HOST_KEY_PUBLIC}")"
+[[ "${LOCAL_HOST_KEY}" =~ ^ssh-ed25519[[:space:]][A-Za-z0-9+/=]+$ ]] \
+    || fail "Mini-server SSH host key is not ED25519"
+DERIVED_HOST_KEY="$(ssh-keygen -y -f "${HOST_KEY_PRIVATE}")"
+[ "${DERIVED_HOST_KEY}" = "${LOCAL_HOST_KEY}" ] \
+    || fail "SSH host public key does not match its private key"
+LOCAL_HOST_FINGERPRINT="$(ssh-keygen -lf "${HOST_KEY_PUBLIC}" -E sha256 | awk '{print $2}')"
+[ -n "${LOCAL_HOST_FINGERPRINT}" ] || fail "Cannot fingerprint local SSH host key"
+
+HOST_SCAN_TMP="$(mktemp /run/openhands-broker-host-scan.XXXXXX)"
+ssh-keyscan -4 -T 5 -p "${BROKER_PORT}" -t ed25519 "${BROKER_HOST}" \
+    > "${HOST_SCAN_TMP}" 2>/dev/null \
+    || fail "Cannot read live ED25519 host key from ${BROKER_HOST}:${BROKER_PORT}"
+mapfile -t OBSERVED_HOST_KEYS < <(
+    awk '$2 == "ssh-ed25519" { print $2 " " $3 }' "${HOST_SCAN_TMP}" | sort -u
+)
+[ "${#OBSERVED_HOST_KEYS[@]}" -eq 1 ] \
+    || fail "Expected exactly one live ED25519 host key"
+OBSERVED_HOST_KEY="${OBSERVED_HOST_KEYS[0]}"
+OBSERVED_HOST_FINGERPRINT="$(ssh-keygen -lf "${HOST_SCAN_TMP}" -E sha256 | awk 'NR == 1 {print $2}')"
+[ "${OBSERVED_HOST_KEY}" = "${LOCAL_HOST_KEY}" ] \
+    || fail "Live SSH host key does not match mini-server sshd host key"
+[ "${OBSERVED_HOST_FINGERPRINT}" = "${LOCAL_HOST_FINGERPRINT}" ] \
+    || fail "Live SSH host fingerprint does not match mini-server sshd host key"
+rm -f "${HOST_SCAN_TMP}"
+HOST_SCAN_TMP=""
+ok "Pinned ED25519 host key verified for ${BROKER_HOST}:${BROKER_PORT}"
+
+COMPOSE_SOURCE="${SCRIPT_DIR}/../compose.yaml"
+[ -f "${COMPOSE_TARGET}" ] || fail "Compose target not found: ${COMPOSE_TARGET}"
+TARGET_COMPOSE_HASH="$(git hash-object "${COMPOSE_TARGET}")"
+SOURCE_COMPOSE_HASH="$(git hash-object "${COMPOSE_SOURCE}")"
+if [ "${TARGET_COMPOSE_HASH}" != "${SOURCE_COMPOSE_HASH}" ] \
+    && [ "${TARGET_COMPOSE_HASH}" != "${AUTHORIZED_PREVIOUS_COMPOSE_HASH}" ]; then
+    fail "Runtime compose.yaml diverges from the authorized update base"
+fi
 
 # --- Создание пользователя (идемпотентно) ---
 if ! id "${BROKER_USER}" &>/dev/null; then
@@ -141,7 +204,6 @@ ok "authorized_keys installed with source restriction and forced command"
 
 # --- Sudo-правила: проверка временного файла, затем atomic install ---
 SUDOERS_TMP="$(mktemp /etc/sudoers.d/.openhands-broker.XXXXXX)"
-trap 'rm -f "${SUDOERS_TMP:-}" "${SSHD_CANDIDATE:-}" "${SSHD_TMP:-}" "${SSHD_OLD:-}"' EXIT
 cat > "${SUDOERS_TMP}" << 'SUDO'
 # OpenHands Agent Broker — разрешённые команды
 # Должны соответствовать tools.yaml. Проверено visudo -cf.
@@ -175,6 +237,34 @@ chmod 755 "${BROKER_ETC}/secrets"
 # Пользователь не может менять файлы
 chown -R root:root "${BROKER_LIB}" "${BROKER_ETC}"
 ok "Broker user cannot modify registry, wrapper, or secrets"
+
+# Только конкретный broker endpoint; root-controlled каталог не позволяет
+# container UID или обычным host-пользователям заменить pin через rename.
+KNOWN_HOSTS_TMP="$(mktemp "${BROKER_ETC}/.client-known-hosts.XXXXXX")"
+printf '%s %s\n' "${BROKER_HOST}" "${LOCAL_HOST_KEY}" > "${KNOWN_HOSTS_TMP}"
+chown root:10001 "${KNOWN_HOSTS_TMP}"
+chmod 0640 "${KNOWN_HOSTS_TMP}"
+mv -f "${KNOWN_HOSTS_TMP}" "${CLIENT_KNOWN_HOSTS}"
+KNOWN_HOSTS_TMP=""
+[ "$(stat -c '%u:%g:%a' "${CLIENT_KNOWN_HOSTS}")" = "0:10001:640" ] \
+    || fail "Pinned known_hosts permissions are not root:10001 0640"
+[ "$(stat -c '%u:%g:%a' "${BROKER_ETC}")" = "0:0:755" ] \
+    || fail "Pinned known_hosts parent is not root-controlled"
+[ "$(grep -cEv '^[[:space:]]*$' "${CLIENT_KNOWN_HOSTS}")" -eq 1 ] \
+    || fail "Pinned known_hosts must contain exactly one entry"
+ok "Persistent pinned known_hosts installed in root-controlled directory"
+
+# setup запускается из временного checkout: атомарно ставим только проверенный
+# compose с read-only mount, отказываясь перетирать расходящийся runtime target.
+COMPOSE_TMP="$(mktemp /srv/openhands-agent/deployment/.compose.yaml.XXXXXX)"
+cp "${COMPOSE_SOURCE}" "${COMPOSE_TMP}"
+chown --reference="${COMPOSE_TARGET}" "${COMPOSE_TMP}"
+chmod --reference="${COMPOSE_TARGET}" "${COMPOSE_TMP}"
+docker compose -f "${COMPOSE_TMP}" config >/dev/null 2>&1 \
+    || fail "Compose candidate with pinned known_hosts mount is invalid"
+mv -f "${COMPOSE_TMP}" "${COMPOSE_TARGET}"
+COMPOSE_TMP=""
+ok "compose.yaml installed atomically with pinned known_hosts read-only mount"
 
 # --- SSH доступ (обычный shell нужен sshd для запуска forced command) ---
 BROKER_SHELL=$(getent passwd "${BROKER_USER}" | cut -d: -f7)

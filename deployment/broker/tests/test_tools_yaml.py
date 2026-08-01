@@ -547,12 +547,61 @@ def test_docker_ps_matches_exact_sudoers_rule():
     assert "NOPASSWD: /usr/bin/docker ps\n" in setup_content
 
 
-def test_compose_mounts_only_broker_key():
+def test_compose_mounts_only_pinned_broker_ssh_files():
     compose = os.path.join(REPO_ROOT, "deployment", "compose.yaml")
     with open(compose) as f:
         content = f.read()
     assert "/srv/openhands-agent/secrets:/secrets" not in content
     assert "secrets/broker-mini-server.key:/secrets/broker-mini-server.key:ro" in content
+    assert (
+        "/etc/openhands-broker/client_known_hosts:"
+        "/home/openhands/.ssh/known_hosts:ro"
+    ) in content
+
+
+def test_pinned_known_hosts_is_verified_and_root_controlled():
+    setup = os.path.join(os.path.dirname(__file__), "..", "setup-broker.sh")
+    with open(setup) as f:
+        content = f.read()
+    assert 'HOST_KEY_PUBLIC="/etc/ssh/ssh_host_ed25519_key.pub"' in content
+    assert 'HOST_KEY_PRIVATE="/etc/ssh/ssh_host_ed25519_key"' in content
+    assert 'ssh-keygen -y -f "${HOST_KEY_PRIVATE}"' in content
+    assert 'ssh-keyscan -4 -T 5 -p "${BROKER_PORT}" -t ed25519 "${BROKER_HOST}"' in content
+    assert '"${OBSERVED_HOST_KEY}" = "${LOCAL_HOST_KEY}"' in content
+    assert '"${OBSERVED_HOST_FINGERPRINT}" = "${LOCAL_HOST_FINGERPRINT}"' in content
+    assert 'CLIENT_KNOWN_HOSTS="${BROKER_ETC}/client_known_hosts"' in content
+    assert 'chown root:10001 "${KNOWN_HOSTS_TMP}"' in content
+    assert 'chmod 0640 "${KNOWN_HOSTS_TMP}"' in content
+    assert 'stat -c \'%u:%g:%a\' "${BROKER_ETC}"' in content
+    assert 'Pinned known_hosts parent is not root-controlled' in content
+    assert "accept-new" not in content
+    assert "StrictHostKeyChecking=no" not in content
+
+
+def test_host_key_mismatch_is_fail_closed_before_install():
+    setup = os.path.join(os.path.dirname(__file__), "..", "setup-broker.sh")
+    with open(setup) as f:
+        content = f.read()
+    mismatch = content.index("Live SSH host key does not match")
+    install = content.index('mv -f "${KNOWN_HOSTS_TMP}" "${CLIENT_KNOWN_HOSTS}"')
+    assert mismatch < install
+    runtime = os.path.join(REPO_ROOT, "deployment", "scripts", "validate-runtime.sh")
+    with open(runtime) as f:
+        runtime_content = f.read()
+    assert "Pinned broker host key mismatch; refusing to start Canvas" in runtime_content
+
+
+def test_broker_client_keeps_strict_host_key_checking():
+    stage_doc = os.path.join(
+        REPO_ROOT,
+        "docs",
+        "План Этапа 4D — Постоянные инструменты агента.md",
+    )
+    with open(stage_doc) as f:
+        content = f.read()
+    assert "StrictHostKeyChecking=yes" in content
+    assert "StrictHostKeyChecking=no" not in content
+    assert "accept-new" not in content
 
 
 def test_canvas_image_contains_minimal_ssh_client():
