@@ -1,0 +1,27 @@
+#!/bin/sh
+set -eu
+umask 077
+PATH=/usr/bin:/bin
+export PATH
+
+if [ "$#" -ne 0 ]; then
+    printf '%s\n' '{"error":{"code":"arguments_forbidden","message":"launcher accepts no arguments"},"request_id":null,"status":"rejected","version":1}'
+    exit 2
+fi
+
+if [ -n "${SSH_ORIGINAL_COMMAND:-}" ]; then
+    printf '%s\n' '{"error":{"code":"original_command_forbidden","message":"SSH_ORIGINAL_COMMAND must be empty"},"request_id":null,"status":"rejected","version":1}'
+    exit 2
+fi
+
+case "$0" in
+    */*) launcher_dir=${0%/*} ;;
+    *) launcher_dir=. ;;
+esac
+broker_root=$(CDPATH= cd -- "$launcher_dir/.." && pwd -P)
+exec /usr/bin/env -i \
+    PATH=/usr/bin:/bin \
+    HOME=/nonexistent \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    /usr/bin/python3 "$broker_root/broker_core.py"

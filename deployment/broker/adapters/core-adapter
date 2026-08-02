@@ -1,0 +1,78 @@
+#!/usr/bin/python3
+"""Credential-free core adapter for ping and capabilities."""
+
+import json
+import sys
+
+MAX_REQUEST_BYTES = 16 * 1024
+MAX_RESPONSE_BYTES = 8 * 1024
+EXPECTED_FIELDS = {"version", "request_id", "target", "operation", "params"}
+
+
+class InvalidJson(ValueError):
+    pass
+
+
+def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise InvalidJson("duplicate key")
+        result[key] = value
+    return result
+
+
+def reject_non_finite(value: str) -> None:
+    raise InvalidJson(f"non-finite number: {value}")
+
+
+def output(value: dict) -> int:
+    raw = json.dumps(value, allow_nan=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    if len(raw) > MAX_RESPONSE_BYTES:
+        raw = b'{"error":{"code":"response_too_large"},"status":"error"}'
+    sys.stdout.buffer.write(raw + b"\n")
+    return 0 if value.get("status") == "ok" else 2
+
+
+def main() -> int:
+    raw = sys.stdin.buffer.read(MAX_REQUEST_BYTES + 1)
+    if not raw or len(raw) > MAX_REQUEST_BYTES:
+        return output({"status": "error", "error": {"code": "invalid_request"}})
+    try:
+        request = json.loads(
+            raw.decode("utf-8", errors="strict"),
+            object_pairs_hook=unique_object,
+            parse_constant=reject_non_finite,
+        )
+    except (UnicodeDecodeError, ValueError):
+        return output({"status": "error", "error": {"code": "invalid_request"}})
+    if not isinstance(request, dict) or set(request) != EXPECTED_FIELDS:
+        return output({"status": "error", "error": {"code": "invalid_request"}})
+    if type(request["version"]) is not int or request["version"] != 1:
+        return output({"status": "error", "error": {"code": "invalid_request"}})
+    if request["target"] != "core" or request["params"] != {}:
+        return output({"status": "error", "error": {"code": "invalid_request"}})
+    if request["operation"] == "ping":
+        result = {"pong": True, "protocol_version": 1}
+    elif request["operation"] == "capabilities":
+        result = {
+            "protocol_version": 1,
+            "operations": ["capabilities", "ping"],
+            "level_b_enabled": False,
+            "level_c_enabled": False,
+        }
+    else:
+        return output({"status": "error", "error": {"code": "unknown_operation"}})
+    return output(
+        {
+            "status": "ok",
+            "result": result,
+            "result_code": "ok",
+            "verify": {"status": "not_applicable"},
+            "rollback": {"status": "not_applicable"},
+        }
+    )
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

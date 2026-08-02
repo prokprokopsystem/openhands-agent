@@ -1,7 +1,7 @@
 # Этап 4D — Архитектура broker
 
-**Версия:** 2.1 (2 августа 2026)  
-**Статус:** 🟡 архитектурный review pending; реализация 4D.1 заблокирована до отдельного review PASS  
+**Версия:** 2.2 (2 августа 2026)
+**Статус:** ✅ `4D.0 REVIEW: PASS`; ✅ `4D.1 REVIEW: PASS`; server installation не выполнялась
 **Основа:** проверенные идеи старого 4D из `fix/canonical-deployment`, без переноса его архитектурного расползания
 
 ---
@@ -346,9 +346,9 @@ Creator canonicalizes request и создаёт approval с полями:
 
 Файл создаётся в том же filesystem через secure temp/open с `O_CREAT|O_EXCL|O_NOFOLLOW`, проверенным owner/mode, `fsync`, затем atomic rename. Итог: regular file `root:root 0600`.
 
-### 8.3. Trusted consumer
+### 8.3. Trusted consumer/executor
 
-Отдельный root-owned consumer/helper. Broker core может вызвать только его точный executable через узкое правило. Consumer получает approval_id + canonical request через bounded JSON stdin.
+Отдельный root-owned consumer/executor. Broker core может вызвать только его точный executable через узкое правило. Consumer получает approval_id + canonical request через bounded JSON stdin. Он не возвращает broker core переносимый grant или иной результат, который core мог бы подделать и предъявить privileged helper.
 
 Consumer:
 
@@ -357,12 +357,13 @@ Consumer:
 3. атомарно claims approval перемещением `approvals/<id>` → `inflight/<id>` на том же filesystem; второй consumer после этого не может получить тот же capability;
 4. проверяет expiry, nonce/id format, target, tool и exact canonical request hash;
 5. mismatch/expired → reject и capability не возвращается в available state;
-6. success → capability считается consumed и атомарно переносится в `consumed/` либо удаляется согласно retention policy;
-7. возвращает только одноразовый structured grant result, без secrets.
+6. после успешной проверки в той же root-controlled execution boundary вызывает только фиксированный Level C helper/operation, привязанный к canonical descriptor;
+7. capability считается consumed независимо от результата операции и атомарно переносится в `consumed/` либо удаляется согласно retention policy;
+8. возвращает broker core только structured result уже выполненной операции, без capability contents и secrets.
 
 ### 8.4. Невозможность обхода core-ом
 
-Level C adapter/root helper сам требует успешный trusted approval-consume result для exact operation. Одного утверждения broker core «approval был» недостаточно. Таким образом компрометация core не превращает Level C helper в безусловный root executor.
+Consume и запуск exact Level C operation находятся в одной root-controlled execution boundary. Между consumer и privileged helper нет доверия к данным, возвращаемым broker core, и никакой reusable/synthetic grant через core не проходит. Одного утверждения core «approval был» недостаточно. Таким образом компрометация core не превращает Level C helper в безусловный root executor.
 
 ---
 
@@ -399,7 +400,7 @@ Journald tag `openhands-broker`.
 9. adapter повторно проверяет target/operation;
 10. systemctl mutations отсутствуют в A/B;
 11. Level C без trusted one-time approval → reject;
-12. approval creator/consumer directories root-only, symlink/race/single-use tests PASS;
+12. approval creator/consumer directories root-only, symlink/race/single-use tests PASS, а core не может подделать grant между consume и execute;
 13. secrets отсутствуют в fixtures/output/audit;
 14. uninstall broker не меняет base Canvas;
 15. connector recovery test доказывает, что canonical recovery после Connector сохраняет broker connection.
@@ -408,13 +409,15 @@ Journald tag `openhands-broker`.
 
 ## 11. Реализация по этапам
 
-### 4D.0 — Архитектура и границы 🟡 REVIEW PENDING
+### 4D.0 — Архитектура и границы ✅ REVIEW PASS
 
 Этот документ и `docs/План.md`.
 
-**4D.1 запрещено начинать до отдельного review PASS этой версии.**
+Архитектурные границы v2.2 проверены по broker/base separation, порядку этапов, wire protocol, credential isolation, Level C trust boundary, DEC-022 и connector recovery. 4D.1 разрешено начинать как repository-only этап в указанном ниже scope.
 
 ### 4D.1 — Broker Core v2 (repository-only)
+
+**Статус: ✅ `4D.1 REVIEW: PASS`; 35/35 unit/negative tests и local process-path PASS.**
 
 - wire protocol v1;
 - forced-command launcher contract;
@@ -422,7 +425,7 @@ Journald tag `openhands-broker`.
 - modular registry;
 - dispatcher;
 - fixed adapter interface;
-- A/B/C policy (C disabled);
+- A/B/C policy (B/C fail-closed до этапов 4D.6/4D.8);
 - audit;
 - core adapter `ping/capabilities`;
 - unit/negative tests.
@@ -434,6 +437,9 @@ Scope: `deployment/broker/**` + документы 4D/Состояние. Base d
 Installer устанавливает только broker artifacts:
 
 - broker Unix identity;
+- отдельный broker client key и его public key с точной ownership/mode policy;
+- restricted `authorized_keys` entry для broker identity;
+- pinned host trust material, проверенное против фактической host key;
 - fixed launcher/core;
 - broker directories;
 - sshd forced-command policy;
@@ -445,9 +451,11 @@ Installer устанавливает только broker artifacts:
 
 Uninstall удаляет только broker artifacts.
 
-### 4D.3 — Host-only Level A acceptance
+Файлы base Canvas на этом этапе не меняются. Client credential и pinned trust material только подготавливаются для последующего read-only mount в 4D.4.
 
-До Canvas Connector проверяются host-side:
+### 4D.3 — Mini-server Level A implementation + host-only acceptance
+
+На этом этапе реализуются `mini_server` adapter и его Level A registry contracts, после чего до Canvas Connector проверяются host-side:
 
 - protocol/forced command;
 - `ping/capabilities`;
@@ -455,7 +463,7 @@ Uninstall удаляет только broker artifacts.
 - credential isolation negative tests;
 - no-shell/no-extra-target tests.
 
-Это **не** end-to-end Canvas acceptance.
+Это **не** end-to-end Canvas acceptance. Acceptance не начинается, пока adapter/tools текущего этапа не реализованы и не установлены через broker-only installer/update path.
 
 ### 4D.4 — Canvas Connector + recovery freeze
 
@@ -469,6 +477,12 @@ Acceptance включает:
 - новый canonical `base + connector SHA` зафиксирован;
 - новая recovery процедура проверена;
 - `de2244dd...` остаётся только pre-connector fallback.
+
+### Operator-mediated bootstrap до 4D.8
+
+4D.2 изменяет system user/SSH/sudo policy, а 4D.4 изменяет строго перечисленные base Canvas/network files. По DEC-022 это Level C действия. До появления approval subsystem они выполняются только доверенным оператором вне Canvas/broker после отдельного точного разрешения пользователя.
+
+Canvas и broker core не могут запускать, повторять или самоподтверждать 4D.2/4D.4. Наличие installer/connector scripts в репозитории не является разрешением на их применение.
 
 ### 4D.5 — Canvas → broker Level A end-to-end
 
@@ -488,7 +502,7 @@ Acceptance включает:
 
 ### 4D.8 — Level C approval subsystem
 
-Реализуются trusted creator + trusted consumer + exact binding + TTL + single-use + race/symlink protection. После PASS разрешается первый заранее выбранный C test; до этого C disabled.
+Реализуются trusted creator + atomic trusted consumer/executor + exact binding + TTL + single-use + race/symlink protection. Никакой grant через broker core не передаётся. После PASS разрешается первый заранее выбранный C test; до этого C disabled.
 
 ### 4D.9 — End-to-end acceptance и freeze 4D v1
 

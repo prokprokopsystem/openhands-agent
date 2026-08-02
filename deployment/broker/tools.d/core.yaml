@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "tools": [
+    {
+      "name": "core.ping",
+      "target": "core",
+      "adapter": "core",
+      "operation": "ping",
+      "risk": "A",
+      "params": {},
+      "timeout_seconds": 5,
+      "max_output_bytes": 8192
+    },
+    {
+      "name": "core.capabilities",
+      "target": "core",
+      "adapter": "core",
+      "operation": "capabilities",
+      "risk": "A",
+      "params": {},
+      "timeout_seconds": 5,
+      "max_output_bytes": 8192
+    }
+  ]
+}
