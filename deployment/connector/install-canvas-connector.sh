@@ -100,9 +100,9 @@ verify_connector_file() {
 
 verify_image_state() {
     if docker image inspect "${IMAGE}" >/dev/null 2>&1; then
-        [ "$(docker image inspect --format '{{ index .Config.Labels \"org.openhands.connector.stage\" }}' "${IMAGE}")" = "4D.4" ] \
+        [ "$(docker image inspect --format '{{ index .Config.Labels "org.openhands.connector.stage" }}' "${IMAGE}")" = "4D.4" ] \
             || fail "Existing connector image has an unexpected stage label"
-        [ "$(docker image inspect --format '{{ index .Config.Labels \"org.openhands.connector.source\" }}' "${IMAGE}")" = "${COMMIT_SHA}" ] \
+        [ "$(docker image inspect --format '{{ index .Config.Labels "org.openhands.connector.source" }}' "${IMAGE}")" = "${COMMIT_SHA}" ] \
             || fail "Existing connector image belongs to another source commit"
     fi
 }

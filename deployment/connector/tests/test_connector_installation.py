@@ -9,6 +9,7 @@ VALIDATE = (ROOT / "validate-canvas-connector.sh").read_text(encoding="utf-8")
 ROLLBACK = (ROOT / "rollback-canvas-connector.sh").read_text(encoding="utf-8")
 ACCEPT = (ROOT / "accept-level-a-e2e.sh").read_text(encoding="utf-8")
 DEPLOYMENT_ROOT = ROOT.parent
+RUNTIME_VALIDATE = (DEPLOYMENT_ROOT / "scripts" / "validate-runtime.sh").read_text(encoding="utf-8")
 
 
 class ConnectorInstallationTests(unittest.TestCase):
@@ -57,6 +58,18 @@ class ConnectorInstallationTests(unittest.TestCase):
         self.assertIn("original_command_forbidden", ACCEPT)
         self.assertIn("arguments_forbidden", ACCEPT)
         self.assertIn("check-egress.sh", VALIDATE)
+
+    def test_docker_label_templates_have_no_literal_escape_characters(self):
+        combined = "\n".join((INSTALL, VALIDATE, RUNTIME_VALIDATE))
+        self.assertNotIn(r'Labels \"', combined)
+        self.assertEqual(
+            combined.count("--format '{{ index .Config.Labels \"org.openhands.connector.stage\" }}'"),
+            2,
+        )
+        self.assertEqual(
+            combined.count("--format '{{ index .Config.Labels \"org.openhands.connector.source\" }}'"),
+            3,
+        )
 
     def test_recovery_requires_real_rollback_reinstall_cycle(self):
         recovery = (ROOT / "README.md").read_text(encoding="utf-8")

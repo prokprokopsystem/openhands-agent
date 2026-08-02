@@ -88,7 +88,7 @@ done
 ok "Broker connector files: root:10001 0640"
 
 docker image inspect "${CONNECTOR_IMAGE}" >/dev/null 2>&1 || fail "Connector image отсутствует"
-[ "$(docker image inspect --format '{{ index .Config.Labels \"org.openhands.connector.stage\" }}' "${CONNECTOR_IMAGE}")" = "4D.4" ] \
+[ "$(docker image inspect --format '{{ index .Config.Labels "org.openhands.connector.stage" }}' "${CONNECTOR_IMAGE}")" = "4D.4" ] \
     || fail "Connector image label mismatch"
 [ -f "${CONNECTOR_STATE}" ] && [ ! -L "${CONNECTOR_STATE}" ] \
     || fail "Connector state отсутствует или является symlink"
@@ -96,7 +96,7 @@ docker image inspect "${CONNECTOR_IMAGE}" >/dev/null 2>&1 || fail "Connector ima
     || fail "Connector state metadata mismatch"
 CONNECTOR_COMMIT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["commit"])' "${CONNECTOR_STATE}")"
 CONNECTOR_IMAGE_ID="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["image_id"])' "${CONNECTOR_STATE}")"
-[ "$(docker image inspect --format '{{ index .Config.Labels \"org.openhands.connector.source\" }}' "${CONNECTOR_IMAGE}")" = "${CONNECTOR_COMMIT}" ] \
+[ "$(docker image inspect --format '{{ index .Config.Labels "org.openhands.connector.source" }}' "${CONNECTOR_IMAGE}")" = "${CONNECTOR_COMMIT}" ] \
     || fail "Connector image source mismatch"
 [ "$(docker image inspect --format '{{.Id}}' "${CONNECTOR_IMAGE}")" = "${CONNECTOR_IMAGE_ID}" ] \
     || fail "Connector image ID mismatch"

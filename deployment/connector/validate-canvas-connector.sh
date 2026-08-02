@@ -37,7 +37,7 @@ for _ in $(seq 1 60); do
 done
 [ "$(docker inspect --format '{{.State.Health.Status}}' openhands-agent)" = "healthy" ] || fail "Canvas container is not healthy"
 [ "$(docker inspect --format '{{.Config.Image}}' openhands-agent)" = "${IMAGE}" ] || fail "Canvas is not using the connector image"
-[ "$(docker image inspect --format '{{ index .Config.Labels \"org.openhands.connector.source\" }}' "${IMAGE}")" = "${COMMIT_SHA}" ] \
+[ "$(docker image inspect --format '{{ index .Config.Labels "org.openhands.connector.source" }}' "${IMAGE}")" = "${COMMIT_SHA}" ] \
     || fail "Connector image source label mismatch"
 
 mounts="$(docker inspect --format '{{json .Mounts}}' openhands-agent)"
