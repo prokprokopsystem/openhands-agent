@@ -29,7 +29,7 @@ ok "wg0: 10.77.0.2"
 [ -f "${COMPOSE_FILE}" ] || fail "${COMPOSE_FILE} не существует"
 ok "compose.yaml"
 
-for d in config secrets test-workspace logs; do
+for d in config secrets work-workspace logs; do
     DIR="${BASE}/${d}"
     [ -d "${DIR}" ] || fail "${DIR} не существует. Запустите prepare.sh"
     P=$(stat -c "%a" "${DIR}")
@@ -37,7 +37,7 @@ for d in config secrets test-workspace logs; do
 done
 ok "Каталоги: 700"
 
-for d in config test-workspace; do
+for d in config work-workspace; do
     DIR="${BASE}/${d}"
     U=$(stat -c "%u" "${DIR}")
     G=$(stat -c "%g" "${DIR}")
