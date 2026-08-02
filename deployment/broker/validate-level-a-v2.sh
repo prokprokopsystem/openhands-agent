@@ -42,14 +42,27 @@ expected_sudo="${BROKER_USER} ALL=(${ADAPTER_USER}) NOPASSWD: ${BROKER_LIB}/adap
 visudo -c >/dev/null || fail "Sudoers configuration invalid"
 
 state="${BROKER_STATE}/install-state.json"
-python3 -c 'import json,sys; s=json.load(open(sys.argv[1], encoding="utf-8")); assert s["commit"]==sys.argv[2]; assert s["stage"]=="4D.3"' \
-    "${state}" "${COMMIT_SHA}" || fail "4D.3 install state mismatch"
-legacy_snapshot="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["legacy_snapshot"])' "${state}")"
-case "$(realpath -e -- "${legacy_snapshot}")" in
-    "${BROKER_STATE}/migrations/"*) ;;
-    *) fail "Install state references an untrusted migration snapshot" ;;
-esac
-sha256sum -c --status "${legacy_snapshot}/BASE-CANVAS.sha256" || fail "Base Canvas files changed"
+connector_state="${BROKER_STATE}/connector-state.json"
+if [ -f "${connector_state}" ] && [ ! -L "${connector_state}" ]; then
+    broker_commit="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["broker_commit"])' "${connector_state}")"
+    python3 -c 'import json,sys; s=json.load(open(sys.argv[1], encoding="utf-8")); assert s["commit"]==sys.argv[2]; assert s["stage"]=="4D.3"' \
+        "${state}" "${broker_commit}" || fail "4D.3 install state mismatch"
+    canonical_manifest="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["canonical_manifest"])' "${connector_state}")"
+    case "$(realpath -e -- "${canonical_manifest}")" in
+        "${BROKER_STATE}/connectors/"*/CANONICAL-CANVAS.sha256) ;;
+        *) fail "Connector canonical manifest is untrusted" ;;
+    esac
+    sha256sum -c --status "${canonical_manifest}" || fail "Canonical base + connector files changed"
+else
+    python3 -c 'import json,sys; s=json.load(open(sys.argv[1], encoding="utf-8")); assert s["commit"]==sys.argv[2]; assert s["stage"]=="4D.3"' \
+        "${state}" "${COMMIT_SHA}" || fail "4D.3 install state mismatch"
+    legacy_snapshot="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["legacy_snapshot"])' "${state}")"
+    case "$(realpath -e -- "${legacy_snapshot}")" in
+        "${BROKER_STATE}/migrations/"*) ;;
+        *) fail "Install state references an untrusted migration snapshot" ;;
+    esac
+    sha256sum -c --status "${legacy_snapshot}/BASE-CANVAS.sha256" || fail "Base Canvas files changed"
+fi
 
 request_health='{"version":1,"request_id":"123e4567-e89b-12d3-a456-426614174031","tool":"mini_server.health","params":{}}'
 response="$(printf '%s' "${request_health}" | runuser -u "${BROKER_USER}" -- \

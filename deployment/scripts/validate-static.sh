@@ -53,7 +53,12 @@ grep -q 'docker.sock' deployment/compose.yaml && fail "docker.sock найден 
 grep -q 'work-workspace' deployment/compose.yaml && pass "work-workspace : выделенный workspace" || fail "нет work-workspace"
 grep -q 'enable_ipv6: false' deployment/compose.yaml && pass "IPv6 отключён : сеть" || fail "IPv6 не отключён в сети"
 grep -q 'disable_ipv6' deployment/compose.yaml && pass "IPv6 отключён : sysctl" || fail "IPv6 sysctl отсутствует"
-grep -q 'sha256:fc24163754bee' deployment/compose.yaml && pass "digest зафиксирован" || fail "digest отсутствует"
+grep -q 'openhands-agent-canvas-broker:1.6.1-4d4' deployment/compose.yaml && pass "connector image tag зафиксирован" || fail "connector image tag отсутствует"
+grep -q 'pull_policy: never' deployment/compose.yaml && pass "connector image: pull запрещён" || fail "connector image: pull_policy не зафиксирован"
+grep -q 'sha256:fc24163754bee' deployment/connector/Dockerfile && pass "base digest зафиксирован в connector image" || fail "connector base digest отсутствует"
+grep -q 'openssh-client=1:10.0p1-7+deb13u4' deployment/connector/Dockerfile && pass "OpenSSH package version зафиксирован" || fail "OpenSSH package version не зафиксирован"
+grep -q 'openhands-broker-v2/id_ed25519.*:ro' deployment/compose.yaml && pass "broker key mount: read-only" || fail "broker key mount отсутствует"
+grep -q 'client_known_hosts.*:ro' deployment/compose.yaml && pass "broker trust mount: read-only" || fail "broker trust mount отсутствует"
 
 echo ""
 echo "--- Recovery prepare invariants ---"
@@ -182,6 +187,9 @@ grep -q 'OPENHANDS-INPUT' "${FW}" && pass "firewall: OPENHANDS-INPUT" || fail "f
 grep -q 'ESTABLISHED,RELATED' "${FW}" && pass "firewall: ESTABLISHED,RELATED" || fail "firewall: нет ESTABLISHED,RELATED"
 grep -q '\-j DROP' "${FW}" && pass "firewall: финальный DROP" || fail "firewall: нет финального DROP"
 grep -q '95.217.239.148' "${FW}" && pass "firewall: VPS заблокирован" || fail "firewall: VPS не заблокирован"
+grep -q 'BROKER_ENDPOINT="10.89.0.1/32"' "${FW}" && pass "firewall: exact broker endpoint" || fail "firewall: broker endpoint отсутствует"
+grep -q -- '--dport 22.*--ctstate NEW.*RETURN' "${FW}" && pass "firewall: broker egress allow" || fail "firewall: broker egress allow отсутствует"
+grep -q -- '--dport 22.*--ctstate NEW.*ACCEPT' "${FW}" && pass "firewall: broker input allow" || fail "firewall: broker input allow отсутствует"
 
 # ── 9. Secrets ──
 echo ""

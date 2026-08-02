@@ -18,6 +18,8 @@ ok() { printf '  [OK] %s\n' "$1"; }
 [ "$(id -u)" -eq 0 ] || fail "Run with sudo"
 [ "$#" -eq 2 ] && [ "${2}" = "--confirm" ] \
     || fail "Usage: $0 /var/lib/openhands-broker/updates/<exact-4d3-snapshot> --confirm"
+[ ! -e "${BROKER_STATE}/connector-state.json" ] \
+    || fail "Canvas Connector is installed; roll it back before rolling back 4D.3"
 [ -f "${INSTALL_STATE}" ] && [ ! -L "${INSTALL_STATE}" ] || fail "Broker install state missing or symlinked"
 SNAPSHOT="$(realpath -e -- "${SNAPSHOT_INPUT}")" || fail "4D.3 snapshot not found"
 case "${SNAPSHOT}" in

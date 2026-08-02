@@ -6,6 +6,10 @@ set -euo pipefail
 BASE="/srv/openhands-agent"
 COMPOSE_FILE="${BASE}/deployment/compose.yaml"
 SECRETS_FILE="${BASE}/secrets/.env"
+BROKER_KEY="${BASE}/secrets/openhands-broker-v2/id_ed25519"
+BROKER_TRUST="/etc/openhands-broker/client_known_hosts"
+CONNECTOR_IMAGE="openhands-agent-canvas-broker:1.6.1-4d4"
+CONNECTOR_STATE="/var/lib/openhands-broker/connector-state.json"
 CONTAINER_UID="10001"
 CONTAINER_GID="10001"
 HOST_UID="$(id -u igor)"
@@ -74,6 +78,29 @@ echo "${KEY}" | grep -q '\*\*\*' && fail "LOCAL_BACKEND_API_KEY содержит
 echo "${KEY}" | grep -q '[[:space:]]' && fail "LOCAL_BACKEND_API_KEY содержит пробелы" || true
 
 ok "LOCAL_BACKEND_API_KEY задан, длина ${#KEY}"
+
+for connector_file in "${BROKER_KEY}" "${BROKER_TRUST}"; do
+    [ -f "${connector_file}" ] && [ ! -L "${connector_file}" ] \
+        || fail "Connector file отсутствует или является symlink: ${connector_file}"
+    [ "$(stat -c '%u:%g:%a' "${connector_file}")" = "0:10001:640" ] \
+        || fail "Connector file metadata mismatch: ${connector_file}"
+done
+ok "Broker connector files: root:10001 0640"
+
+docker image inspect "${CONNECTOR_IMAGE}" >/dev/null 2>&1 || fail "Connector image отсутствует"
+[ "$(docker image inspect --format '{{ index .Config.Labels \"org.openhands.connector.stage\" }}' "${CONNECTOR_IMAGE}")" = "4D.4" ] \
+    || fail "Connector image label mismatch"
+[ -f "${CONNECTOR_STATE}" ] && [ ! -L "${CONNECTOR_STATE}" ] \
+    || fail "Connector state отсутствует или является symlink"
+[ "$(stat -c '%U:%G:%a' "${CONNECTOR_STATE}")" = "root:root:600" ] \
+    || fail "Connector state metadata mismatch"
+CONNECTOR_COMMIT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["commit"])' "${CONNECTOR_STATE}")"
+CONNECTOR_IMAGE_ID="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["image_id"])' "${CONNECTOR_STATE}")"
+[ "$(docker image inspect --format '{{ index .Config.Labels \"org.openhands.connector.source\" }}' "${CONNECTOR_IMAGE}")" = "${CONNECTOR_COMMIT}" ] \
+    || fail "Connector image source mismatch"
+[ "$(docker image inspect --format '{{.Id}}' "${CONNECTOR_IMAGE}")" = "${CONNECTOR_IMAGE_ID}" ] \
+    || fail "Connector image ID mismatch"
+ok "Connector image"
 
 for s in run-supervised.sh health-watchdog.sh prepare.sh; do
     [ -f "${BASE}/deployment/scripts/${s}" ] || fail "${s} не найден"

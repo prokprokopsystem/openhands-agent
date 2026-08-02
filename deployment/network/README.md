@@ -12,12 +12,13 @@
 Разрешены:
 
 - ответы `ESTABLISHED,RELATED`;
+- только `10.89.0.2 → 10.89.0.1:22` для forced-command broker;
 - DNS TCP/UDP 53;
 - внешний HTTP/HTTPS TCP 80/443.
 
 Запрещены:
 
-- mini-server и Docker gateway;
+- mini-server и Docker gateway, кроме точного broker endpoint `10.89.0.1:22`;
 - WireGuard и сети `10.0.0.0/8`;
 - LAN `192.168.0.0/16`;
 - чужие Docker-сети `172.16.0.0/12`;
@@ -49,7 +50,7 @@
 bash /srv/openhands-agent/deployment/network/check-egress.sh
 ```
 
-Скрипт сам выполняет сетевые команды через `docker exec openhands-agent`. Он проверяет внешний HTTPS и блокировку AMNESIA, Nextcloud, SSH mini-server, Docker gateway, LAN-роутера, VPS, публичного SSH и IPv6.
+Скрипт сам выполняет сетевые команды через `docker exec openhands-agent`. Он проверяет доступность только broker SSH на Docker gateway, внешний HTTPS и блокировку AMNESIA, Nextcloud, альтернативного SSH mini-server, LAN-роутера, VPS, публичного SSH и IPv6.
 
 ## Аварийное удаление правил
 
