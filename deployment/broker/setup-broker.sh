@@ -29,6 +29,7 @@ BROKER_PORT="22"
 COMPOSE_TARGET="/srv/openhands-agent/deployment/compose.yaml"
 PREPARE_TARGET="/srv/openhands-agent/deployment/scripts/prepare.sh"
 VALIDATE_RUNTIME_TARGET="/srv/openhands-agent/deployment/scripts/validate-runtime.sh"
+HEALTH_WATCHDOG_TARGET="/srv/openhands-agent/deployment/scripts/health-watchdog.sh"
 SEED_CONFIG_TARGET="/srv/openhands-agent/deployment/scripts/seed-config.sh"
 SETTINGS_TEMPLATE_TARGET="/srv/openhands-agent/deployment/config/settings.json"
 DEEPSEEK_TEMPLATE_TARGET="/srv/openhands-agent/deployment/config/profiles/deepseek-chat.json"
@@ -43,13 +44,14 @@ AUTHORIZED_PREVIOUS_VALIDATE_RUNTIME_HASHES=(
     "11707aa434ceb324dec704b3e47374604a2f45c6"
     "664a64f0be8647de8e3b5d79a56e18644b8c5926"
 )
+AUTHORIZED_PREVIOUS_HEALTH_WATCHDOG_HASH="5f0233e76b37d785144390e6370e0ba2d0755b4f"
 LOCK_DIR="/run/lock/openhands-broker"
 LOCKFILE="${LOCK_DIR}/setup.lock"
-HOST_SCAN_TMP=""
 KNOWN_HOSTS_TMP=""
 COMPOSE_TMP=""
 PREPARE_TMP=""
 VALIDATE_RUNTIME_TMP=""
+HEALTH_WATCHDOG_TMP=""
 SEED_CONFIG_TMP=""
 SETTINGS_TEMPLATE_TMP=""
 DEEPSEEK_TEMPLATE_TMP=""
@@ -95,9 +97,10 @@ require_absent_or_current_runtime_target() {
 [ "$(id -u)" -eq 0 ] || fail "Run with sudo"
 
 cleanup() {
-    rm -f "${HOST_SCAN_TMP:-}" "${KNOWN_HOSTS_TMP:-}" \
+    rm -f "${KNOWN_HOSTS_TMP:-}" \
         "${COMPOSE_TMP:-}" "${PREPARE_TMP:-}" \
-        "${VALIDATE_RUNTIME_TMP:-}" "${SUDOERS_TMP:-}" \
+        "${VALIDATE_RUNTIME_TMP:-}" "${HEALTH_WATCHDOG_TMP:-}" \
+        "${SUDOERS_TMP:-}" \
         "${SEED_CONFIG_TMP:-}" "${SETTINGS_TEMPLATE_TMP:-}" \
         "${DEEPSEEK_TEMPLATE_TMP:-}" "${DEFAULT_AGENT_TEMPLATE_TMP:-}" \
         "${SSHD_CANDIDATE:-}" "${SSHD_TMP:-}" "${SSHD_OLD:-}"
@@ -130,6 +133,7 @@ for source_path in \
     deployment/compose.yaml \
     deployment/scripts/prepare.sh \
     deployment/scripts/validate-runtime.sh \
+    deployment/scripts/health-watchdog.sh \
     deployment/scripts/seed-config.sh \
     deployment/config/settings.json \
     deployment/config/profiles/deepseek-chat.json \
@@ -183,33 +187,19 @@ LOCAL_HOST_FINGERPRINT="$(ssh-keygen -lf "${HOST_KEY_PUBLIC}" -E sha256 | awk 'N
 [ "${DERIVED_HOST_FINGERPRINT}" = "${LOCAL_HOST_FINGERPRINT}" ] \
     || fail "SSH host public key does not match its private key"
 
-HOST_SCAN_TMP="$(mktemp /run/openhands-broker-host-scan.XXXXXX)"
-ssh-keyscan -4 -T 5 -p "${BROKER_PORT}" -t ed25519 "${BROKER_HOST}" \
-    > "${HOST_SCAN_TMP}" 2>/dev/null \
-    || fail "Cannot read live ED25519 host key from ${BROKER_HOST}:${BROKER_PORT}"
-mapfile -t OBSERVED_HOST_KEYS < <(
-    awk '$2 == "ssh-ed25519" { print $2 " " $3 }' "${HOST_SCAN_TMP}" | sort -u
-)
-[ "${#OBSERVED_HOST_KEYS[@]}" -eq 1 ] \
-    || fail "Expected exactly one live ED25519 host key"
-OBSERVED_HOST_FINGERPRINT="$(ssh-keygen -lf "${HOST_SCAN_TMP}" -E sha256 | awk 'NR == 1 {print $2}')"
-[ -n "${OBSERVED_HOST_FINGERPRINT}" ] \
-    || fail "Cannot fingerprint live SSH host key"
-[ "${OBSERVED_HOST_FINGERPRINT}" = "${LOCAL_HOST_FINGERPRINT}" ] \
-    || fail "Live SSH host fingerprint does not match mini-server sshd host key"
-rm -f "${HOST_SCAN_TMP}"
-HOST_SCAN_TMP=""
-ok "Pinned ED25519 host key verified for ${BROKER_HOST}:${BROKER_PORT}"
+ok "Pinned ED25519 trust anchor verified from local sshd private/public key"
 
 COMPOSE_SOURCE="${SCRIPT_DIR}/../compose.yaml"
 PREPARE_SOURCE="${SCRIPT_DIR}/../scripts/prepare.sh"
 VALIDATE_RUNTIME_SOURCE="${SCRIPT_DIR}/../scripts/validate-runtime.sh"
+HEALTH_WATCHDOG_SOURCE="${SCRIPT_DIR}/../scripts/health-watchdog.sh"
 SEED_CONFIG_SOURCE="${SCRIPT_DIR}/../scripts/seed-config.sh"
 SETTINGS_TEMPLATE_SOURCE="${SCRIPT_DIR}/../config/settings.json"
 DEEPSEEK_TEMPLATE_SOURCE="${SCRIPT_DIR}/../config/profiles/deepseek-chat.json"
 DEFAULT_AGENT_TEMPLATE_SOURCE="${SCRIPT_DIR}/../config/agent-profiles/default.json"
 bash -n "${PREPARE_SOURCE}" || fail "prepare.sh candidate syntax is invalid"
 bash -n "${VALIDATE_RUNTIME_SOURCE}" || fail "validate-runtime.sh candidate syntax is invalid"
+bash -n "${HEALTH_WATCHDOG_SOURCE}" || fail "health-watchdog.sh candidate syntax is invalid"
 bash -n "${SEED_CONFIG_SOURCE}" || fail "seed-config.sh candidate syntax is invalid"
 require_authorized_runtime_target \
     "${COMPOSE_SOURCE}" "${COMPOSE_TARGET}" "compose.yaml" \
@@ -220,6 +210,9 @@ require_authorized_runtime_target \
 require_authorized_runtime_target \
     "${VALIDATE_RUNTIME_SOURCE}" "${VALIDATE_RUNTIME_TARGET}" "validate-runtime.sh" \
     "${AUTHORIZED_PREVIOUS_VALIDATE_RUNTIME_HASHES[@]}"
+require_authorized_runtime_target \
+    "${HEALTH_WATCHDOG_SOURCE}" "${HEALTH_WATCHDOG_TARGET}" "health-watchdog.sh" \
+    "${AUTHORIZED_PREVIOUS_HEALTH_WATCHDOG_HASH}"
 require_absent_or_current_runtime_target \
     "${SEED_CONFIG_SOURCE}" "${SEED_CONFIG_TARGET}" "seed-config.sh"
 require_absent_or_current_runtime_target \
@@ -356,6 +349,11 @@ cp "${VALIDATE_RUNTIME_SOURCE}" "${VALIDATE_RUNTIME_TMP}"
 chown --reference="${VALIDATE_RUNTIME_TARGET}" "${VALIDATE_RUNTIME_TMP}"
 chmod 0755 "${VALIDATE_RUNTIME_TMP}"
 
+HEALTH_WATCHDOG_TMP="$(mktemp /srv/openhands-agent/deployment/scripts/.health-watchdog.sh.XXXXXX)"
+cp "${HEALTH_WATCHDOG_SOURCE}" "${HEALTH_WATCHDOG_TMP}"
+chown --reference="${HEALTH_WATCHDOG_TARGET}" "${HEALTH_WATCHDOG_TMP}"
+chmod 0755 "${HEALTH_WATCHDOG_TMP}"
+
 # Новые deployment dependencies не затрагивают пользовательскую config в
 # /srv/openhands-agent/config. Отсутствующие target directories создаются
 # root-controlled; существующие файлы принимаются только при exact hash match.
@@ -395,6 +393,9 @@ require_authorized_runtime_target \
 require_authorized_runtime_target \
     "${VALIDATE_RUNTIME_SOURCE}" "${VALIDATE_RUNTIME_TARGET}" "validate-runtime.sh" \
     "${AUTHORIZED_PREVIOUS_VALIDATE_RUNTIME_HASHES[@]}"
+require_authorized_runtime_target \
+    "${HEALTH_WATCHDOG_SOURCE}" "${HEALTH_WATCHDOG_TARGET}" "health-watchdog.sh" \
+    "${AUTHORIZED_PREVIOUS_HEALTH_WATCHDOG_HASH}"
 require_absent_or_current_runtime_target \
     "${SEED_CONFIG_SOURCE}" "${SEED_CONFIG_TARGET}" "seed-config.sh"
 require_absent_or_current_runtime_target \
@@ -418,6 +419,8 @@ mv -f "${PREPARE_TMP}" "${PREPARE_TARGET}"
 PREPARE_TMP=""
 mv -f "${VALIDATE_RUNTIME_TMP}" "${VALIDATE_RUNTIME_TARGET}"
 VALIDATE_RUNTIME_TMP=""
+mv -f "${HEALTH_WATCHDOG_TMP}" "${HEALTH_WATCHDOG_TARGET}"
+HEALTH_WATCHDOG_TMP=""
 mv -f "${COMPOSE_TMP}" "${COMPOSE_TARGET}"
 COMPOSE_TMP=""
 ok "Complete prepare dependency chain and lifecycle files installed from verified commit"

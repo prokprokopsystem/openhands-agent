@@ -62,6 +62,7 @@ echo ""
 echo "--- Broker lifecycle persistence ---"
 PREPARE="deployment/scripts/prepare.sh"
 RUNTIME_VALIDATOR="deployment/scripts/validate-runtime.sh"
+HEALTH_WATCHDOG="deployment/scripts/health-watchdog.sh"
 BROKER_SETUP="deployment/broker/setup-broker.sh"
 grep -Fq 'chown -R "${HOST_OWNER}" "${BASE}/secrets"' "${PREPARE}" \
     && fail "prepare: recursive secrets chown ломает broker key" \
@@ -79,9 +80,19 @@ grep -Fq '[ "${BROKER_KEY_STATE}" = "0:10001:640" ]' "${RUNTIME_VALIDATOR}" \
     || fail "runtime: нет точной проверки broker SSH permissions"
 grep -Fq 'deployment/scripts/prepare.sh' "${BROKER_SETUP}" \
     && grep -Fq 'deployment/scripts/validate-runtime.sh' "${BROKER_SETUP}" \
+    && grep -Fq 'deployment/scripts/health-watchdog.sh' "${BROKER_SETUP}" \
     && grep -Fq 'diverges from every authorized update base' "${BROKER_SETUP}" \
     && pass "setup: lifecycle scripts delivered from authorized base" \
     || fail "setup: lifecycle delivery не fail-closed"
+if ! grep -Fq 'ssh-keyscan -4' "${BROKER_SETUP}" \
+    && grep -Fq 'ssh-keygen -y -f "${HOST_KEY_PRIVATE}"' "${BROKER_SETUP}" \
+    && grep -Fq '"${DERIVED_HOST_FINGERPRINT}" = "${LOCAL_HOST_FINGERPRINT}"' "${BROKER_SETUP}" \
+    && grep -Fq '"${SSH_KEYSCAN_BIN}" -4 -T 2 -p "${BROKER_PORT}" -t ed25519 "${BROKER_HOST}"' "${HEALTH_WATCHDOG}" \
+    && grep -Fq '"${observed_fingerprint}" != "${pinned_fingerprint}"' "${HEALTH_WATCHDOG}"; then
+    pass "setup: bridge-independent bootstrap + post-start pinned host-key verification"
+else
+    fail "setup: bootstrap/post-start host-key verification contract broken"
+fi
 if grep -Fq '"${SCRIPT_DIR}/seed-config.sh"' "${PREPARE}" \
     && grep -Fq 'Existing server-side Canvas config preserved' "${PREPARE}" \
     && grep -Fq 'deployment/scripts/seed-config.sh' "${BROKER_SETUP}" \
@@ -510,6 +521,9 @@ echo ""
 echo "--- Watchdog SIGTERM/no-child test ---"
 WATCHDOG_TEST_DIR=$(mktemp -d "${VALIDATION_TMP}/watchdog.XXXXXX")
 WATCHDOG_DOCKER="${WATCHDOG_TEST_DIR}/mock-docker"
+WATCHDOG_KEYSCAN="${WATCHDOG_TEST_DIR}/mock-ssh-keyscan"
+WATCHDOG_KEYGEN="${WATCHDOG_TEST_DIR}/mock-ssh-keygen"
+WATCHDOG_KNOWN_HOSTS="${WATCHDOG_TEST_DIR}/known_hosts"
 cat > "${WATCHDOG_DOCKER}" <<'EOF'
 #!/usr/bin/bash
 set -euo pipefail
@@ -527,10 +541,25 @@ case "$1" in
 esac
 EOF
 chmod +x "${WATCHDOG_DOCKER}"
+cat > "${WATCHDOG_KEYSCAN}" <<'EOF'
+#!/usr/bin/bash
+printf '%s\n' '10.89.0.1 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMockWatchdogKey'
+EOF
+cat > "${WATCHDOG_KEYGEN}" <<'EOF'
+#!/usr/bin/bash
+printf '%s\n' '256 SHA256:MockWatchdogFingerprint broker-host (ED25519)'
+EOF
+chmod +x "${WATCHDOG_KEYSCAN}" "${WATCHDOG_KEYGEN}"
+printf '%s\n' '[10.89.0.1]:22 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMockWatchdogKey' \
+    > "${WATCHDOG_KNOWN_HOSTS}"
 
 WATCHDOG_RC=0
 WATCHDOG_CHILD_PID=""
 DOCKER_BIN="${WATCHDOG_DOCKER}" \
+SSH_KEYSCAN_BIN="${WATCHDOG_KEYSCAN}" \
+SSH_KEYGEN_BIN="${WATCHDOG_KEYGEN}" \
+BROKER_KNOWN_HOSTS="${WATCHDOG_KNOWN_HOSTS}" \
+WATCHDOG_HOST_SCAN_TMP_DIR="${WATCHDOG_TEST_DIR}" \
 WATCHDOG_START_PERIOD=30 \
 WATCHDOG_CHECK_INTERVAL=30 \
 WATCHDOG_MAX_UNHEALTHY=3 \

@@ -378,6 +378,7 @@ def test_setup_atomically_delivers_authorized_lifecycle_scripts():
     for source in (
         "deployment/scripts/prepare.sh",
         "deployment/scripts/validate-runtime.sh",
+        "deployment/scripts/health-watchdog.sh",
         "deployment/scripts/seed-config.sh",
         "deployment/config/settings.json",
         "deployment/config/profiles/deepseek-chat.json",
@@ -387,6 +388,10 @@ def test_setup_atomically_delivers_authorized_lifecycle_scripts():
     assert 'PREPARE_TARGET="/srv/openhands-agent/deployment/scripts/prepare.sh"' in setup
     assert (
         'VALIDATE_RUNTIME_TARGET="/srv/openhands-agent/deployment/scripts/validate-runtime.sh"'
+        in setup
+    )
+    assert (
+        'HEALTH_WATCHDOG_TARGET="/srv/openhands-agent/deployment/scripts/health-watchdog.sh"'
         in setup
     )
     assert "77cece874846d56b058a9f0932f8188674ec11c3" in setup
@@ -399,6 +404,9 @@ def test_setup_atomically_delivers_authorized_lifecycle_scripts():
     )
     assert setup.index('VALIDATE_RUNTIME_TMP="$(mktemp') < setup.index(
         'mv -f "${VALIDATE_RUNTIME_TMP}" "${VALIDATE_RUNTIME_TARGET}"'
+    )
+    assert setup.index('HEALTH_WATCHDOG_TMP="$(mktemp') < setup.index(
+        'mv -f "${HEALTH_WATCHDOG_TMP}" "${HEALTH_WATCHDOG_TARGET}"'
     )
 
 
@@ -683,23 +691,29 @@ def test_compose_mounts_only_pinned_broker_ssh_files():
 
 def test_pinned_known_hosts_is_verified_and_root_controlled():
     setup = os.path.join(os.path.dirname(__file__), "..", "setup-broker.sh")
+    watchdog = os.path.join(REPO_ROOT, "deployment", "scripts", "health-watchdog.sh")
     with open(setup) as f:
         content = f.read()
+    with open(watchdog) as f:
+        watchdog_content = f.read()
     assert 'HOST_KEY_PUBLIC="/etc/ssh/ssh_host_ed25519_key.pub"' in content
     assert 'HOST_KEY_PRIVATE="/etc/ssh/ssh_host_ed25519_key"' in content
     assert 'ssh-keygen -y -f "${HOST_KEY_PRIVATE}"' in content
-    assert 'ssh-keyscan -4 -T 5 -p "${BROKER_PORT}" -t ed25519 "${BROKER_HOST}"' in content
+    assert 'ssh-keyscan -4' not in content
     assert '"${DERIVED_HOST_FINGERPRINT}" = "${LOCAL_HOST_FINGERPRINT}"' in content
-    assert '"${OBSERVED_HOST_FINGERPRINT}" = "${LOCAL_HOST_FINGERPRINT}"' in content
     assert '"${DERIVED_HOST_KEY}" = "${LOCAL_HOST_KEY}"' not in content
-    assert '"${OBSERVED_HOST_KEY}" = "${LOCAL_HOST_KEY}"' not in content
     assert 'CLIENT_KNOWN_HOSTS="${BROKER_ETC}/client_known_hosts"' in content
     assert 'chown root:10001 "${KNOWN_HOSTS_TMP}"' in content
     assert 'chmod 0640 "${KNOWN_HOSTS_TMP}"' in content
     assert 'stat -c \'%u:%g:%a\' "${BROKER_ETC}"' in content
     assert 'Pinned known_hosts parent is not root-controlled' in content
+    assert 'BROKER_KNOWN_HOSTS="${BROKER_KNOWN_HOSTS:-/etc/openhands-broker/client_known_hosts}"' in watchdog_content
+    assert '"${SSH_KEYSCAN_BIN}" -4 -T 2 -p "${BROKER_PORT}" -t ed25519 "${BROKER_HOST}"' in watchdog_content
+    assert '"${observed_fingerprint}" != "${pinned_fingerprint}"' in watchdog_content
     assert "accept-new" not in content
     assert "StrictHostKeyChecking=no" not in content
+    assert "accept-new" not in watchdog_content
+    assert "StrictHostKeyChecking=no" not in watchdog_content
 
 
 def test_host_key_fingerprint_ignores_comment_and_line_ending():
@@ -743,17 +757,119 @@ def test_host_key_fingerprint_ignores_comment_and_line_ending():
         assert derived_fingerprint == public_fingerprint
 
 
-def test_host_key_mismatch_is_fail_closed_before_install():
+def test_host_key_mismatch_is_fail_closed_after_runtime_start():
     setup = os.path.join(os.path.dirname(__file__), "..", "setup-broker.sh")
+    watchdog = os.path.join(REPO_ROOT, "deployment", "scripts", "health-watchdog.sh")
     with open(setup) as f:
         content = f.read()
-    mismatch = content.index("Live SSH host fingerprint does not match")
-    install = content.index('mv -f "${KNOWN_HOSTS_TMP}" "${CLIENT_KNOWN_HOSTS}"')
-    assert mismatch < install
+    with open(watchdog) as f:
+        watchdog_content = f.read()
+    assert "Cannot read live ED25519 host key" not in content
+    assert "Live SSH host fingerprint does not match" not in content
+    assert 'verify_broker_host_key' in watchdog_content
+    assert 'Live broker SSH host key не совпадает с pinned key' in watchdog_content
+    container_check = watchdog_content.index(
+        'if ! "${DOCKER_BIN}" ps --format \'{{.Names}}\''
+    )
+    live_verify = watchdog_content.index("verify_broker_host_key", container_check)
+    assert container_check < live_verify
     runtime = os.path.join(REPO_ROOT, "deployment", "scripts", "validate-runtime.sh")
     with open(runtime) as f:
         runtime_content = f.read()
     assert "Pinned broker host key mismatch; refusing to start Canvas" in runtime_content
+
+
+def test_stopped_service_without_bridge_can_bootstrap_then_verify_endpoint():
+    setup = os.path.join(os.path.dirname(__file__), "..", "setup-broker.sh")
+    watchdog = os.path.join(REPO_ROOT, "deployment", "scripts", "health-watchdog.sh")
+    supervisor = os.path.join(REPO_ROOT, "deployment", "scripts", "run-supervised.sh")
+    with open(setup) as f:
+        setup_content = f.read()
+    with open(watchdog) as f:
+        watchdog_content = f.read()
+    with open(supervisor) as f:
+        supervisor_content = f.read()
+
+    assert 'ssh-keyscan -4' not in setup_content
+    assert '"${DERIVED_HOST_FINGERPRINT}" = "${LOCAL_HOST_FINGERPRINT}"' in setup_content
+    assert 'mv -f "${KNOWN_HOSTS_TMP}" "${CLIENT_KNOWN_HOSTS}"' in setup_content
+    assert 'deployment/scripts/health-watchdog.sh' in setup_content
+    assert 'mv -f "${HEALTH_WATCHDOG_TMP}" "${HEALTH_WATCHDOG_TARGET}"' in setup_content
+
+    container_found = watchdog_content.index('echo "[watchdog] Контейнер найден."')
+    endpoint_verify = watchdog_content.index("verify_broker_host_key", container_found)
+    endpoint_scan = watchdog_content.index('"${SSH_KEYSCAN_BIN}" -4 -T 2')
+    assert container_found < endpoint_verify
+    assert endpoint_scan < endpoint_verify
+    assert 'HOST_KEY_RETRIES="${WATCHDOG_HOST_KEY_RETRIES:-10}"' in watchdog_content
+    assert 'return 1' in watchdog_content[endpoint_scan:endpoint_verify]
+    assert (
+        'WATCHDOG="${WATCHDOG:-/srv/openhands-agent/deployment/scripts/health-watchdog.sh}"'
+        in supervisor_content
+    )
+
+
+def test_watchdog_verifies_live_endpoint_and_rejects_mismatch():
+    watchdog = os.path.join(REPO_ROOT, "deployment", "scripts", "health-watchdog.sh")
+    with tempfile.TemporaryDirectory() as test_dir:
+        docker = os.path.join(test_dir, "docker")
+        keyscan = os.path.join(test_dir, "ssh-keyscan")
+        keygen = os.path.join(test_dir, "ssh-keygen")
+        known_hosts = os.path.join(test_dir, "known_hosts")
+        with open(docker, "w") as f:
+            f.write(
+                "#!/usr/bin/bash\n"
+                "if [ \"$1\" = ps ]; then echo openhands-agent; exit 0; fi\n"
+                "if [ \"$1\" = inspect ]; then echo unknown; exit 0; fi\n"
+                "exit 2\n"
+            )
+        with open(keyscan, "w") as f:
+            f.write(
+                "#!/usr/bin/bash\n"
+                "echo '10.89.0.1 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMockKey'\n"
+            )
+        with open(known_hosts, "w") as f:
+            f.write("[10.89.0.1]:22 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMockKey\n")
+        os.chmod(docker, 0o755)
+        os.chmod(keyscan, 0o755)
+
+        def run_watchdog(observed_fingerprint):
+            with open(keygen, "w") as f:
+                f.write(
+                    "#!/usr/bin/bash\n"
+                    "case \"$2\" in\n"
+                    f"  {known_hosts}) fingerprint=SHA256:Pinned ;;\n"
+                    f"  *) fingerprint={observed_fingerprint} ;;\n"
+                    "esac\n"
+                    "echo \"256 $fingerprint broker-host (ED25519)\"\n"
+                )
+            os.chmod(keygen, 0o755)
+            env = os.environ.copy()
+            env.update({
+                "DOCKER_BIN": docker,
+                "SSH_KEYSCAN_BIN": keyscan,
+                "SSH_KEYGEN_BIN": keygen,
+                "BROKER_KNOWN_HOSTS": known_hosts,
+                "WATCHDOG_START_PERIOD": "0",
+                "WATCHDOG_HOST_KEY_RETRIES": "1",
+                "WATCHDOG_HOST_SCAN_TMP_DIR": test_dir,
+            })
+            return subprocess.run(
+                ["bash", watchdog],
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=5,
+            )
+
+        matching = run_watchdog("SHA256:Pinned")
+        assert "Broker SSH host key подтверждён" in matching.stdout, (
+            matching.stdout + matching.stderr
+        )
+        mismatch = run_watchdog("SHA256:Mismatch")
+        assert mismatch.returncode == 1
+        assert "не совпадает с pinned key" in mismatch.stdout
+        assert "Broker SSH host key подтверждён" not in mismatch.stdout
 
 
 def test_broker_client_keeps_strict_host_key_checking():
