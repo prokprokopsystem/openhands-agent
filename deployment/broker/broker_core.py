@@ -253,18 +253,28 @@ class AdapterRunner:
     RESULT_STATUSES = {"not_applicable", "not_run", "passed", "failed", "available", "succeeded"}
 
     def __init__(self, root: Path) -> None:
-        self.executables = {"core": root / "adapters" / "core-adapter"}
+        self.commands = {
+            "core": (str(root / "adapters" / "core-adapter"),),
+            "mini-server": (
+                "/usr/bin/sudo",
+                "-n",
+                "-u",
+                "openhands-adapter-mini-server",
+                "--",
+                str(root / "adapters" / "mini-server-adapter"),
+            ),
+        }
 
     def execute(self, tool: Tool, request: dict[str, Any]) -> dict[str, Any]:
-        executable = self.executables.get(tool.adapter)
-        if executable is None:
+        command = self.commands.get(tool.adapter)
+        if command is None:
             raise BrokerError("adapter_unavailable", "adapter is not installed", status="error")
         payload = compact_json(request)
         if len(payload) > MAX_REQUEST_BYTES:
             raise BrokerError("adapter_request_too_large", "adapter request exceeds limit", status="error")
         try:
             process = subprocess.Popen(
-                [str(executable)],
+                list(command),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,

@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "tools": [
+    {
+      "name": "mini_server.health",
+      "target": "mini-server",
+      "adapter": "mini-server",
+      "operation": "health",
+      "risk": "A",
+      "params": {},
+      "timeout_seconds": 8,
+      "max_output_bytes": 16384
+    },
+    {
+      "name": "mini_server.filesystem_usage",
+      "target": "mini-server",
+      "adapter": "mini-server",
+      "operation": "filesystem_usage",
+      "risk": "A",
+      "params": {
+        "path": {
+          "type": "string",
+          "required": true,
+          "enum": ["/", "/srv/openhands-agent"]
+        }
+      },
+      "timeout_seconds": 5,
+      "max_output_bytes": 8192
+    }
+  ]
+}

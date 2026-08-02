@@ -1,0 +1,147 @@
+#!/usr/bin/python3
+"""Credential-free read-only mini-server adapter for stage 4D.3."""
+
+from __future__ import annotations
+
+import http.client
+import json
+import os
+import subprocess
+import sys
+from typing import Any
+
+
+MAX_REQUEST_BYTES = 16 * 1024
+MAX_RESPONSE_BYTES = 16 * 1024
+EXPECTED_FIELDS = {"version", "request_id", "target", "operation", "params"}
+SAFE_ENV = {
+    "PATH": "/usr/bin:/bin",
+    "HOME": "/nonexistent",
+    "LANG": "C.UTF-8",
+    "LC_ALL": "C.UTF-8",
+}
+ALLOWED_FILESYSTEMS = {"/", "/srv/openhands-agent"}
+
+
+class InvalidRequest(ValueError):
+    pass
+
+
+def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise InvalidRequest("duplicate key")
+        result[key] = value
+    return result
+
+
+def reject_non_finite(value: str) -> None:
+    raise InvalidRequest(f"non-finite number: {value}")
+
+
+def emit(value: dict[str, Any]) -> int:
+    raw = json.dumps(value, allow_nan=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    if len(raw) > MAX_RESPONSE_BYTES:
+        raw = b'{"error":{"code":"response_too_large"},"status":"error"}'
+    sys.stdout.buffer.write(raw + b"\n")
+    return 0 if value.get("status") == "ok" else 2
+
+
+def reject(code: str = "invalid_request") -> int:
+    return emit({"status": "error", "error": {"code": code}})
+
+
+def fixed_output(argv: list[str]) -> str:
+    completed = subprocess.run(
+        argv,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        env=SAFE_ENV,
+        timeout=3,
+        check=False,
+    )
+    if completed.returncode != 0 or len(completed.stdout) > 256:
+        raise RuntimeError("fixed read-only probe failed")
+    return completed.stdout.decode("utf-8", errors="strict").strip()
+
+
+def filesystem_usage(path: str) -> dict[str, int | str]:
+    if path not in ALLOWED_FILESYSTEMS:
+        raise InvalidRequest("filesystem path is not allowed")
+    stats = os.statvfs(path)
+    total = stats.f_blocks * stats.f_frsize
+    available = stats.f_bavail * stats.f_frsize
+    return {"path": path, "total_bytes": total, "available_bytes": available, "used_bytes": total - available}
+
+
+def canvas_http_status() -> int:
+    connection = http.client.HTTPConnection("10.77.0.2", 8000, timeout=3)
+    try:
+        connection.request("GET", "/canvas")
+        response = connection.getresponse()
+        return response.status
+    finally:
+        connection.close()
+
+
+def health() -> dict[str, Any]:
+    with open("/proc/uptime", "r", encoding="ascii") as handle:
+        uptime_seconds = int(float(handle.read().split()[0]))
+    with open("/proc/loadavg", "r", encoding="ascii") as handle:
+        load_1m = float(handle.read().split()[0])
+    return {
+        "uptime_seconds": uptime_seconds,
+        "load_1m": load_1m,
+        "root_filesystem": filesystem_usage("/"),
+        "canvas_service": {
+            "active_state": fixed_output(["/usr/bin/systemctl", "show", "openhands-agent.service", "--property=ActiveState", "--value"]),
+            "sub_state": fixed_output(["/usr/bin/systemctl", "show", "openhands-agent.service", "--property=SubState", "--value"]),
+            "http_status": canvas_http_status(),
+        },
+    }
+
+
+def success(result: dict[str, Any]) -> int:
+    return emit(
+        {
+            "status": "ok",
+            "result": result,
+            "result_code": "ok",
+            "verify": {"status": "not_applicable"},
+            "rollback": {"status": "not_applicable"},
+        }
+    )
+
+
+def main() -> int:
+    raw = sys.stdin.buffer.read(MAX_REQUEST_BYTES + 1)
+    if not raw or len(raw) > MAX_REQUEST_BYTES:
+        return reject()
+    try:
+        request = json.loads(
+            raw.decode("utf-8", errors="strict"),
+            object_pairs_hook=unique_object,
+            parse_constant=reject_non_finite,
+        )
+        if not isinstance(request, dict) or set(request) != EXPECTED_FIELDS:
+            raise InvalidRequest("invalid fields")
+        if type(request["version"]) is not int or request["version"] != 1:
+            raise InvalidRequest("invalid version")
+        if request["target"] != "mini-server" or not isinstance(request["params"], dict):
+            raise InvalidRequest("invalid target or params")
+        if request["operation"] == "health" and request["params"] == {}:
+            return success(health())
+        if request["operation"] == "filesystem_usage" and set(request["params"]) == {"path"}:
+            path = request["params"]["path"]
+            if not isinstance(path, str):
+                raise InvalidRequest("invalid path")
+            return success(filesystem_usage(path))
+        raise InvalidRequest("unknown operation")
+    except (InvalidRequest, UnicodeDecodeError, ValueError, OSError, RuntimeError, subprocess.SubprocessError, http.client.HTTPException):
+        return reject()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

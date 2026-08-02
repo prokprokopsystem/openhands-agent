@@ -67,3 +67,26 @@ sudo deployment/broker/rollback-broker-v1.sh \
 
 `uninstall-broker-v2.sh --confirm` removes only v2 broker identities and artifacts. It
 preserves migration snapshots, the frozen legacy keypair, and the separate v2 keypair.
+
+## 4D.3 mini-server Level A
+
+`install-level-a-v2.sh` is a separate transactional update anchored to the completed
+4D.2 commit. It installs the fixed `mini-server-adapter`, its metadata-only registry,
+and one sudoers rule that lets broker core execute only that root-owned adapter, with
+no command-line arguments, as `openhands-adapter-mini-server`. Request data remains
+bounded JSON on stdin; the adapter exposes only fixed read-only health and filesystem
+usage operations.
+
+```sh
+sudo deployment/broker/install-level-a-v2.sh <full-commit-sha> --preflight-only
+sudo deployment/broker/install-level-a-v2.sh <full-commit-sha>
+sudo deployment/broker/validate-level-a-v2.sh <full-commit-sha>
+```
+
+The installer prints an exact root-only update snapshot. Manual rollback requires that
+same path and restores the completed 4D.2 broker state without touching base Canvas:
+
+```sh
+sudo deployment/broker/rollback-level-a-v2.sh \
+  /var/lib/openhands-broker/updates/<exact-4d3-snapshot> --confirm
+```

@@ -253,7 +253,7 @@ class AdapterBoundaryTests(unittest.TestCase):
             )
             os.chmod(executable, 0o755)
             runner = AdapterRunner(ROOT)
-            runner.executables["core"] = executable
+            runner.commands["core"] = (str(executable),)
             tool = Tool("core.ping", "core", "core", "ping", "A", {}, 5, 256)
             with self.assertRaises(BrokerError) as caught:
                 runner.execute(tool, {"version": 1})
@@ -275,7 +275,7 @@ class AdapterBoundaryTests(unittest.TestCase):
             )
             os.chmod(executable, 0o755)
             runner = AdapterRunner(ROOT)
-            runner.executables["core"] = executable
+            runner.commands["core"] = (str(executable),)
             tool = Tool("core.ping", "core", "core", "ping", "A", {}, 1, 256)
             with self.assertRaises(BrokerError) as caught:
                 runner.execute(tool, {"version": 1})
