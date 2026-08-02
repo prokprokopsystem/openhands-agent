@@ -1,7 +1,7 @@
 # Этап 4D — Архитектура broker
 
 **Версия:** 2.2 (2 августа 2026)
-**Статус:** ✅ `4D.0 REVIEW: PASS`; ✅ `4D.1 REVIEW: PASS`; 4D.2 remediation подготовлен после полного server audit, server migration не выполнялась
+**Статус:** ✅ `4D.0 REVIEW: PASS`; ✅ `4D.1 REVIEW: PASS`; первая 4D.2 migration attempt остановилась до замены frozen v1, keypair verification исправляется через SHA256 fingerprints
 **Основа:** проверенные идеи старого 4D из `fix/canonical-deployment`, без переноса его архитектурного расползания
 
 ---

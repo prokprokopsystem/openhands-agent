@@ -19,6 +19,7 @@ readonly LEGACY_CLIENT_PUBLIC_KEY="/srv/openhands-agent/secrets/broker-mini-serv
 readonly V2_CLIENT_DIR="/srv/openhands-agent/secrets/openhands-broker-v2"
 readonly V2_CLIENT_KEY="${V2_CLIENT_DIR}/id_ed25519"
 readonly V2_CLIENT_PUBLIC_KEY="${V2_CLIENT_DIR}/id_ed25519.pub"
+readonly KEYPAIR_VERIFIER="deployment/broker/verify-keypair-fingerprint.sh"
 readonly HOST_PUBLIC_KEY="/etc/ssh/ssh_host_ed25519_key.pub"
 readonly BROKER_ENDPOINT="10.89.0.1"
 readonly CANVAS_SOURCE="10.89.0.2"
@@ -175,7 +176,6 @@ preflight_legacy() {
 }
 
 preflight_v2_key_target() {
-    local derived_public stored_public
     if [ ! -e "${V2_CLIENT_DIR}" ]; then
         return
     fi
@@ -187,9 +187,8 @@ preflight_v2_key_target() {
     [ "$(stat -c '%u:%g:%a' "${V2_CLIENT_KEY}")" = "10001:10001:600" ] \
         || fail "Broker v2 private key metadata mismatch"
     require_regular "${V2_CLIENT_PUBLIC_KEY}" "root:root" "644"
-    derived_public="$(ssh-keygen -y -f "${V2_CLIENT_KEY}")" || fail "Cannot derive broker v2 public key"
-    stored_public="$(awk 'NF >= 2 {print $1 " " $2; exit}' "${V2_CLIENT_PUBLIC_KEY}")"
-    [ "${derived_public}" = "${stored_public}" ] || fail "Broker v2 private/public key mismatch"
+    "${KEYPAIR_VERIFIER}" "${V2_CLIENT_KEY}" "${V2_CLIENT_PUBLIC_KEY}" >/dev/null \
+        || fail "Broker v2 private/public fingerprint mismatch"
 }
 
 verify_source_commit() {
@@ -207,6 +206,7 @@ verify_source_commit() {
         deployment/broker/rollback-broker-v1.sh \
         deployment/broker/uninstall-broker-v2.sh \
         deployment/broker/validate-install-v2.sh \
+        deployment/broker/verify-keypair-fingerprint.sh \
         deployment/broker/bin/broker-launcher \
         deployment/broker/broker_core.py \
         deployment/broker/adapters/core-adapter \
@@ -234,7 +234,7 @@ verify_base_canvas_manifest() {
 }
 
 ensure_v2_keypair() {
-    local key_stage derived_public stored_public
+    local key_stage
     if [ -e "${V2_CLIENT_DIR}" ]; then
         preflight_v2_key_target
         ok "Existing exact broker v2 client keypair preserved and reused"
@@ -244,9 +244,8 @@ ensure_v2_keypair() {
     key_stage="$(mktemp -d /run/openhands-broker-v2-key.XXXXXX)"
     TEMP_PATHS+=("${key_stage}")
     ssh-keygen -q -t ed25519 -N '' -C openhands-broker-v2 -f "${key_stage}/id_ed25519"
-    derived_public="$(ssh-keygen -y -f "${key_stage}/id_ed25519")"
-    stored_public="$(awk 'NF >= 2 {print $1 " " $2; exit}' "${key_stage}/id_ed25519.pub")"
-    [ "${derived_public}" = "${stored_public}" ] || fail "Generated broker v2 keypair mismatch"
+    "${KEYPAIR_VERIFIER}" "${key_stage}/id_ed25519" "${key_stage}/id_ed25519.pub" >/dev/null \
+        || fail "Generated broker v2 keypair fingerprint mismatch"
 
     mkdir -m 0700 -- "${V2_CLIENT_DIR}"
     chown root:root "${V2_CLIENT_DIR}"

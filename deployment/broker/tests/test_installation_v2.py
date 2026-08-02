@@ -1,6 +1,7 @@
 import hashlib
 import re
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -11,6 +12,7 @@ INSTALL = (ROOT / "install-broker-v2.sh").read_text(encoding="utf-8")
 VALIDATE = (ROOT / "validate-install-v2.sh").read_text(encoding="utf-8")
 ROLLBACK = (ROOT / "rollback-broker-v1.sh").read_text(encoding="utf-8")
 UNINSTALL = (ROOT / "uninstall-broker-v2.sh").read_text(encoding="utf-8")
+KEYPAIR_VERIFIER = ROOT / "verify-keypair-fingerprint.sh"
 
 
 def function_body(source: str, name: str) -> str:
@@ -118,6 +120,38 @@ class ProtectedBoundaryTests(unittest.TestCase):
         self.assertIn("10001:10001:600", VALIDATE)
         self.assertIn("Broker v2 private key is missing or symlinked", INSTALL)
         self.assertIn("Broker v2 private key is missing or symlinked", VALIDATE)
+
+    def test_keypair_verifier_uses_fingerprints_and_rejects_real_mismatch(self):
+        verifier = KEYPAIR_VERIFIER.read_text(encoding="utf-8")
+        self.assertIn('ssh-keygen -y -f "${private_key}"', verifier)
+        self.assertIn("ssh-keygen -lf - -E sha256", verifier)
+        self.assertIn('ssh-keygen -lf "${public_key}" -E sha256', verifier)
+        self.assertIn("KEYPAIR_VERIFIER", INSTALL)
+        self.assertIn("KEYPAIR_VERIFIER", VALIDATE)
+
+        with tempfile.TemporaryDirectory() as directory:
+            first = Path(directory) / "first"
+            second = Path(directory) / "second"
+            for key in (first, second):
+                subprocess.run(
+                    ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key)],
+                    check=True,
+                )
+
+            matching = subprocess.run(
+                [str(KEYPAIR_VERIFIER), str(first), f"{first}.pub"],
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(matching.returncode, 0, matching.stderr)
+
+            mismatched = subprocess.run(
+                [str(KEYPAIR_VERIFIER), str(first), f"{second}.pub"],
+                text=True,
+                capture_output=True,
+            )
+            self.assertNotEqual(mismatched.returncode, 0)
+            self.assertIn("SSH keypair fingerprint mismatch", mismatched.stderr)
 
     def test_uninstall_and_rollback_do_not_reference_base_canvas(self):
         for source in (ROLLBACK, UNINSTALL):

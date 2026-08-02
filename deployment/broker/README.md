@@ -35,6 +35,11 @@ write. The apply path creates a separate v2 ED25519 client key under
 UID/GID `10001:10001` with mode `0600`. Existing legacy key files are never overwritten,
 renamed, chmodded, or deleted.
 
+Private/public v2 key correspondence is checked only by SHA256 fingerprints:
+`ssh-keygen -y -f PRIVATE | ssh-keygen -lf - -E sha256` is compared with
+`ssh-keygen -lf PUBLIC -E sha256`. Raw public-key strings and comments are not used as
+the equality contract.
+
 The migration creates a root-only snapshot under
 `/var/lib/openhands-broker/migrations/`, removes the legacy sudo grants, installs the
 root-owned v2 core/registry, creates isolated non-login adapter identities and empty
