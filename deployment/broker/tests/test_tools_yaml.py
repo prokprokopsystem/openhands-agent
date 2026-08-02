@@ -378,6 +378,10 @@ def test_setup_atomically_delivers_authorized_lifecycle_scripts():
     for source in (
         "deployment/scripts/prepare.sh",
         "deployment/scripts/validate-runtime.sh",
+        "deployment/scripts/seed-config.sh",
+        "deployment/config/settings.json",
+        "deployment/config/profiles/deepseek-chat.json",
+        "deployment/config/agent-profiles/default.json",
     ):
         assert source in setup
     assert 'PREPARE_TARGET="/srv/openhands-agent/deployment/scripts/prepare.sh"' in setup
@@ -386,6 +390,7 @@ def test_setup_atomically_delivers_authorized_lifecycle_scripts():
         in setup
     )
     assert "77cece874846d56b058a9f0932f8188674ec11c3" in setup
+    assert "6835ee74594890cfb66bca9d4ddcdb1b14baf3ec" in setup
     assert "11707aa434ceb324dec704b3e47374604a2f45c6" in setup
     assert "diverges from every authorized update base" in setup
     assert setup.count("require_authorized_runtime_target") >= 7
@@ -395,6 +400,59 @@ def test_setup_atomically_delivers_authorized_lifecycle_scripts():
     assert setup.index('VALIDATE_RUNTIME_TMP="$(mktemp') < setup.index(
         'mv -f "${VALIDATE_RUNTIME_TMP}" "${VALIDATE_RUNTIME_TARGET}"'
     )
+
+
+def test_clean_setup_installs_complete_prepare_dependency_chain():
+    setup_path = os.path.join(os.path.dirname(__file__), "..", "setup-broker.sh")
+    prepare_path = os.path.join(REPO_ROOT, "deployment", "scripts", "prepare.sh")
+    seed_path = os.path.join(REPO_ROOT, "deployment", "scripts", "seed-config.sh")
+    with open(setup_path) as f:
+        setup = f.read()
+    with open(prepare_path) as f:
+        prepare = f.read()
+    with open(seed_path) as f:
+        seed = f.read()
+
+    dependencies = {
+        "SEED_CONFIG_TARGET": "deployment/scripts/seed-config.sh",
+        "SETTINGS_TEMPLATE_TARGET": "deployment/config/settings.json",
+        "DEEPSEEK_TEMPLATE_TARGET": "deployment/config/profiles/deepseek-chat.json",
+        "DEFAULT_AGENT_TEMPLATE_TARGET": "deployment/config/agent-profiles/default.json",
+    }
+    for variable, relative_target in dependencies.items():
+        assert f'{variable}="/srv/openhands-agent/{relative_target}"' in setup
+        assert os.path.isfile(os.path.join(REPO_ROOT, relative_target))
+    assert 'TARGET="/srv/openhands-agent/config' not in setup
+
+    assert '"${SCRIPT_DIR}/seed-config.sh"' in prepare
+    assert '"${SCRIPT_DIR}/seed-config.sh" --force' not in prepare
+    assert 'find "${BASE}/config" -mindepth 1 -maxdepth 1 -print -quit' in prepare
+    assert "Existing server-side Canvas config preserved" in prepare
+    assert prepare.index("Existing server-side Canvas config preserved") < prepare.index(
+        '"${SCRIPT_DIR}/seed-config.sh"'
+    )
+    assert 'TEMPLATES="${SCRIPT_DIR}/../config"' in seed
+    assert 'TARGET="${BASE}/config"' in seed
+    assert 'if [ -f "${dst}" ] && [ "${FORCE}" != "true" ]' in seed
+    for source in (
+        '"${TEMPLATES}/settings.json"',
+        '"${TEMPLATES}/profiles/deepseek-chat.json"',
+        '"${TEMPLATES}/agent-profiles/default.json"',
+    ):
+        assert source in seed
+
+    assert "require_absent_or_current_runtime_target" in setup
+    assert 'if [ ! -e "${target_path}" ] && [ ! -L "${target_path}" ]; then' in setup
+    assert '[ "${target_hash}" = "${source_hash}" ]' in setup
+    assert "diverges from the verified commit" in setup
+    dependency_installs = [
+        setup.index('mv -f "${SETTINGS_TEMPLATE_TMP}" "${SETTINGS_TEMPLATE_TARGET}"'),
+        setup.index('mv -f "${DEEPSEEK_TEMPLATE_TMP}" "${DEEPSEEK_TEMPLATE_TARGET}"'),
+        setup.index('mv -f "${DEFAULT_AGENT_TEMPLATE_TMP}" "${DEFAULT_AGENT_TEMPLATE_TARGET}"'),
+        setup.index('mv -f "${SEED_CONFIG_TMP}" "${SEED_CONFIG_TARGET}"'),
+    ]
+    prepare_install = setup.index('mv -f "${PREPARE_TMP}" "${PREPARE_TARGET}"')
+    assert all(install < prepare_install for install in dependency_installs)
 
 
 # ======================================================================

@@ -60,4 +60,8 @@ ls -ld \
 
 # Развернуть конфигурацию Canvas из шаблонов с подстановкой DEEPSEEK_API_KEY.
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-"${SCRIPT_DIR}/seed-config.sh"
+if [ -n "$(find "${BASE}/config" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+    echo "Existing server-side Canvas config preserved; bootstrap seed skipped."
+else
+    "${SCRIPT_DIR}/seed-config.sh"
+fi

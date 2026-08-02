@@ -82,6 +82,16 @@ grep -Fq 'deployment/scripts/prepare.sh' "${BROKER_SETUP}" \
     && grep -Fq 'diverges from every authorized update base' "${BROKER_SETUP}" \
     && pass "setup: lifecycle scripts delivered from authorized base" \
     || fail "setup: lifecycle delivery не fail-closed"
+if grep -Fq '"${SCRIPT_DIR}/seed-config.sh"' "${PREPARE}" \
+    && grep -Fq 'Existing server-side Canvas config preserved' "${PREPARE}" \
+    && grep -Fq 'deployment/scripts/seed-config.sh' "${BROKER_SETUP}" \
+    && grep -Fq 'deployment/config/settings.json' "${BROKER_SETUP}" \
+    && grep -Fq 'deployment/config/profiles/deepseek-chat.json' "${BROKER_SETUP}" \
+    && grep -Fq 'deployment/config/agent-profiles/default.json' "${BROKER_SETUP}"; then
+    pass "setup: complete prepare dependency chain"
+else
+    fail "setup: prepare dependency chain incomplete"
+fi
 
 # ── 5. Systemd invariants ──
 echo ""
