@@ -7,7 +7,7 @@ RUN test -n "${SOURCE_COMMIT}" \
     && rm -f /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources \
     && printf '%s\n' \
        'Types: deb' \
-       'URIs: https://snapshot.debian.org/archive/debian/20260507T030000Z' \
+       'URIs: https://snapshot.debian.org/archive/debian/20260601T030000Z' \
        'Suites: trixie' \
        'Components: main' \
        'Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg' \

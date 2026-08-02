@@ -61,7 +61,7 @@ class ConnectorDefinitionTests(unittest.TestCase):
     def test_dockerfile_pins_base_snapshot_and_package(self):
         source = (ROOT / "Dockerfile").read_text(encoding="utf-8")
         self.assertIn("@sha256:fc24163754bee2ab0115b117d57512cc01b4d99770e7ac17c3607e76290deeb6", source)
-        self.assertIn("snapshot.debian.org/archive/debian/20260507T030000Z", source)
+        self.assertIn("snapshot.debian.org/archive/debian/20260601T030000Z", source)
         self.assertIn("openssh-client=1:10.0p1-7+deb13u4", source)
         self.assertIn('test -n "${SOURCE_COMMIT}"', source)
         self.assertIn("USER openhands", source)
