@@ -25,14 +25,23 @@ python3 -m unittest discover -s deployment/broker/tests -v
 `install-broker-v2.sh` is intentionally not a generic installer. It accepts only the
 exact frozen v1 broker currently identified on mini-server. Before any replacement it
 verifies the legacy wrapper, registry, sudoers, sshd policy, authorized key, pinned host
-key, account layout, and preserved client keypair. Any mismatch stops before mutation.
+key, account layout, the frozen empty `secrets/` directory, and legacy public-key
+authorization. The legacy private key is preserved as opaque data because its frozen
+`0640` mode is intentionally not changed. Any mismatch stops before mutation.
+
+`--preflight-only` performs no lock-file, temporary-file, audit, key, or system-policy
+write. The apply path creates a separate v2 ED25519 client key under
+`/srv/openhands-agent/secrets/openhands-broker-v2/`; its private key is owned by Canvas
+UID/GID `10001:10001` with mode `0600`. Existing legacy key files are never overwritten,
+renamed, chmodded, or deleted.
 
 The migration creates a root-only snapshot under
 `/var/lib/openhands-broker/migrations/`, removes the legacy sudo grants, installs the
 root-owned v2 core/registry, creates isolated non-login adapter identities and empty
 credential boundaries, installs the fixed forced command, and validates the installed
-process path. It never installs Canvas connector files and never modifies the preserved
-client keypair.
+process path. The snapshot records a hash manifest for the fixed base Canvas files and
+install, validation, rollback, and uninstall fail if those files change. It never
+installs Canvas connector files.
 
 Run only from a clean checkout at the separately approved commit:
 
@@ -51,4 +60,4 @@ sudo deployment/broker/rollback-broker-v1.sh \
 ```
 
 `uninstall-broker-v2.sh --confirm` removes only v2 broker identities and artifacts. It
-preserves migration snapshots and `/srv/openhands-agent/secrets/broker-mini-server.key*`.
+preserves migration snapshots, the frozen legacy keypair, and the separate v2 keypair.

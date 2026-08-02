@@ -9,8 +9,11 @@ readonly BROKER_USER="openhands-broker"
 readonly BROKER_LIB="/usr/local/lib/openhands-broker"
 readonly BROKER_ETC="/etc/openhands-broker"
 readonly BROKER_STATE="/var/lib/openhands-broker"
-readonly CLIENT_KEY="/srv/openhands-agent/secrets/broker-mini-server.key"
-readonly CLIENT_PUBLIC_KEY="/srv/openhands-agent/secrets/broker-mini-server.key.pub"
+readonly LEGACY_CLIENT_KEY="/srv/openhands-agent/secrets/broker-mini-server.key"
+readonly LEGACY_CLIENT_PUBLIC_KEY="/srv/openhands-agent/secrets/broker-mini-server.key.pub"
+readonly V2_CLIENT_DIR="/srv/openhands-agent/secrets/openhands-broker-v2"
+readonly V2_CLIENT_KEY="${V2_CLIENT_DIR}/id_ed25519"
+readonly V2_CLIENT_PUBLIC_KEY="${V2_CLIENT_DIR}/id_ed25519.pub"
 readonly -a ADAPTERS=(mini-server vps n8n github nextcloud notion amnesia)
 COMMIT_SHA="${1:-}"
 
@@ -21,8 +24,8 @@ ok() { printf '  [OK] %s\n' "$1"; }
 [[ "${COMMIT_SHA}" =~ ^[0-9a-f]{40}$ ]] || fail "A full commit SHA is required"
 id "${BROKER_USER}" >/dev/null 2>&1 || fail "Broker user missing"
 [ "$(id -nG "${BROKER_USER}")" = "${BROKER_USER}" ] || fail "Broker core has unexpected group memberships"
-runuser -u "${BROKER_USER}" -- test ! -r "${CLIENT_KEY}" \
-    || fail "Broker core can read the protected client private key"
+runuser -u "${BROKER_USER}" -- test ! -r "${V2_CLIENT_KEY}" \
+    || fail "Broker core can read the broker v2 client private key"
 
 for path in \
     "${BROKER_LIB}/broker_core.py" \
@@ -45,7 +48,10 @@ cmp -s deployment/broker/tools.d/core.yaml "${BROKER_ETC}/tools.d/core.yaml" \
     || fail "Installed registry differs from approved source"
 
 [ ! -e /etc/sudoers.d/openhands-broker ] || fail "Legacy sudoers still exists"
-sudo -l -U "${BROKER_USER}" 2>/dev/null | grep -q 'NOPASSWD' && fail "Broker retains a NOPASSWD grant"
+sudo_policy="$(sudo -l -U "${BROKER_USER}" 2>&1 || true)"
+if grep -Eq 'NOPASSWD|/usr/|/bin/|ALL[[:space:]]*=' <<<"${sudo_policy}"; then
+    fail "Broker retains a sudo command grant"
+fi
 
 for adapter in "${ADAPTERS[@]}"; do
     user="openhands-adapter-${adapter}"
@@ -60,7 +66,7 @@ for adapter in "${ADAPTERS[@]}"; do
         || fail "Adapter cannot traverse its own state boundary: ${adapter}"
     runuser -u "${user}" -- test -x "${BROKER_ETC}/secrets.d/${adapter}" \
         || fail "Adapter cannot traverse its own credential boundary: ${adapter}"
-    runuser -u "${user}" -- test ! -r "${CLIENT_KEY}" \
+    runuser -u "${user}" -- test ! -r "${V2_CLIENT_KEY}" \
         || fail "Adapter can read the Canvas broker client key: ${adapter}"
 done
 [ "$(stat -c '%U:%G:%a' "${BROKER_STATE}")" = "root:root:711" ] \
@@ -86,7 +92,7 @@ done
     || fail "Broker SSH directory boundary mismatch"
 [ "$(stat -c '%U:%G:%a' /home/openhands-broker/.ssh/authorized_keys)" = "root:${BROKER_USER}:440" ] \
     || fail "authorized_keys boundary mismatch"
-derived_public="$(ssh-keygen -y -f "${CLIENT_KEY}")"
+derived_public="$(ssh-keygen -y -f "${V2_CLIENT_KEY}")"
 expected_auth="from=\"10.89.0.2\",restrict,command=\"${BROKER_LIB}/bin/broker-launcher\" ${derived_public}"
 [ "$(cat /home/openhands-broker/.ssh/authorized_keys)" = "${expected_auth}" ] \
     || fail "authorized_keys forced-command/source policy mismatch"
@@ -100,10 +106,20 @@ for path in /run/openhands-broker/approvals /run/openhands-broker/inflight /run/
     [ "$(stat -c '%U:%G:%a' "${path}")" = "root:root:700" ] || fail "Level C directory boundary mismatch: ${path}"
 done
 
-[ "$(stat -c '%u:%g:%a' "${CLIENT_KEY}")" = "0:10001:640" ] \
-    || fail "Preserved private key metadata changed"
-[ "$(ssh-keygen -y -f "${CLIENT_KEY}")" = "$(awk 'NF >= 2 {print $1 " " $2; exit}' "${CLIENT_PUBLIC_KEY}")" ] \
-    || fail "Preserved broker keypair mismatch"
+[ "$(stat -c '%U:%G:%a' "${V2_CLIENT_DIR}")" = "root:root:700" ] \
+    || fail "Broker v2 key directory boundary mismatch"
+[ -f "${V2_CLIENT_KEY}" ] && [ ! -L "${V2_CLIENT_KEY}" ] \
+    || fail "Broker v2 private key is missing or symlinked"
+[ "$(stat -c '%u:%g:%a' "${V2_CLIENT_KEY}")" = "10001:10001:600" ] \
+    || fail "Broker v2 private key metadata mismatch"
+[ "$(stat -c '%U:%G:%a' "${V2_CLIENT_PUBLIC_KEY}")" = "root:root:644" ] \
+    || fail "Broker v2 public key metadata mismatch"
+[ "$(ssh-keygen -y -f "${V2_CLIENT_KEY}")" = "$(awk 'NF >= 2 {print $1 " " $2; exit}' "${V2_CLIENT_PUBLIC_KEY}")" ] \
+    || fail "Broker v2 keypair mismatch"
+[ "$(stat -c '%u:%g:%a' "${LEGACY_CLIENT_KEY}")" = "0:10001:640" ] \
+    || fail "Preserved legacy private key metadata changed"
+[ "$(stat -c '%u:%g:%a' "${LEGACY_CLIENT_PUBLIC_KEY}")" = "1000:1000:600" ] \
+    || fail "Preserved legacy public key metadata changed"
 
 sshd -t || fail "sshd configuration invalid"
 effective="$(sshd -T -C user=openhands-broker,host=mini-server,addr=10.89.0.2)"
@@ -127,4 +143,6 @@ case "$(realpath -e -- "${snapshot}")" in
     "${BROKER_STATE}/migrations/"*) ;;
     *) fail "Install state references an untrusted snapshot" ;;
 esac
+sha256sum -c --status "${snapshot}/BASE-CANVAS.sha256" \
+    || fail "Base Canvas files changed during broker migration"
 ok "Broker v2 installation validation passed"

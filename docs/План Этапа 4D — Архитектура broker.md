@@ -1,7 +1,7 @@
 # Этап 4D — Архитектура broker
 
 **Версия:** 2.2 (2 августа 2026)
-**Статус:** ✅ `4D.0 REVIEW: PASS`; ✅ `4D.1 REVIEW: PASS`; server installation не выполнялась
+**Статус:** ✅ `4D.0 REVIEW: PASS`; ✅ `4D.1 REVIEW: PASS`; 4D.2 remediation подготовлен после полного server audit, server migration не выполнялась
 **Основа:** проверенные идеи старого 4D из `fix/canonical-deployment`, без переноса его архитектурного расползания
 
 ---
@@ -434,12 +434,13 @@ Scope: `deployment/broker/**` + документы 4D/Состояние. Base d
 
 ### 4D.2 — Host installation v2 + isolation foundation
 
-**Статус: 🟡 exact frozen-v1 migration package реализован и локально проверен; server preflight/application ещё не выполнены.**
+**Статус: 🟡 exact frozen-v1 migration package исправлен после первого остановленного preflight; повторный server preflight/application ещё не выполнены.**
 
 Installer устанавливает только broker artifacts:
 
 - broker Unix identity;
-- отдельный broker client key и его public key с точной ownership/mode policy;
+- сохранение frozen legacy client keypair без chmod/chown/перезаписи;
+- отдельный broker v2 client key и его public key с точной ownership/mode policy `10001:10001 0600` для private key;
 - restricted `authorized_keys` entry для broker identity;
 - pinned host trust material, проверенное против фактической host key;
 - fixed launcher/core;
@@ -450,6 +451,11 @@ Installer устанавливает только broker artifacts:
 - narrow helper/sudo policy;
 - audit prerequisites;
 - Level C directories, но C остаётся disabled.
+
+`--preflight-only` является строго observational: не создаёт lock/temp/key files и не
+пишет audit event. Apply snapshot содержит before-hashes фиксированного списка base
+Canvas lifecycle/network files; validation, rollback и uninstall подтверждают их
+неизменность.
 
 Uninstall удаляет только broker artifacts.
 

@@ -49,6 +49,19 @@ class FrozenBaselineTests(unittest.TestCase):
         self.assertIn("Legacy sudoers differs from frozen baseline", preflight)
         self.assertIn("Legacy sshd drop-in differs from frozen baseline", preflight)
         self.assertIn("Unexpected pre-existing adapter identity", preflight)
+        inventory = function_body(INSTALL, "assert_exact_inventory")
+        self.assertIn("client_known_hosts\\nsecrets\\ntools.yaml", inventory)
+        self.assertIn("Legacy secrets directory is not empty", inventory)
+
+    def test_preflight_only_does_not_create_lock_tempfiles_or_audit(self):
+        main = INSTALL.rsplit('\n[ "$(id -u)" -eq 0 ]', 1)[1]
+        preflight_exit = main.index('if [ "${PREFLIGHT_ONLY}" = true ]')
+        before_exit = main[:preflight_exit]
+        for forbidden in ("install -d", "migration.lock", "logger --tag", "mktemp"):
+            self.assertNotIn(forbidden, before_exit)
+        preflight = function_body(INSTALL, "preflight_legacy")
+        self.assertNotIn("mktemp", preflight)
+        self.assertNotIn("logger", preflight)
 
 
 class ProtectedBoundaryTests(unittest.TestCase):
@@ -62,26 +75,38 @@ class ProtectedBoundaryTests(unittest.TestCase):
     )
 
     def test_runtime_code_does_not_reference_base_canvas_targets(self):
-        executable_body = INSTALL.replace(function_body(INSTALL, "write_old_sudoers_reference"), "")
-        for prefix in self.PROTECTED_PREFIXES:
-            self.assertNotIn(prefix, executable_body)
+        for line in INSTALL.splitlines():
+            if not re.search(r"\b(rm|mv|cp|install|chmod|chown|truncate|tee)\b", line):
+                continue
+            for prefix in self.PROTECTED_PREFIXES:
+                self.assertNotIn(prefix, line)
 
-    def test_preserved_client_keys_are_never_mutation_targets(self):
+    def test_legacy_client_keys_are_never_mutation_targets(self):
         for source in (INSTALL, VALIDATE, ROLLBACK, UNINSTALL):
             for line in source.splitlines():
-                if "CLIENT_KEY" in line or "broker-mini-server.key" in line:
+                if "LEGACY_CLIENT_KEY" in line or "broker-mini-server.key" in line:
                     self.assertNotRegex(line, r"\b(rm|mv|cp|install|chmod|chown)\b")
+
+    def test_separate_v2_key_is_created_with_canvas_uid_and_strict_mode(self):
+        keygen = function_body(INSTALL, "ensure_v2_keypair")
+        self.assertIn("ssh-keygen -q -t ed25519", keygen)
+        self.assertIn("-o 10001 -g 10001 -m 0600", keygen)
+        self.assertIn("V2_CLIENT_KEY", keygen)
+        self.assertNotIn("LEGACY_CLIENT_KEY", keygen)
+        self.assertIn("10001:10001:600", VALIDATE)
+        self.assertIn("Broker v2 private key is missing or symlinked", INSTALL)
+        self.assertIn("Broker v2 private key is missing or symlinked", VALIDATE)
 
     def test_uninstall_and_rollback_do_not_reference_base_canvas(self):
         for source in (ROLLBACK, UNINSTALL):
-            self.assertNotIn("/srv/openhands-agent", source)
+            self.assertNotRegex(source, r"\b(rm|mv|cp|install|chmod|chown)\b[^\n]*/srv/openhands-agent")
             self.assertNotIn("openhands-agent.service", source)
 
     def test_no_v2_sudo_grants_are_installed(self):
-        source_without_reference = INSTALL.replace(function_body(INSTALL, "write_old_sudoers_reference"), "")
-        self.assertNotIn("NOPASSWD:", source_without_reference)
-        self.assertIn('rm -f -- "${SUDOERS_FILE}"', source_without_reference)
-        self.assertIn("Legacy broker sudo grant remains", source_without_reference)
+        self.assertNotIn("NOPASSWD:", INSTALL)
+        self.assertIn('rm -f -- "${SUDOERS_FILE}"', INSTALL)
+        self.assertIn("Broker retains a sudo command grant", INSTALL)
+        self.assertIn("sudo -l -U", INSTALL)
 
 
 class IsolationContractTests(unittest.TestCase):
@@ -99,7 +124,7 @@ class IsolationContractTests(unittest.TestCase):
         self.assertIn("Broker core has unexpected group memberships", VALIDATE)
         self.assertIn("Adapter state isolation failed", VALIDATE)
         self.assertIn("Adapter credential isolation failed", VALIDATE)
-        self.assertIn("Broker core can read the protected client private key", VALIDATE)
+        self.assertIn("Broker core can read the broker v2 client private key", VALIDATE)
         self.assertIn("Adapter can read the Canvas broker client key", VALIDATE)
         self.assertIn('-m 0711 "${BROKER_STATE}" "${BROKER_STATE}/adapters"', INSTALL)
 
@@ -127,6 +152,13 @@ class TransactionTests(unittest.TestCase):
         self.assertIn("cp -a", snapshot)
         self.assertNotIn("chmod -R", snapshot)
         self.assertIn("mkdir -m 0700", snapshot)
+        self.assertIn("write_base_canvas_manifest", snapshot)
+
+    def test_base_canvas_hashes_are_checked_after_install_and_rollback(self):
+        self.assertIn("verify_base_canvas_manifest", INSTALL)
+        self.assertIn("BASE-CANVAS.sha256", VALIDATE)
+        self.assertIn("BASE-CANVAS.sha256", ROLLBACK)
+        self.assertIn("BASE-CANVAS.sha256", UNINSTALL)
 
     def test_error_trap_restores_only_broker_artifacts(self):
         rollback = function_body(INSTALL, "restore_snapshot")
@@ -145,7 +177,7 @@ class TransactionTests(unittest.TestCase):
     def test_uninstall_requires_marker_and_confirmation(self):
         self.assertIn("--confirm", UNINSTALL)
         self.assertIn("Broker v2 install marker missing", UNINSTALL)
-        self.assertIn("migrations and protected client key files preserved", UNINSTALL)
+        self.assertIn("migrations and all protected client key files preserved", UNINSTALL)
 
 
 if __name__ == "__main__":

@@ -26,9 +26,11 @@ case "${resolved}" in
 esac
 [ "$(stat -c '%U:%G:%a' "${resolved}")" = "root:root:700" ] || fail "Snapshot ownership/mode mismatch"
 [ "$(cat "${resolved}/FORMAT")" = "openhands-broker-v1-snapshot" ] || fail "Unknown snapshot format"
-for path in lib etc home sudoers sshd-dropin passwd group; do
+for path in lib etc home sudoers sshd-dropin passwd group BASE-CANVAS.sha256; do
     [ -e "${resolved}/${path}" ] || fail "Incomplete snapshot: ${path}"
 done
+sha256sum -c --status "${resolved}/BASE-CANVAS.sha256" \
+    || fail "Base Canvas differs from the migration checkpoint"
 
 sshd_candidate="$(mktemp /run/openhands-rollback-sshd.XXXXXX)"
 cat /etc/ssh/sshd_config "${resolved}/sshd-dropin" > "${sshd_candidate}"
@@ -50,5 +52,7 @@ done
 visudo -cf "${SUDOERS_FILE}" >/dev/null
 sshd -t
 systemctl reload ssh.service
+sha256sum -c --status "${resolved}/BASE-CANVAS.sha256" \
+    || fail "Base Canvas changed during broker rollback"
 logger --tag openhands-broker-setup -- '{"event":"ROLLBACK_TO_FROZEN_V1"}'
 printf '  [OK] Frozen v1 broker snapshot restored; protected client key files were untouched\n'

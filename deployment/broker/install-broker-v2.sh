@@ -14,8 +14,11 @@ readonly BROKER_STATE="/var/lib/openhands-broker"
 readonly SUDOERS_FILE="/etc/sudoers.d/openhands-broker"
 readonly SSHD_DROPIN="/etc/ssh/sshd_config.d/99-openhands-broker.conf"
 readonly AUTH_KEYS="${BROKER_HOME}/.ssh/authorized_keys"
-readonly CLIENT_KEY="/srv/openhands-agent/secrets/broker-mini-server.key"
-readonly CLIENT_PUBLIC_KEY="/srv/openhands-agent/secrets/broker-mini-server.key.pub"
+readonly LEGACY_CLIENT_KEY="/srv/openhands-agent/secrets/broker-mini-server.key"
+readonly LEGACY_CLIENT_PUBLIC_KEY="/srv/openhands-agent/secrets/broker-mini-server.key.pub"
+readonly V2_CLIENT_DIR="/srv/openhands-agent/secrets/openhands-broker-v2"
+readonly V2_CLIENT_KEY="${V2_CLIENT_DIR}/id_ed25519"
+readonly V2_CLIENT_PUBLIC_KEY="${V2_CLIENT_DIR}/id_ed25519.pub"
 readonly HOST_PUBLIC_KEY="/etc/ssh/ssh_host_ed25519_key.pub"
 readonly BROKER_ENDPOINT="10.89.0.1"
 readonly CANVAS_SOURCE="10.89.0.2"
@@ -23,7 +26,21 @@ readonly LOCK_DIR="/run/lock/openhands-broker-v2"
 readonly OLD_WRAPPER_BLOB="decb5e6c2c5bcc6eeb32b345da4b434ab3e1f039"
 readonly OLD_JOURNAL_BLOB="9c6e79f7ce8246dba108ef11661b17d69aef2780"
 readonly OLD_TOOLS_BLOB="f693aad33f34aeebd838122f654a734d4ac7043d"
+readonly OLD_SUDOERS_SHA256="5d95888af66bc03dceee7990ff5c022adb3941998914b518d894583865304908b"
+readonly OLD_SSHD_SHA256="60f848563df1f7585a8dad2b3fb360bd13214706e4fd4046d48376304d319e8b"
 readonly -a ADAPTERS=(mini-server vps n8n github nextcloud notion amnesia)
+readonly -a BASE_CANVAS_FILES=(
+    /srv/openhands-agent/deployment/compose.yaml
+    /srv/openhands-agent/deployment/systemd/openhands-agent.service
+    /srv/openhands-agent/deployment/scripts/prepare.sh
+    /srv/openhands-agent/deployment/scripts/validate-runtime.sh
+    /srv/openhands-agent/deployment/scripts/seed-config.sh
+    /srv/openhands-agent/deployment/scripts/run-supervised.sh
+    /srv/openhands-agent/deployment/scripts/health-watchdog.sh
+    /srv/openhands-agent/deployment/network/apply-egress-rules.sh
+    /srv/openhands-agent/deployment/network/remove-egress-rules.sh
+    /srv/openhands-agent/deployment/network/check-egress.sh
+)
 
 COMMIT_SHA="${1:-}"
 PREFLIGHT_ONLY=false
@@ -59,33 +76,15 @@ require_regular() {
     [ "$(stat -c '%a' "${path}")" = "${mode}" ] || fail "Unexpected mode: ${path}"
 }
 
-write_old_sudoers_reference() {
-    cat > "$1" <<'EOF'
-# OpenHands Agent Broker — разрешённые команды
-# Должны соответствовать tools.yaml. Проверено visudo -cf.
-openhands-broker ALL=(root) NOPASSWD: /usr/bin/docker ps
-openhands-broker ALL=(root) NOPASSWD: /usr/bin/docker compose -f /srv/openhands-agent/deployment/compose.yaml ps
-openhands-broker ALL=(root) NOPASSWD: /usr/bin/docker compose -f /srv/openhands-agent/deployment/compose.yaml logs -n *
-openhands-broker ALL=(root) NOPASSWD: /usr/local/lib/openhands-broker/journal-logs
-openhands-broker ALL=(root) NOPASSWD: /usr/bin/systemctl restart openhands-agent.service
-openhands-broker ALL=(root) NOPASSWD: /usr/bin/systemctl stop openhands-agent.service
-openhands-broker ALL=(root) NOPASSWD: /usr/bin/systemctl start openhands-agent.service
-openhands-broker ALL=(root) NOPASSWD: /usr/local/bin/openhands-backup.sh
-openhands-broker ALL=(root) NOPASSWD: /srv/openhands-agent/deployment/scripts/validate-runtime.sh
-EOF
+require_directory() {
+    local path="$1" owner_group="$2" mode="$3"
+    [ -d "${path}" ] && [ ! -L "${path}" ] || fail "Not a directory: ${path}"
+    [ "$(stat -c '%U:%G' "${path}")" = "${owner_group}" ] || fail "Unexpected owner: ${path}"
+    [ "$(stat -c '%a' "${path}")" = "${mode}" ] || fail "Unexpected mode: ${path}"
 }
 
-write_old_sshd_reference() {
-    cat > "$1" <<'EOF'
-Match User openhands-broker
-    AuthenticationMethods publickey
-    PasswordAuthentication no
-    KbdInteractiveAuthentication no
-    ForceCommand /usr/local/lib/openhands-broker/broker-wrapper.sh
-    DisableForwarding yes
-    PermitTTY no
-    PermitUserRC no
-EOF
+sha256_of() {
+    sha256sum -- "$1" | awk '{print $1}'
 }
 
 write_new_sshd_candidate() {
@@ -108,21 +107,33 @@ assert_exact_inventory() {
     expected=$'broker-wrapper.sh\njournal-logs'
     [ "${actual}" = "${expected}" ] || fail "Unexpected legacy lib inventory"
     actual="$(find "${BROKER_ETC}" -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort)"
-    expected=$'client_known_hosts\ntools.yaml'
+    expected=$'client_known_hosts\nsecrets\ntools.yaml'
     [ "${actual}" = "${expected}" ] || fail "Unexpected legacy etc inventory"
+    [ -z "$(find "${BROKER_ETC}/secrets" -mindepth 1 -maxdepth 1 -print -quit)" ] \
+        || fail "Legacy secrets directory is not empty"
     actual="$(find "${BROKER_HOME}/.ssh" -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort)"
     [ "${actual}" = "authorized_keys" ] || fail "Unexpected legacy SSH inventory"
 }
 
 preflight_legacy() {
-    local old_sudoers old_sshd derived_public stored_public host_public expected_auth expected_known
+    local stored_public host_public expected_auth expected_known
     id "${BROKER_USER}" >/dev/null 2>&1 || fail "Legacy broker user is absent"
+    [ "$(id -nG "${BROKER_USER}")" = "${BROKER_USER}" ] \
+        || fail "Legacy broker account has unexpected supplementary groups"
     [ "$(getent passwd "${BROKER_USER}" | cut -d: -f6-7)" = "${BROKER_HOME}:/bin/bash" ] \
         || fail "Legacy broker account differs from expected baseline"
-    [ -d "${BROKER_LIB}" ] && [ ! -L "${BROKER_LIB}" ] || fail "Legacy broker lib missing"
-    [ -d "${BROKER_ETC}" ] && [ ! -L "${BROKER_ETC}" ] || fail "Legacy broker etc missing"
-    [ -d "${BROKER_HOME}/.ssh" ] && [ ! -L "${BROKER_HOME}/.ssh" ] || fail "Legacy broker SSH dir missing"
+    require_directory "${BROKER_LIB}" "root:root" "755"
+    require_directory "${BROKER_ETC}" "root:root" "755"
+    require_directory "${BROKER_ETC}/secrets" "root:root" "755"
+    require_directory "${BROKER_HOME}" "root:root" "711"
+    require_directory "${BROKER_HOME}/.ssh" "root:root" "711"
     assert_exact_inventory
+
+    require_regular "${BROKER_LIB}/broker-wrapper.sh" "root:root" "755"
+    require_regular "${BROKER_LIB}/journal-logs" "root:root" "755"
+    require_regular "${BROKER_ETC}/tools.yaml" "root:root" "644"
+    [ "$(stat -c '%u:%g:%a' "${BROKER_ETC}/client_known_hosts")" = "0:10001:640" ] \
+        || fail "Legacy pinned host trust metadata mismatch"
 
     [ "$(git hash-object "${BROKER_LIB}/broker-wrapper.sh")" = "${OLD_WRAPPER_BLOB}" ] \
         || fail "Legacy wrapper hash mismatch"
@@ -134,26 +145,24 @@ preflight_legacy() {
     require_regular "${SUDOERS_FILE}" "root:root" "440"
     require_regular "${SSHD_DROPIN}" "root:root" "600"
     require_regular "${AUTH_KEYS}" "root:${BROKER_USER}" "440"
-    old_sudoers="$(mktemp /run/openhands-old-sudoers.XXXXXX)"
-    old_sshd="$(mktemp /run/openhands-old-sshd.XXXXXX)"
-    TEMP_PATHS+=("${old_sudoers}" "${old_sshd}")
-    write_old_sudoers_reference "${old_sudoers}"
-    write_old_sshd_reference "${old_sshd}"
-    cmp -s "${old_sudoers}" "${SUDOERS_FILE}" || fail "Legacy sudoers differs from frozen baseline"
-    cmp -s "${old_sshd}" "${SSHD_DROPIN}" || fail "Legacy sshd drop-in differs from frozen baseline"
-    rm -f "${old_sudoers}" "${old_sshd}"
+    [ "$(sha256_of "${SUDOERS_FILE}")" = "${OLD_SUDOERS_SHA256}" ] \
+        || fail "Legacy sudoers differs from frozen baseline"
+    [ "$(sha256_of "${SSHD_DROPIN}")" = "${OLD_SSHD_SHA256}" ] \
+        || fail "Legacy sshd drop-in differs from frozen baseline"
 
-    [ -f "${CLIENT_KEY}" ] && [ ! -L "${CLIENT_KEY}" ] || fail "Preserved broker private key missing"
-    [ "$(stat -c '%u:%g:%a' "${CLIENT_KEY}")" = "0:10001:640" ] \
-        || fail "Preserved broker private key metadata mismatch"
-    [ -f "${CLIENT_PUBLIC_KEY}" ] && [ ! -L "${CLIENT_PUBLIC_KEY}" ] \
-        || fail "Preserved broker public key missing"
-    derived_public="$(ssh-keygen -y -f "${CLIENT_KEY}")" || fail "Cannot derive broker public key"
-    stored_public="$(awk 'NF >= 2 {print $1 " " $2; exit}' "${CLIENT_PUBLIC_KEY}")"
-    [ "${derived_public}" = "${stored_public}" ] || fail "Broker private/public key mismatch"
+    [ -f "${LEGACY_CLIENT_KEY}" ] && [ ! -L "${LEGACY_CLIENT_KEY}" ] \
+        || fail "Preserved legacy broker private key missing"
+    [ "$(stat -c '%u:%g:%a' "${LEGACY_CLIENT_KEY}")" = "0:10001:640" ] \
+        || fail "Preserved legacy broker private key metadata mismatch"
+    [ -f "${LEGACY_CLIENT_PUBLIC_KEY}" ] && [ ! -L "${LEGACY_CLIENT_PUBLIC_KEY}" ] \
+        || fail "Preserved legacy broker public key missing"
+    [ "$(stat -c '%u:%g:%a' "${LEGACY_CLIENT_PUBLIC_KEY}")" = "1000:1000:600" ] \
+        || fail "Preserved legacy broker public key metadata mismatch"
+    stored_public="$(awk 'NF >= 2 {print $1 " " $2; exit}' "${LEGACY_CLIENT_PUBLIC_KEY}")"
+    [ "${stored_public%% *}" = "ssh-ed25519" ] || fail "Legacy broker public key is not ED25519"
     host_public="$(awk 'NF >= 2 {print $1 " " $2; exit}' "${HOST_PUBLIC_KEY}")"
     [ "${host_public%% *}" = "ssh-ed25519" ] || fail "Host key is not ED25519"
-    expected_auth="from=\"${CANVAS_SOURCE}\",restrict,command=\"${BROKER_LIB}/broker-wrapper.sh\" ${derived_public}"
+    expected_auth="from=\"${CANVAS_SOURCE}\",restrict,command=\"${BROKER_LIB}/broker-wrapper.sh\" ${stored_public}"
     [ "$(cat "${AUTH_KEYS}")" = "${expected_auth}" ] || fail "Legacy authorized_keys differs from expected key/policy"
     expected_known="${BROKER_ENDPOINT} ${host_public}"
     [ "$(cat "${BROKER_ETC}/client_known_hosts")" = "${expected_known}" ] \
@@ -163,6 +172,24 @@ preflight_legacy() {
             && fail "Unexpected pre-existing adapter identity: openhands-adapter-${adapter}"
     done
     ok "Exact frozen v1 broker baseline verified"
+}
+
+preflight_v2_key_target() {
+    local derived_public stored_public
+    if [ ! -e "${V2_CLIENT_DIR}" ]; then
+        return
+    fi
+    require_directory "${V2_CLIENT_DIR}" "root:root" "700"
+    [ "$(find "${V2_CLIENT_DIR}" -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort)" \
+        = $'id_ed25519\nid_ed25519.pub' ] || fail "Unexpected broker v2 key inventory"
+    [ -f "${V2_CLIENT_KEY}" ] && [ ! -L "${V2_CLIENT_KEY}" ] \
+        || fail "Broker v2 private key is missing or symlinked"
+    [ "$(stat -c '%u:%g:%a' "${V2_CLIENT_KEY}")" = "10001:10001:600" ] \
+        || fail "Broker v2 private key metadata mismatch"
+    require_regular "${V2_CLIENT_PUBLIC_KEY}" "root:root" "644"
+    derived_public="$(ssh-keygen -y -f "${V2_CLIENT_KEY}")" || fail "Cannot derive broker v2 public key"
+    stored_public="$(awk 'NF >= 2 {print $1 " " $2; exit}' "${V2_CLIENT_PUBLIC_KEY}")"
+    [ "${derived_public}" = "${stored_public}" ] || fail "Broker v2 private/public key mismatch"
 }
 
 verify_source_commit() {
@@ -190,6 +217,54 @@ verify_source_commit() {
     done
 }
 
+write_base_canvas_manifest() {
+    local path
+    : > "${SNAPSHOT}/BASE-CANVAS.sha256"
+    for path in "${BASE_CANVAS_FILES[@]}"; do
+        [ -f "${path}" ] && [ ! -L "${path}" ] || fail "Base Canvas invariant missing: ${path}"
+        printf '%s  %s\n' "$(sha256_of "${path}")" "${path}" >> "${SNAPSHOT}/BASE-CANVAS.sha256"
+    done
+    chmod 0600 "${SNAPSHOT}/BASE-CANVAS.sha256"
+}
+
+verify_base_canvas_manifest() {
+    [ -f "${SNAPSHOT}/BASE-CANVAS.sha256" ] || fail "Base Canvas invariant manifest missing"
+    sha256sum -c --status "${SNAPSHOT}/BASE-CANVAS.sha256" \
+        || fail "Base Canvas files changed during broker migration"
+}
+
+ensure_v2_keypair() {
+    local key_stage derived_public stored_public
+    if [ -e "${V2_CLIENT_DIR}" ]; then
+        preflight_v2_key_target
+        ok "Existing exact broker v2 client keypair preserved and reused"
+        return
+    fi
+
+    key_stage="$(mktemp -d /run/openhands-broker-v2-key.XXXXXX)"
+    TEMP_PATHS+=("${key_stage}")
+    ssh-keygen -q -t ed25519 -N '' -C openhands-broker-v2 -f "${key_stage}/id_ed25519"
+    derived_public="$(ssh-keygen -y -f "${key_stage}/id_ed25519")"
+    stored_public="$(awk 'NF >= 2 {print $1 " " $2; exit}' "${key_stage}/id_ed25519.pub")"
+    [ "${derived_public}" = "${stored_public}" ] || fail "Generated broker v2 keypair mismatch"
+
+    mkdir -m 0700 -- "${V2_CLIENT_DIR}"
+    chown root:root "${V2_CLIENT_DIR}"
+    install -o 10001 -g 10001 -m 0600 "${key_stage}/id_ed25519" "${V2_CLIENT_KEY}"
+    install -o root -g root -m 0644 "${key_stage}/id_ed25519.pub" "${V2_CLIENT_PUBLIC_KEY}"
+    sync -f "${V2_CLIENT_DIR}"
+    preflight_v2_key_target
+    ok "Separate broker v2 client keypair created without changing legacy keys"
+}
+
+assert_no_broker_sudo_grants() {
+    local policy
+    policy="$(sudo -l -U "${BROKER_USER}" 2>&1 || true)"
+    if grep -Eq 'NOPASSWD|/usr/|/bin/|ALL[[:space:]]*=' <<<"${policy}"; then
+        fail "Broker retains a sudo command grant"
+    fi
+}
+
 create_snapshot() {
     local stamp
     install -d -o root -g root -m 0711 "${BROKER_STATE}"
@@ -205,6 +280,7 @@ create_snapshot() {
     cp -a "${SSHD_DROPIN}" "${SNAPSHOT}/sshd-dropin"
     getent passwd "${BROKER_USER}" > "${SNAPSHOT}/passwd"
     getent group "${BROKER_USER}" > "${SNAPSHOT}/group"
+    write_base_canvas_manifest
     ok "Root-only broker rollback snapshot created: ${SNAPSHOT}"
 }
 
@@ -226,6 +302,11 @@ restore_snapshot() {
     done
     if ! sshd -t || ! systemctl reload ssh.service; then
         printf '  [CRITICAL] Frozen sshd policy was restored on disk but reload failed\n' >&2
+        set -e
+        return 1
+    fi
+    if ! sha256sum -c --status "${SNAPSHOT}/BASE-CANVAS.sha256"; then
+        printf '  [CRITICAL] Base Canvas invariant changed; broker rollback cannot repair it\n' >&2
         set -e
         return 1
     fi
@@ -259,6 +340,7 @@ install_v2() {
     create_snapshot
     MUTATION_STARTED=true
     trap on_error ERR
+    ensure_v2_keypair
 
     rm -rf -- "${BROKER_LIB}"
     mv "${STAGE}/lib" "${BROKER_LIB}"
@@ -266,6 +348,7 @@ install_v2() {
     chmod 0755 "${BROKER_LIB}" "${BROKER_LIB}/bin" "${BROKER_LIB}/adapters"
 
     rm -f -- "${BROKER_ETC}/tools.yaml"
+    rmdir -- "${BROKER_ETC}/secrets"
     install -d -o root -g root -m 0755 "${BROKER_ETC}" "${BROKER_ETC}/tools.d" \
         "${BROKER_ETC}/adapters" "${BROKER_ETC}/secrets.d"
     install -o root -g root -m 0644 deployment/broker/tools.d/core.yaml "${BROKER_ETC}/tools.d/core.yaml"
@@ -288,7 +371,7 @@ install_v2() {
     install -d -o root -g root -m 0700 /run/openhands-broker \
         /run/openhands-broker/approvals /run/openhands-broker/inflight /run/openhands-broker/consumed
 
-    derived_public="$(ssh-keygen -y -f "${CLIENT_KEY}")"
+    derived_public="$(ssh-keygen -y -f "${V2_CLIENT_KEY}")"
     install -d -o root -g root -m 0711 "${BROKER_HOME}" "${BROKER_HOME}/.ssh"
     printf 'from="%s",restrict,command="%s/bin/broker-launcher" %s\n' \
         "${CANVAS_SOURCE}" "${BROKER_LIB}" "${derived_public}" > "${AUTH_KEYS}.new"
@@ -303,7 +386,8 @@ install_v2() {
     mv -f "${BROKER_ETC}/client_known_hosts.new" "${BROKER_ETC}/client_known_hosts"
 
     rm -f -- "${SUDOERS_FILE}"
-    sudo -l -U "${BROKER_USER}" 2>/dev/null | grep -q 'NOPASSWD' && fail "Legacy broker sudo grant remains"
+    visudo -c >/dev/null
+    assert_no_broker_sudo_grants
 
     write_new_sshd_candidate "${STAGE}/sshd-dropin"
     sshd -t -f "${STAGE}/sshd-dropin"
@@ -319,6 +403,7 @@ install_v2() {
     mv -f "${BROKER_STATE}/install-state.json.new" "${BROKER_STATE}/install-state.json"
 
     deployment/broker/validate-install-v2.sh "${COMMIT_SHA}"
+    verify_base_canvas_manifest
     logger --tag openhands-broker-setup -- \
         "{\"event\":\"MIGRATION_SUCCEEDED\",\"commit\":\"${COMMIT_SHA}\"}"
     trap - ERR
@@ -329,21 +414,22 @@ install_v2() {
 }
 
 [ "$(id -u)" -eq 0 ] || fail "Run with sudo"
-for command_name in git python3 logger sshd visudo sudo useradd userdel install flock ssh-keygen runuser; do
+for command_name in git python3 logger sshd visudo sudo useradd userdel install flock ssh-keygen runuser sha256sum sync; do
     command -v "${command_name}" >/dev/null 2>&1 || fail "Missing dependency: ${command_name}"
 done
-install -d -o root -g root -m 0755 "${LOCK_DIR}"
-exec 9>"${LOCK_DIR}/migration.lock"
-flock -n 9 || fail "Another broker migration is running"
 verify_source_commit
 preflight_legacy
+preflight_v2_key_target
 sshd -t || fail "Current sshd configuration is invalid"
-logger --tag openhands-broker-setup -- '{"event":"MIGRATION_PREFLIGHT_OK"}' \
-    || fail "Audit transport is unavailable"
 
 if [ "${PREFLIGHT_ONLY}" = true ]; then
-    ok "Preflight-only completed; no system mutation performed"
+    ok "Read-only preflight completed; no filesystem or audit mutation performed"
     exit 0
 fi
 
+install -d -o root -g root -m 0755 "${LOCK_DIR}"
+exec 9>"${LOCK_DIR}/migration.lock"
+flock -n 9 || fail "Another broker migration is running"
+logger --tag openhands-broker-setup -- '{"event":"MIGRATION_PREFLIGHT_OK"}' \
+    || fail "Audit transport is unavailable"
 install_v2

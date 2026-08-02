@@ -13,6 +13,14 @@ readonly -a ADAPTERS=(mini-server vps n8n github nextcloud notion amnesia)
     || { echo '[FAIL] Broker v2 install marker missing' >&2; exit 1; }
 python3 -c 'import json,sys; s=json.load(open(sys.argv[1], encoding="utf-8")); assert s["version"] == 1' \
     "${STATE_ROOT}/install-state.json" || { echo '[FAIL] Invalid install marker' >&2; exit 1; }
+snapshot="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["legacy_snapshot"])' \
+    "${STATE_ROOT}/install-state.json")"
+case "$(realpath -e -- "${snapshot}")" in
+    "${STATE_ROOT}/migrations/"*) ;;
+    *) echo '[FAIL] Install marker references an untrusted snapshot' >&2; exit 1 ;;
+esac
+sha256sum -c --status "${snapshot}/BASE-CANVAS.sha256" \
+    || { echo '[FAIL] Base Canvas differs from the migration checkpoint' >&2; exit 1; }
 
 rm -f -- /etc/sudoers.d/openhands-broker /etc/ssh/sshd_config.d/99-openhands-broker.conf
 rm -rf -- /usr/local/lib/openhands-broker /etc/openhands-broker /home/openhands-broker /run/openhands-broker
@@ -25,5 +33,7 @@ rm -f -- "${STATE_ROOT}/install-state.json"
 rm -rf -- "${STATE_ROOT}/adapters"
 sshd -t
 systemctl reload ssh.service
+sha256sum -c --status "${snapshot}/BASE-CANVAS.sha256" \
+    || { echo '[CRITICAL] Base Canvas changed during broker uninstall' >&2; exit 1; }
 logger --tag openhands-broker-setup -- '{"event":"BROKER_V2_UNINSTALLED"}'
-printf '  [OK] Broker v2 artifacts removed; migrations and protected client key files preserved\n'
+printf '  [OK] Broker v2 artifacts removed; migrations and all protected client key files preserved\n'
