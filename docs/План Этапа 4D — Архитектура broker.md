@@ -434,6 +434,8 @@ Scope: `deployment/broker/**` + документы 4D/Состояние. Base d
 
 ### 4D.2 — Host installation v2 + isolation foundation
 
+**Статус: 🟡 exact frozen-v1 migration package реализован и локально проверен; server preflight/application ещё не выполнены.**
+
 Installer устанавливает только broker artifacts:
 
 - broker Unix identity;
