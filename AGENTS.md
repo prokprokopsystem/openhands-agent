@@ -1,55 +1,48 @@
-# OpenHands Agent — instructions for Codex
+# Обязательные правила работы
 
-These instructions apply to the whole repository.
+Эти правила действуют для всего репозитория.
 
-## Working principle
+## Перед началом работы
 
-- The repository is the source of truth. Do not rely on chat history when repository state disagrees with it.
-- Keep independent engineering judgment. Do **not** assume that a task description, previous ChatGPT recommendation, previous Codex decision, or existing implementation is correct.
-- If you find a contradiction, unsafe assumption, architectural error, or a materially better solution, say so and explain the evidence. Do not blindly implement a known-bad instruction.
-- Limit **actions**, not **thinking**: investigate as broadly as needed for correctness, security, dependencies, and regression risk.
+1. Сначала прочитать `docs/Состояние.md`.
+2. Затем прочитать только текущий план, относящиеся к задаче решения и нужную инструкцию из `deployment/`.
+3. Для существенной работы использовать `.agents/skills/openhands-project-work/SKILL.md`.
 
-## Context economy
+Не перечитывать весь проект и не начинать рассуждение с нуля, если для этого нет конкретной причины.
 
-Start with the smallest useful context:
+## Источник истины
 
-1. `docs/Состояние.md`.
-2. The current stage document referenced there.
-3. The latest relevant commit and diff.
-4. Files directly involved in the task.
+- Репозиторий и история Git — память проекта.
+- `docs/Состояние.md` — единственное место текущего состояния и следующего шага.
+- Зафиксированное состояние считается действующим, пока после него не задокументировано реальное изменение.
+- При противоречии чата и репозитория сначала указать противоречие и опираться на проверенные факты репозитория.
 
-Do not re-read the whole repository by default. Expand the review when necessary to verify an assumption, dependency, security boundary, integration, or regression risk. For an explicit audit/review task, read as broadly as the audit requires.
+## Проверки mini-server
 
-## Change discipline
+Повторная полная проверка mini-server запрещена, если после последней зафиксированной проверки не было документированного изменения.
 
-- Continue from the state recorded in the repository; do not redesign accepted architecture without evidence that it is wrong or unsafe.
-- Prefer the smallest correct change over broad refactoring.
-- Do not fix unrelated issues unless they block the current task. Report them separately.
-- Do not touch production, servers, networking, firewall, SSH, secrets, storage, `main`, or destructive operations unless the user explicitly asks for that exact action.
-- Never expose secrets in chat, logs, diffs, commits, or test output.
-- Reuse existing components, wrappers, tests, scripts, and decisions instead of creating duplicates.
+Повторная проверка разрешена только когда:
 
-## Verification
+- сервер действительно изменён;
+- предыдущая проверка завершилась ошибкой;
+- для следующего действия нужен конкретный факт, которого нет в документации.
 
-- Before changing code, understand the relevant current behavior.
-- After changing code, run the narrowest relevant tests first, then any broader checks needed for confidence.
-- Treat passing tests as evidence, not proof; verify security and behavior assumptions independently when relevant.
-- Do not claim completion when verification is incomplete.
+Перед проверкой кратко указать новое изменение или неизвестный факт, ради которого она нужна. Проверять только это условие, а не весь сервер.
 
-## Project continuity
+## Изменения и документация
 
-For completed implementation work:
+После любого реального изменения кода, конфигурации или mini-server в той же работе:
 
-- Update `docs/Состояние.md` briefly with what changed, verification performed, commit SHA, and the next logical step.
-- Keep documentation consistent with actual repository state.
-- Make focused commits with clear messages.
+- обновить `docs/Состояние.md`;
+- обновить связанную инструкцию;
+- при изменении этапа обновить план;
+- зафиксировать код и документацию вместе.
 
-For read-only review/audit tasks, do not modify documentation unless explicitly requested.
+Изменение без актуальной документации не считается завершённым.
 
-## Project skill
+## Границы
 
-Use the repository skill `openhands-project-work` for substantive work in this project:
-
-- `.agents/skills/openhands-project-work/SKILL.md`
-
-The skill contains the detailed workflow. This `AGENTS.md` stays intentionally short so permanent context remains cheap.
+- Не менять production, mini-server, сеть, SSH, firewall, секреты, хранилища, `main` и защищённые системы без прямого разрешения.
+- Не переделывать утверждённую архитектуру без подтверждённой ошибки или риска.
+- Теоретический риск сам по себе не является препятствием. Остановка допустима при подтверждённой ошибке, выходе за разрешённые границы или реальном риске повреждения.
+- Отчёты писать простым русским языком: «ПРОЙДЕНО», «НЕ ПРОЙДЕНО», «ИЗМЕНЕНО», «НЕ ИЗМЕНЕНО».
