@@ -71,6 +71,21 @@ class ConnectorInstallationTests(unittest.TestCase):
             3,
         )
 
+    def test_post_build_gate_reports_each_failure_and_matches_runtime_banner(self):
+        gate = INSTALL.split("validate_built_image() {", 1)[1].split("preflight() {", 1)[0]
+        build = INSTALL.split("build_image() {", 1)[1].split("write_manifest() {", 1)[0]
+        self.assertIn("validate_built_image", build)
+        self.assertIn(r"OpenSSH_10.0p2\ Debian-7+deb13u4,*", gate)
+        self.assertNotIn('grep -q "OpenSSH_10.0p1"', gate)
+        for message in (
+            "Connector image identity probe failed",
+            "Connector image identity mismatch",
+            "Connector OpenSSH version probe failed",
+            "Connector OpenSSH runtime version mismatch",
+            "Connector broker client is missing or not executable",
+        ):
+            self.assertIn(message, gate)
+
     def test_recovery_requires_real_rollback_reinstall_cycle(self):
         recovery = (ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn("install → rollback → reinstall", recovery)

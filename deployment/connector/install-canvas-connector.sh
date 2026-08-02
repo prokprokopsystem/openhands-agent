@@ -107,6 +107,26 @@ verify_image_state() {
     fi
 }
 
+validate_built_image() {
+    local identity ssh_banner
+    identity="$(docker run --rm --entrypoint /bin/sh "${IMAGE}" -c \
+        'printf "%s:%s\n" "$(id -u)" "$(id -g)"')" \
+        || fail "Connector image identity probe failed"
+    [ "${identity}" = "10001:10001" ] \
+        || fail "Connector image identity mismatch: ${identity}"
+
+    ssh_banner="$(docker run --rm --entrypoint /usr/bin/ssh "${IMAGE}" -V 2>&1)" \
+        || fail "Connector OpenSSH version probe failed"
+    case "${ssh_banner}" in
+        OpenSSH_10.0p2\ Debian-7+deb13u4,*) ;;
+        *) fail "Connector OpenSSH runtime version mismatch: ${ssh_banner}" ;;
+    esac
+
+    docker run --rm --entrypoint /usr/bin/test "${IMAGE}" \
+        -x /usr/local/bin/openhands-broker-client \
+        || fail "Connector broker client is missing or not executable"
+}
+
 preflight() {
     [ ! -e "${CONNECTOR_STATE}" ] || fail "Connector state already exists; use validator"
     [ ! -e "${BASE}/deployment/connector" ] || fail "Unexpected pre-existing runtime connector directory"
@@ -128,8 +148,7 @@ build_image() {
     docker build --pull=false --build-arg "SOURCE_COMMIT=${COMMIT_SHA}" \
         --tag "${IMAGE}" --file deployment/connector/Dockerfile deployment/connector
     verify_image_state
-    docker run --rm --entrypoint /bin/sh "${IMAGE}" -c \
-        'test "$(id -u):$(id -g)" = "10001:10001" && ssh -V 2>&1 | grep -q "OpenSSH_10.0p1" && test -x /usr/local/bin/openhands-broker-client'
+    validate_built_image
     ok "Pinned connector image built and validated"
 }
 
