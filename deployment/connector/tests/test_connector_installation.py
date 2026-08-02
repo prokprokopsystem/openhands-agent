@@ -46,8 +46,9 @@ class ConnectorInstallationTests(unittest.TestCase):
         self.assertIn('rm -rf -- "${BASE}/deployment/connector"', ROLLBACK)
         self.assertNotIn("/usr/local/lib/openhands-broker", ROLLBACK)
         self.assertNotIn("openhands-broker-v2", ROLLBACK)
-        self.assertIn("deployment/network/README.md", INSTALL)
-        self.assertIn("deployment/scripts/validate-static.sh", INSTALL)
+        changed = INSTALL.split("readonly -a CHANGED_FILES=(", 1)[1].split(")", 1)[0]
+        self.assertNotIn("deployment/network/README.md", changed)
+        self.assertNotIn("deployment/scripts/validate-static.sh", changed)
 
     def test_validation_and_e2e_cover_positive_and_negative_paths(self):
         self.assertIn('"tool":"core.ping"', VALIDATE)

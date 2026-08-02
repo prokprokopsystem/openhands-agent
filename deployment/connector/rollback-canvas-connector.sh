@@ -12,9 +12,7 @@ readonly -a CHANGED_FILES=(
     deployment/compose.yaml
     deployment/network/apply-egress-rules.sh
     deployment/network/check-egress.sh
-    deployment/network/README.md
     deployment/scripts/validate-runtime.sh
-    deployment/scripts/validate-static.sh
 )
 
 fail() { printf '  [FAIL] %s\n' "$1" >&2; exit 1; }

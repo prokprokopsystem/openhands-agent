@@ -17,9 +17,7 @@ readonly -a CHANGED_FILES=(
     deployment/compose.yaml
     deployment/network/apply-egress-rules.sh
     deployment/network/check-egress.sh
-    deployment/network/README.md
     deployment/scripts/validate-runtime.sh
-    deployment/scripts/validate-static.sh
 )
 readonly -a PRECONNECTOR_FILES=(
     deployment/compose.yaml
@@ -32,8 +30,6 @@ readonly -a PRECONNECTOR_FILES=(
     deployment/network/apply-egress-rules.sh
     deployment/network/remove-egress-rules.sh
     deployment/network/check-egress.sh
-    deployment/network/README.md
-    deployment/scripts/validate-static.sh
 )
 readonly -a CANONICAL_FILES=(
     "${PRECONNECTOR_FILES[@]}"
