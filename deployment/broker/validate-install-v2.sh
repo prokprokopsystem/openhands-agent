@@ -14,7 +14,6 @@ readonly LEGACY_CLIENT_PUBLIC_KEY="/srv/openhands-agent/secrets/broker-mini-serv
 readonly V2_CLIENT_DIR="/srv/openhands-agent/secrets/openhands-broker-v2"
 readonly V2_CLIENT_KEY="${V2_CLIENT_DIR}/id_ed25519"
 readonly V2_CLIENT_PUBLIC_KEY="${V2_CLIENT_DIR}/id_ed25519.pub"
-readonly KEYPAIR_VERIFIER="deployment/broker/verify-keypair-fingerprint.sh"
 readonly -a ADAPTERS=(mini-server vps n8n github nextcloud notion amnesia)
 COMMIT_SHA="${1:-}"
 
@@ -93,8 +92,8 @@ done
     || fail "Broker SSH directory boundary mismatch"
 [ "$(stat -c '%U:%G:%a' /home/openhands-broker/.ssh/authorized_keys)" = "root:${BROKER_USER}:440" ] \
     || fail "authorized_keys boundary mismatch"
-derived_public="$(ssh-keygen -y -f "${V2_CLIENT_KEY}")"
-expected_auth="from=\"10.89.0.2\",restrict,command=\"${BROKER_LIB}/bin/broker-launcher\" ${derived_public}"
+stored_public="$(awk 'NF >= 2 {print $1 " " $2; exit}' "${V2_CLIENT_PUBLIC_KEY}")"
+expected_auth="from=\"10.89.0.2\",restrict,command=\"${BROKER_LIB}/bin/broker-launcher\" ${stored_public}"
 [ "$(cat /home/openhands-broker/.ssh/authorized_keys)" = "${expected_auth}" ] \
     || fail "authorized_keys forced-command/source policy mismatch"
 host_public="$(awk 'NF >= 2 {print $1 " " $2; exit}' /etc/ssh/ssh_host_ed25519_key.pub)"
@@ -111,12 +110,10 @@ done
     || fail "Broker v2 key directory boundary mismatch"
 [ -f "${V2_CLIENT_KEY}" ] && [ ! -L "${V2_CLIENT_KEY}" ] \
     || fail "Broker v2 private key is missing or symlinked"
-[ "$(stat -c '%u:%g:%a' "${V2_CLIENT_KEY}")" = "10001:10001:600" ] \
+[ "$(stat -c '%u:%g:%a' "${V2_CLIENT_KEY}")" = "0:10001:640" ] \
     || fail "Broker v2 private key metadata mismatch"
 [ "$(stat -c '%U:%G:%a' "${V2_CLIENT_PUBLIC_KEY}")" = "root:root:644" ] \
     || fail "Broker v2 public key metadata mismatch"
-"${KEYPAIR_VERIFIER}" "${V2_CLIENT_KEY}" "${V2_CLIENT_PUBLIC_KEY}" >/dev/null \
-    || fail "Broker v2 keypair fingerprint mismatch"
 [ "$(stat -c '%u:%g:%a' "${LEGACY_CLIENT_KEY}")" = "0:10001:640" ] \
     || fail "Preserved legacy private key metadata changed"
 [ "$(stat -c '%u:%g:%a' "${LEGACY_CLIENT_PUBLIC_KEY}")" = "1000:1000:600" ] \

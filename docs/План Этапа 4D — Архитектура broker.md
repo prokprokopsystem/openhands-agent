@@ -440,7 +440,7 @@ Installer устанавливает только broker artifacts:
 
 - broker Unix identity;
 - сохранение frozen legacy client keypair без chmod/chown/перезаписи;
-- отдельный broker v2 client key и его public key с точной ownership/mode policy `10001:10001 0600` для private key;
+- отдельный broker v2 client key и его public key: private `root:10001 0640` для group-read Canvas без host ownership/write, public `root:root 0644`; host-user `10001` не создаётся;
 - restricted `authorized_keys` entry для broker identity;
 - pinned host trust material, проверенное против фактической host key;
 - fixed launcher/core;

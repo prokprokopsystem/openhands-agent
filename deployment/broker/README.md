@@ -31,9 +31,10 @@ authorization. The legacy private key is preserved as opaque data because its fr
 
 `--preflight-only` performs no lock-file, temporary-file, audit, key, or system-policy
 write. The apply path creates a separate v2 ED25519 client key under
-`/srv/openhands-agent/secrets/openhands-broker-v2/`; its private key is owned by Canvas
-UID/GID `10001:10001` with mode `0600`. Existing legacy key files are never overwritten,
-renamed, chmodded, or deleted.
+`/srv/openhands-agent/secrets/openhands-broker-v2/`; its private key is installed first
+as `root:root 0600`, then finalized as `root:10001 0640`. Canvas receives group-read
+without host ownership or write access. No host user named `10001` is created. Existing
+legacy key files are never overwritten, renamed, chmodded, or deleted.
 
 Private/public v2 key correspondence is checked only by SHA256 fingerprints:
 `ssh-keygen -y -f PRIVATE | ssh-keygen -lf - -E sha256` is compared with

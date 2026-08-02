@@ -1,4 +1,6 @@
 import hashlib
+import os
+import pwd
 import re
 import subprocess
 import tempfile
@@ -111,15 +113,80 @@ class ProtectedBoundaryTests(unittest.TestCase):
                 if "LEGACY_CLIENT_KEY" in line or "broker-mini-server.key" in line:
                     self.assertNotRegex(line, r"\b(rm|mv|cp|install|chmod|chown)\b")
 
-    def test_separate_v2_key_is_created_with_canvas_uid_and_strict_mode(self):
+    def test_separate_v2_key_is_published_root_group_canvas_without_host_user(self):
         keygen = function_body(INSTALL, "ensure_v2_keypair")
+        publisher = function_body(INSTALL, "publish_v2_private_key")
         self.assertIn("ssh-keygen -q -t ed25519", keygen)
-        self.assertIn("-o 10001 -g 10001 -m 0600", keygen)
+        self.assertIn("publish_v2_private_key", keygen)
+        self.assertNotIn("-o 10001", publisher)
+        self.assertNotRegex(INSTALL, r"useradd[^\n]*\b10001\b")
+        install_private = 'install -o root -g root -m 0600 "${source_key}" "${target_key}"'
+        chown_private = 'chown root:10001 "${target_key}"'
+        chmod_private = 'chmod 0640 "${target_key}"'
+        self.assertIn(install_private, publisher)
+        self.assertIn(chown_private, publisher)
+        self.assertIn(chmod_private, publisher)
+        self.assertLess(publisher.index(install_private), publisher.index(chown_private))
+        self.assertLess(publisher.index(chown_private), publisher.index(chmod_private))
         self.assertIn("V2_CLIENT_KEY", keygen)
         self.assertNotIn("LEGACY_CLIENT_KEY", keygen)
-        self.assertIn("10001:10001:600", VALIDATE)
-        self.assertIn("Broker v2 private key is missing or symlinked", INSTALL)
+        self.assertIn("0:10001:640", VALIDATE)
         self.assertIn("Broker v2 private key is missing or symlinked", VALIDATE)
+        self.assertNotIn('ssh-keygen -y -f "${V2_CLIENT_KEY}"', INSTALL)
+        self.assertNotIn('ssh-keygen -y -f "${V2_CLIENT_KEY}"', VALIDATE)
+
+        with self.assertRaises(KeyError):
+            pwd.getpwnam("10001")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            source = root / "source"
+            target = root / "target"
+            source.write_text("private-key-fixture", encoding="utf-8")
+            stubs = {
+                "install": """#!/bin/bash
+[ "$1" = -o ] && [ "$2" = root ] && [ "$3" = -g ] && [ "$4" = root ] || exit 90
+exec /usr/bin/install -m 0600 "$7" "$8"
+""",
+                "chown": """#!/bin/bash
+[ "$1" = root:10001 ] || exit 91
+exit 0
+""",
+                "stat": """#!/bin/bash
+printf '0:10001:640\\n'
+""",
+            }
+            for name, content in stubs.items():
+                path = fake_bin / name
+                path.write_text(content, encoding="utf-8")
+                path.chmod(0o755)
+            script = (
+                "set -euo pipefail\n"
+                "fail() { printf '%s\\n' \"$1\" >&2; exit 1; }\n"
+                f"publish_v2_private_key() {{\n{publisher}}}\n"
+                f"publish_v2_private_key {source} {target}\n"
+            )
+            result = subprocess.run(
+                ["bash", "-c", script],
+                text=True,
+                capture_output=True,
+                env={**os.environ, "PATH": f"{fake_bin}:/usr/bin:/bin"},
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_canvas_identity_can_read_but_not_modify_published_private_key(self):
+        owner_uid, group_gid, mode = 0, 10001, 0o640
+        canvas_uid, canvas_gid = 10001, 10001
+        self.assertNotEqual(canvas_uid, owner_uid)
+        self.assertEqual(canvas_gid, group_gid)
+        self.assertTrue(mode & 0o040, "Canvas group must have read permission")
+        self.assertFalse(mode & 0o020, "Canvas group must not have write permission")
+
+    def test_preexisting_nonempty_v2_key_directory_fails_without_overwrite(self):
+        preflight = function_body(INSTALL, "preflight_v2_key_target")
+        self.assertIn("Unexpected non-empty broker v2 key directory", preflight)
+        self.assertNotRegex(preflight, r"\b(rm|mv|cp|install|chmod|chown|truncate|tee)\b")
 
     def test_keypair_verifier_uses_fingerprints_and_rejects_real_mismatch(self):
         verifier = KEYPAIR_VERIFIER.read_text(encoding="utf-8")
@@ -127,7 +194,6 @@ class ProtectedBoundaryTests(unittest.TestCase):
         self.assertIn("ssh-keygen -lf - -E sha256", verifier)
         self.assertIn('ssh-keygen -lf "${public_key}" -E sha256', verifier)
         self.assertIn("KEYPAIR_VERIFIER", INSTALL)
-        self.assertIn("KEYPAIR_VERIFIER", VALIDATE)
 
         with tempfile.TemporaryDirectory() as directory:
             first = Path(directory) / "first"
@@ -223,6 +289,13 @@ class TransactionTests(unittest.TestCase):
         self.assertIn('"${SNAPSHOT}/home"', rollback)
         self.assertNotIn("/srv/openhands-agent", rollback)
         self.assertIn("systemctl reload ssh.service", rollback)
+
+    def test_rollback_removes_only_new_empty_v2_key_directory(self):
+        rollback = function_body(INSTALL, "restore_snapshot")
+        self.assertIn('"${V2_KEY_DIR_CREATED}" = true', rollback)
+        self.assertIn('find "${V2_CLIENT_DIR}" -mindepth 1 -maxdepth 1 -print -quit', rollback)
+        self.assertIn('rmdir -- "${V2_CLIENT_DIR}"', rollback)
+        self.assertNotIn('rm -rf -- "${V2_CLIENT_DIR}"', rollback)
 
     def test_manual_rollback_restricts_snapshot_path(self):
         self.assertIn('"${STATE_ROOT}/migrations/"*', ROLLBACK)

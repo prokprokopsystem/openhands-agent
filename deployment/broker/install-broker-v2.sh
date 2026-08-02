@@ -55,6 +55,7 @@ fi
 SNAPSHOT=""
 STAGE=""
 MUTATION_STARTED=false
+V2_KEY_DIR_CREATED=false
 CREATED_ADAPTER_USERS=()
 TEMP_PATHS=()
 
@@ -180,15 +181,8 @@ preflight_v2_key_target() {
         return
     fi
     require_directory "${V2_CLIENT_DIR}" "root:root" "700"
-    [ "$(find "${V2_CLIENT_DIR}" -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort)" \
-        = $'id_ed25519\nid_ed25519.pub' ] || fail "Unexpected broker v2 key inventory"
-    [ -f "${V2_CLIENT_KEY}" ] && [ ! -L "${V2_CLIENT_KEY}" ] \
-        || fail "Broker v2 private key is missing or symlinked"
-    [ "$(stat -c '%u:%g:%a' "${V2_CLIENT_KEY}")" = "10001:10001:600" ] \
-        || fail "Broker v2 private key metadata mismatch"
-    require_regular "${V2_CLIENT_PUBLIC_KEY}" "root:root" "644"
-    "${KEYPAIR_VERIFIER}" "${V2_CLIENT_KEY}" "${V2_CLIENT_PUBLIC_KEY}" >/dev/null \
-        || fail "Broker v2 private/public fingerprint mismatch"
+    [ -z "$(find "${V2_CLIENT_DIR}" -mindepth 1 -maxdepth 1 -print -quit)" ] \
+        || fail "Unexpected non-empty broker v2 key directory"
 }
 
 verify_source_commit() {
@@ -233,12 +227,20 @@ verify_base_canvas_manifest() {
         || fail "Base Canvas files changed during broker migration"
 }
 
+publish_v2_private_key() {
+    local source_key="$1" target_key="$2"
+    install -o root -g root -m 0600 "${source_key}" "${target_key}"
+    chown root:10001 "${target_key}"
+    chmod 0640 "${target_key}"
+    [ "$(stat -c '%u:%g:%a' "${target_key}")" = "0:10001:640" ] \
+        || fail "Published broker v2 private key metadata mismatch"
+}
+
 ensure_v2_keypair() {
     local key_stage
     if [ -e "${V2_CLIENT_DIR}" ]; then
         preflight_v2_key_target
-        ok "Existing exact broker v2 client keypair preserved and reused"
-        return
+        rmdir -- "${V2_CLIENT_DIR}"
     fi
 
     key_stage="$(mktemp -d /run/openhands-broker-v2-key.XXXXXX)"
@@ -248,11 +250,15 @@ ensure_v2_keypair() {
         || fail "Generated broker v2 keypair fingerprint mismatch"
 
     mkdir -m 0700 -- "${V2_CLIENT_DIR}"
+    V2_KEY_DIR_CREATED=true
     chown root:root "${V2_CLIENT_DIR}"
-    install -o 10001 -g 10001 -m 0600 "${key_stage}/id_ed25519" "${V2_CLIENT_KEY}"
+    publish_v2_private_key "${key_stage}/id_ed25519" "${V2_CLIENT_KEY}"
     install -o root -g root -m 0644 "${key_stage}/id_ed25519.pub" "${V2_CLIENT_PUBLIC_KEY}"
+    cmp -s "${key_stage}/id_ed25519" "${V2_CLIENT_KEY}" \
+        || fail "Published broker v2 private key content mismatch"
+    cmp -s "${key_stage}/id_ed25519.pub" "${V2_CLIENT_PUBLIC_KEY}" \
+        || fail "Published broker v2 public key content mismatch"
     sync -f "${V2_CLIENT_DIR}"
-    preflight_v2_key_target
     ok "Separate broker v2 client keypair created without changing legacy keys"
 }
 
@@ -296,6 +302,10 @@ restore_snapshot() {
     rm -f -- "${BROKER_STATE}/install-state.json"
     rm -rf -- "${BROKER_STATE}/adapters"
     rm -rf -- /run/openhands-broker
+    if [ "${V2_KEY_DIR_CREATED}" = true ] && [ -d "${V2_CLIENT_DIR}" ] \
+        && [ -z "$(find "${V2_CLIENT_DIR}" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+        rmdir -- "${V2_CLIENT_DIR}"
+    fi
     for user in "${CREATED_ADAPTER_USERS[@]:-}"; do
         [ -n "${user}" ] && userdel "${user}" >/dev/null 2>&1
     done
@@ -370,7 +380,7 @@ install_v2() {
     install -d -o root -g root -m 0700 /run/openhands-broker \
         /run/openhands-broker/approvals /run/openhands-broker/inflight /run/openhands-broker/consumed
 
-    derived_public="$(ssh-keygen -y -f "${V2_CLIENT_KEY}")"
+    derived_public="$(awk 'NF >= 2 {print $1 " " $2; exit}' "${V2_CLIENT_PUBLIC_KEY}")"
     install -d -o root -g root -m 0711 "${BROKER_HOME}" "${BROKER_HOME}/.ssh"
     printf 'from="%s",restrict,command="%s/bin/broker-launcher" %s\n' \
         "${CANVAS_SOURCE}" "${BROKER_LIB}" "${derived_public}" > "${AUTH_KEYS}.new"
