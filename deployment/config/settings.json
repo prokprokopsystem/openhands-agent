@@ -22,7 +22,7 @@
       "openrouter_site_url": "https://docs.all-hands.dev/",
       "openrouter_app_name": "OpenHands",
       "num_retries": 5,
-      "retry_multiplier": 8,
+      "retry_multiplier": 8.0,
       "retry_min_wait": 8,
       "retry_max_wait": 64,
       "timeout": 300,
