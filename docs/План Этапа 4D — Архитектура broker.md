@@ -1,7 +1,7 @@
 # Этап 4D — Архитектура broker
 
 **Версия:** 2.2 (2 августа 2026)
-**Статус:** ✅ `4D.0 REVIEW: PASS`; ✅ `4D.1 REVIEW: PASS`; первая 4D.2 migration attempt остановилась до замены frozen v1, keypair verification исправляется через SHA256 fingerprints
+**Статус:** ✅ `4D.0 REVIEW: PASS`; ✅ `4D.1 REVIEW: PASS`; ✅ `4D.2` host installation/isolation foundation завершён; этапы 4D.3–4D.9 ещё не завершены
 **Основа:** проверенные идеи старого 4D из `fix/canonical-deployment`, без переноса его архитектурного расползания
 
 ---
@@ -434,7 +434,7 @@ Scope: `deployment/broker/**` + документы 4D/Состояние. Base d
 
 ### 4D.2 — Host installation v2 + isolation foundation
 
-**Статус: 🟡 exact frozen-v1 migration package исправлен после первого остановленного preflight; повторный server preflight/application ещё не выполнены.**
+**Статус: ✅ exact frozen-v1 migration выполнена из commit `f9c97c4cc113b081f19c455bd193e014fa3d7585`; read-only preflight, installation validation и broker v2 migration PASS.**
 
 Installer устанавливает только broker artifacts:
 
@@ -460,6 +460,8 @@ Canvas lifecycle/network files; validation, rollback и uninstall подтвер
 Uninstall удаляет только broker artifacts.
 
 Файлы base Canvas на этом этапе не меняются. Client credential и pinned trust material только подготавливаются для последующего read-only mount в 4D.4.
+
+Фактический rollback snapshot: `/var/lib/openhands-broker/migrations/20260802T151702Z-v1-to-f9c97c4cc113`. Создана отдельная v2 keypair private `root:10001 0640` / public `root:root 0644`; frozen legacy keys не изменены. Protocol/forced-command host-only acceptance остаётся частью 4D.3, а Canvas end-to-end — частью 4D.5; завершение 4D.2 не означает завершение всего 4D.
 
 ### 4D.3 — Mini-server Level A implementation + host-only acceptance
 
