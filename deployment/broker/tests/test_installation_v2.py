@@ -1,3 +1,4 @@
+import hashlib
 import re
 import subprocess
 import unittest
@@ -35,6 +36,27 @@ class FrozenBaselineTests(unittest.TestCase):
             ).strip()
             self.assertEqual(actual, expected)
             self.assertIn(expected, INSTALL)
+
+    def test_frozen_policy_hash_guards_are_derived_from_branch(self):
+        frozen = subprocess.check_output(
+            ["git", "show", "fix/canonical-deployment:deployment/broker/setup-broker.sh"],
+            cwd=REPO,
+            text=True,
+        )
+        for marker, constant in (
+            ("SUDO", "OLD_SUDOERS_SHA256"),
+            ("SSHD", "OLD_SSHD_SHA256"),
+        ):
+            match = re.search(
+                rf"^cat > [^\n]* << '{marker}'\n(.*?)^{marker}$",
+                frozen,
+                re.MULTILINE | re.DOTALL,
+            )
+            self.assertIsNotNone(match, f"missing frozen {marker} heredoc")
+            actual = hashlib.sha256(match.group(1).encode()).hexdigest()
+            guarded = re.search(rf'{constant}="([0-9a-f]{{64}})"', INSTALL)
+            self.assertIsNotNone(guarded, f"missing {constant}")
+            self.assertEqual(actual, guarded.group(1))
 
     def test_all_legacy_checks_precede_snapshot_and_mutation(self):
         main = INSTALL.rsplit('\n[ "$(id -u)" -eq 0 ]', 1)[1]
