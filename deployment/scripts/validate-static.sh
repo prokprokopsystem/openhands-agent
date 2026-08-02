@@ -50,10 +50,88 @@ echo ""
 echo "--- Compose invariants ---"
 grep -q 'restart:.*"no"' deployment/compose.yaml && pass "restart: no" || fail "restart: должно быть \"no\""
 grep -q 'docker.sock' deployment/compose.yaml && fail "docker.sock найден в compose" || pass "docker.sock отсутствует"
-grep -q 'test-workspace' deployment/compose.yaml && pass "test-workspace : не общий workspace" || fail "нет test-workspace"
+grep -q 'work-workspace' deployment/compose.yaml && pass "work-workspace : выделенный workspace" || fail "нет work-workspace"
 grep -q 'enable_ipv6: false' deployment/compose.yaml && pass "IPv6 отключён : сеть" || fail "IPv6 не отключён в сети"
 grep -q 'disable_ipv6' deployment/compose.yaml && pass "IPv6 отключён : sysctl" || fail "IPv6 sysctl отсутствует"
 grep -q 'sha256:fc24163754bee' deployment/compose.yaml && pass "digest зафиксирован" || fail "digest отсутствует"
+
+echo ""
+echo "--- Recovery prepare invariants ---"
+PREPARE="deployment/scripts/prepare.sh"
+if ! grep -Fq 'chown -R "${HOST_OWNER}" "${BASE}/secrets"' "${PREPARE}" \
+    && ! grep -Fq 'chmod 600 "${BASE}/secrets/.env"' "${PREPARE}" \
+    && grep -Fq 'chown "${HOST_OWNER}" "${BASE}/secrets"' "${PREPARE}"; then
+    pass "prepare: existing secrets contents are not modified"
+else
+    fail "prepare: secrets contents can be modified"
+fi
+if ! grep -Fq 'chown -R "${CONTAINER_OWNER}" "${BASE}/config"' "${PREPARE}" \
+    && grep -Fq 'find "${BASE}/config" -mindepth 1 -maxdepth 1 -print -quit' "${PREPARE}" \
+    && grep -Fq 'Existing server-side Canvas config preserved; seed skipped.' "${PREPARE}" \
+    && grep -Fq '"${SCRIPT_DIR}/seed-config.sh"' "${PREPARE}" \
+    && ! grep -Fq 'seed-config.sh" --force' "${PREPARE}"; then
+    pass "prepare: non-empty config is preserved; empty config uses normal seed"
+else
+    fail "prepare: config preservation/bootstrap contract broken"
+fi
+
+PREPARE_TEST_ROOT="${VALIDATION_TMP}/prepare-recovery"
+PREPARE_MOCK_BIN="${PREPARE_TEST_ROOT}/bin"
+PREPARE_CHOWN_LOG="${PREPARE_TEST_ROOT}/chown.log"
+mkdir -p "${PREPARE_MOCK_BIN}"
+cat > "${PREPARE_MOCK_BIN}/chown" <<'EOF'
+#!/usr/bin/bash
+printf '%s\n' "$*" >> "${PREPARE_CHOWN_LOG}"
+EOF
+chmod +x "${PREPARE_MOCK_BIN}/chown"
+
+EXISTING_BASE="${PREPARE_TEST_ROOT}/existing"
+mkdir -p "${EXISTING_BASE}/config" "${EXISTING_BASE}/secrets"
+printf '%s\n' '{"existing":true}' > "${EXISTING_BASE}/config/settings.json"
+printf '%s\n' 'LOCAL_BACKEND_API_KEY=recovery-test-only' > "${EXISTING_BASE}/secrets/.env"
+printf '%s\n' 'broker-key-test-fixture' > "${EXISTING_BASE}/secrets/broker-mini-server.key"
+chmod 0644 "${EXISTING_BASE}/secrets/.env"
+chmod 0640 "${EXISTING_BASE}/secrets/broker-mini-server.key"
+EXISTING_CONFIG_HASH="$(sha256sum "${EXISTING_BASE}/config/settings.json")"
+EXISTING_ENV_HASH="$(sha256sum "${EXISTING_BASE}/secrets/.env")"
+EXISTING_BROKER_HASH="$(sha256sum "${EXISTING_BASE}/secrets/broker-mini-server.key")"
+: > "${PREPARE_CHOWN_LOG}"
+if PATH="${PREPARE_MOCK_BIN}:${PATH}" \
+    PREPARE_CHOWN_LOG="${PREPARE_CHOWN_LOG}" \
+    OPENHANDS_BASE="${EXISTING_BASE}" \
+    /usr/bin/bash "${PREPARE}" > "${PREPARE_TEST_ROOT}/existing.log" 2>&1 \
+    && [ "$(sha256sum "${EXISTING_BASE}/config/settings.json")" = "${EXISTING_CONFIG_HASH}" ] \
+    && [ "$(sha256sum "${EXISTING_BASE}/secrets/.env")" = "${EXISTING_ENV_HASH}" ] \
+    && [ "$(sha256sum "${EXISTING_BASE}/secrets/broker-mini-server.key")" = "${EXISTING_BROKER_HASH}" ] \
+    && [ "$(stat -c '%a' "${EXISTING_BASE}/secrets/.env")" = "644" ] \
+    && [ "$(stat -c '%a' "${EXISTING_BASE}/secrets/broker-mini-server.key")" = "640" ] \
+    && grep -Fq 'Existing server-side Canvas config preserved; seed skipped.' "${PREPARE_TEST_ROOT}/existing.log" \
+    && ! grep -Fq '/secrets/.env' "${PREPARE_CHOWN_LOG}" \
+    && ! grep -Fq '/secrets/broker-mini-server.key' "${PREPARE_CHOWN_LOG}"; then
+    pass "prepare behavior: existing config and secret files remain unchanged"
+else
+    fail "prepare behavior: existing config or secret files changed"
+fi
+
+EMPTY_BASE="${PREPARE_TEST_ROOT}/empty"
+mkdir -p "${EMPTY_BASE}/secrets"
+printf '%s\n' \
+    'LOCAL_BACKEND_API_KEY=recovery-test-only' \
+    'DEEPSEEK_API_KEY=recovery-test-only' \
+    > "${EMPTY_BASE}/secrets/.env"
+: > "${PREPARE_CHOWN_LOG}"
+if PATH="${PREPARE_MOCK_BIN}:${PATH}" \
+    PREPARE_CHOWN_LOG="${PREPARE_CHOWN_LOG}" \
+    OPENHANDS_BASE="${EMPTY_BASE}" \
+    /usr/bin/bash "${PREPARE}" > "${PREPARE_TEST_ROOT}/empty.log" 2>&1 \
+    && [ -f "${EMPTY_BASE}/config/settings.json" ] \
+    && [ -f "${EMPTY_BASE}/config/profiles/deepseek-chat.json" ] \
+    && [ -f "${EMPTY_BASE}/config/agent-profiles/default.json" ] \
+    && grep -Fq 'Config seeded successfully.' "${PREPARE_TEST_ROOT}/empty.log"; then
+    pass "prepare behavior: empty config uses normal seed bootstrap"
+else
+    fail "prepare behavior: empty config bootstrap failed"
+fi
 
 # ── 5. Systemd invariants ──
 echo ""
