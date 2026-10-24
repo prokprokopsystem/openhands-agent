@@ -23,6 +23,9 @@ services:
       - /srv/openhands-agent/ssh-client:/home/openhands/.ssh:ro
       - /srv/openhands-agent/secrets/broker-mini-server.key:/run/openhands-ssh-key:ro
 
+    environment:
+      GH_CONFIG_DIR: /home/openhands/.openhands/gh
+
     env_file:
       - /srv/openhands-agent/secrets/.env
 

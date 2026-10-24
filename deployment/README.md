@@ -210,3 +210,58 @@ systemd openhands-agent.service
 **ПРОЙДЕНО:** restore-canvas-ssh.py из f23db19 выполнен; Canvas healthy, реальный SSH после пересоздания вернул mini-server и uid=1000(igor). Image alias указывает на сохранённый ID sha256:293042314e9e535e63c2c65f8df591e3eb545c5d781e402efb799b8a2a5d5a21. Это локальный image, не опубликованный registry artifact; не удалять его при будущей очистке. Повторно запускать восстановление поверх успешной конфигурации не требуется.
 
 Текущие compose.yaml и apply-egress-rules.sh в Git соответствуют применённому SSH-изменению. Server check-egress.sh ещё старый: ожидает блокировку gateway SSH. В Git ожидаемая проверка исправлена на доступность; синхронизировать серверный checker отдельно, не разворачивать весь deployment ради одного файла. GitHub CLI установлен, постоянная авторизация ещё не завершена.
+
+
+## Постоянное хранение авторизации GitHub CLI
+
+**Подготовлено 24 октября; применение ещё не подтверждено.** GH_CONFIG_DIR задаётся как /home/openhands/.openhands/gh и тем самым использует существующий постоянный config mount. Он соответствует /srv/openhands-agent/config/gh на хосте. Наличие gh CLI не означает авторизацию. Сначала настроить постоянный каталог, затем проверить сохранившийся вход и только при его отсутствии выполнять вход в существующий GitHub account.
+
+Однократное применение на проверенном mini-server (без создания backup/token, остальные secrets не менять):
+
+```bash
+sudo python3 - <<'PY'
+import pathlib, os, subprocess, time
+f = pathlib.Path('/srv/openhands-agent/deployment/compose.yaml')
+original = f.read_text()
+anchor = '    env_file:\n'
+if original.count(anchor) != 1 or '    environment:' in original:
+    raise SystemExit('СТОП: Compose отличается от ожидаемого')
+if 'image: openhands-agent-canvas-ssh:1.6.1-restored' not in original:
+    raise SystemExit('СТОП: образ Canvas изменился')
+folder = pathlib.Path('/srv/openhands-agent/config/gh')
+if folder.is_symlink() or (folder.exists() and not folder.is_dir()):
+    raise SystemExit('СТОП: неожиданный объект config/gh')
+folder.mkdir(exist_ok=True)
+os.chown(folder, 10001, 10001)
+folder.chmod(0o700)
+updated = original.replace(anchor,
+    '    environment:\n      GH_CONFIG_DIR: /home/openhands/.openhands/gh\n\n'+anchor, 1)
+attempted_restart = False
+try:
+    f.write_text(updated)
+    subprocess.run(['docker','compose','-f',str(f),'config','--quiet'], check=True)
+    print('Сохраняю постоянный каталог gh. Перезапуск только OpenHands...', flush=True)
+    attempted_restart = True
+    subprocess.run(['systemctl','restart','openhands-agent'], check=True, timeout=240)
+    for _ in range(60):
+        r = subprocess.run(['docker','exec','openhands-agent','printenv','GH_CONFIG_DIR'],
+            capture_output=True, text=True)
+        if r.returncode == 0 and r.stdout.strip() == '/home/openhands/.openhands/gh':
+            break
+        time.sleep(2)
+    else:
+        raise RuntimeError('Новая настройка не появилась в контейнере')
+except Exception:
+    f.write_text(original)
+    if attempted_restart:
+        subprocess.run(['systemctl','restart','openhands-agent'], timeout=240)
+    raise SystemExit('НЕ ПРОЙДЕНО: возвращён исходный Compose')
+print('ПРОЙДЕНО: GH_CONFIG_DIR=/home/openhands/.openhands/gh')
+r = subprocess.run(['docker','exec','openhands-agent','gh','auth','status','--hostname','github.com'],
+    capture_output=True, text=True)
+print(r.stdout)
+print(r.stderr)
+PY
+```
+
+Если gh сообщает not logged in после настройки каталога, это ожидаемый незавершённый шаг. Не записывать токен в Compose/Git/.env; следующий вход gh будет сохранять свои credentials в указанном постоянном runtime directory. Нельзя считать доступ к приватному репозиторию или запись в него проверенными по одному существованию hosts.yml.
