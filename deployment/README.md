@@ -183,3 +183,23 @@ systemd openhands-agent.service
 - `config/settings.json` — `active_profile: deepseek-chat`, `active_agent_profile_id: 2e07efc4-...`
 
 Существующая конфигурация не перезаписывается. Для принудительного обновления: `seed-config.sh --force`.
+
+
+## Восстановление постоянного SSH из сохранённых компонентов — 24 октября 2026
+
+Применять только к проверенному mini-server и показанному исходному compose/network. Это разовый операторский шаг; далее агент использует обычную команду `ssh mini-server`. Новый broker и новый keypair не нужны.
+
+Скрипт: [scripts/restore-canvas-ssh.py](scripts/restore-canvas-ssh.py). Запуск: `sudo python3 /path/to/restore-canvas-ssh.py` из зафиксированного коммита. Подготовлен пакет; результат на сервере пока не подтверждён.
+
+Предусловия: сохранённый image 293042314e9e с SSH/Git/gh; исходный базовый Canvas запущен; ключ root:10001 0640 и публичная часть сохранены; публичная часть уже разрешена в authorized_keys igor. Доверие к серверу берётся с его локального ED25519 host key, не через отключение StrictHostKeyChecking.
+
+Изменения:
+- локальный alias сохранённого image, без build/pull;
+- /srv/openhands-agent/ssh-client/{config,known_hosts}, root:10001, только чтение для контейнера;
+- прежний private key монтируется только для чтения в /run/openhands-ssh-key;
+- два mounts и client image в действующем Compose, pull_policy never;
+- только SSH из 10.89.0.2 к 10.89.0.1:22 в OPENHANDS-INPUT, с сохранением правила при запуске службы.
+
+Проверки: тест обычного SSH в сетевом namespace текущего Canvas до его переключения; после применения — healthy и реальный hostname/id через SSH из контейнера. Меняется только OpenHands. Сохранённый image содержит прежний broker-client executable, но обычный SSH его не вызывает и host broker не восстанавливается. Это локальный сохранённый image, его наличие необходимо при будущем восстановлении/очистке образов.
+
+Скрипт возвращает исходные compose/network из памяти при ошибке и пытается запустить прежний Canvas; файловые backup-копии не создаются. Не редактирует LLM/config/workspace/.env/Telegram и не применяет общий firewall reset. Авторизацию gh проверить и восстановить отдельно: установка CLI не означает наличие GitHub-доступа.
