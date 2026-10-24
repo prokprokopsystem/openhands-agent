@@ -7,7 +7,8 @@
 
 services:
   openhands:
-    image: ghcr.io/openhands/agent-canvas:1.6.1@sha256:fc24163754bee2ab0115b117d57512cc01b4d99770e7ac17c3607e76290deeb6
+    image: openhands-agent-canvas-ssh:1.6.1-restored
+    pull_policy: never
     container_name: openhands-agent
     restart: "no"
 
@@ -19,7 +20,8 @@ services:
       - /srv/openhands-agent/config:/home/openhands/.openhands:rw
       - /srv/openhands-agent/work-workspace:/projects:rw
       - /srv/openhands-agent/docs:/docs:ro
-      - /srv/openhands-agent/secrets:/secrets:ro
+      - /srv/openhands-agent/ssh-client:/home/openhands/.ssh:ro
+      - /srv/openhands-agent/secrets/broker-mini-server.key:/run/openhands-ssh-key:ro
 
     env_file:
       - /srv/openhands-agent/secrets/.env
