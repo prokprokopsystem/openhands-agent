@@ -189,7 +189,7 @@ systemd openhands-agent.service
 
 Применять только к проверенному mini-server и показанному исходному compose/network. Это разовый операторский шаг; далее агент использует обычную команду `ssh mini-server`. Новый broker и новый keypair не нужны.
 
-Скрипт: [scripts/restore-canvas-ssh.py](scripts/restore-canvas-ssh.py). Запуск: `sudo python3 /path/to/restore-canvas-ssh.py` из зафиксированного коммита. Подготовлен пакет; результат на сервере пока не подтверждён.
+Скрипт: [scripts/restore-canvas-ssh.py](scripts/restore-canvas-ssh.py). Запуск: `sudo python3 /path/to/restore-canvas-ssh.py` из зафиксированного коммита. Пакет применён 24 октября; успешный результат приведён ниже. Повторное применение не требуется.
 
 Предусловия: сохранённый image 293042314e9e с SSH/Git/gh; исходный базовый Canvas запущен; ключ root:10001 0640 и публичная часть сохранены; публичная часть уже разрешена в authorized_keys igor. Доверие к серверу берётся с его локального ED25519 host key, не через отключение StrictHostKeyChecking.
 
@@ -209,59 +209,34 @@ systemd openhands-agent.service
 
 **ПРОЙДЕНО:** restore-canvas-ssh.py из f23db19 выполнен; Canvas healthy, реальный SSH после пересоздания вернул mini-server и uid=1000(igor). Image alias указывает на сохранённый ID sha256:293042314e9e535e63c2c65f8df591e3eb545c5d781e402efb799b8a2a5d5a21. Это локальный image, не опубликованный registry artifact; не удалять его при будущей очистке. Повторно запускать восстановление поверх успешной конфигурации не требуется.
 
-Текущие compose.yaml и apply-egress-rules.sh в Git соответствуют применённому SSH-изменению. Server check-egress.sh ещё старый: ожидает блокировку gateway SSH. В Git ожидаемая проверка исправлена на доступность; синхронизировать серверный checker отдельно, не разворачивать весь deployment ради одного файла. GitHub CLI установлен, постоянная авторизация ещё не завершена.
+Текущие compose.yaml и apply-egress-rules.sh в Git соответствуют применённому SSH-изменению. Server check-egress.sh ещё старый: ожидает блокировку gateway SSH. В Git ожидаемая проверка исправлена на доступность; синхронизировать серверный checker отдельно, не разворачивать весь deployment ради одного файла. GitHub CLI авторизован через постоянный каталог; проверка после повторного перезапуска службы пройдена, см. следующий раздел.
 
 
 ## Постоянное хранение авторизации GitHub CLI
 
-**Подготовлено 24 октября; применение ещё не подтверждено.** GH_CONFIG_DIR задаётся как /home/openhands/.openhands/gh и тем самым использует существующий постоянный config mount. Он соответствует /srv/openhands-agent/config/gh на хосте. Наличие gh CLI не означает авторизацию. Сначала настроить постоянный каталог, затем проверить сохранившийся вход и только при его отсутствии выполнять вход в существующий GitHub account.
+**Применено и проверено 24 октября 2026. Повторный login сейчас не нужен.**
 
-Однократное применение на проверенном mini-server (без создания backup/token, остальные secrets не менять):
+В сервисе openhands задано:
 
-```bash
-sudo python3 - <<'PY'
-import pathlib, os, subprocess, time
-f = pathlib.Path('/srv/openhands-agent/deployment/compose.yaml')
-original = f.read_text()
-anchor = '    env_file:\n'
-if original.count(anchor) != 1 or '    environment:' in original:
-    raise SystemExit('СТОП: Compose отличается от ожидаемого')
-if 'image: openhands-agent-canvas-ssh:1.6.1-restored' not in original:
-    raise SystemExit('СТОП: образ Canvas изменился')
-folder = pathlib.Path('/srv/openhands-agent/config/gh')
-if folder.is_symlink() or (folder.exists() and not folder.is_dir()):
-    raise SystemExit('СТОП: неожиданный объект config/gh')
-folder.mkdir(exist_ok=True)
-os.chown(folder, 10001, 10001)
-folder.chmod(0o700)
-updated = original.replace(anchor,
-    '    environment:\n      GH_CONFIG_DIR: /home/openhands/.openhands/gh\n\n'+anchor, 1)
-attempted_restart = False
-try:
-    f.write_text(updated)
-    subprocess.run(['docker','compose','-f',str(f),'config','--quiet'], check=True)
-    print('Сохраняю постоянный каталог gh. Перезапуск только OpenHands...', flush=True)
-    attempted_restart = True
-    subprocess.run(['systemctl','restart','openhands-agent'], check=True, timeout=240)
-    for _ in range(60):
-        r = subprocess.run(['docker','exec','openhands-agent','printenv','GH_CONFIG_DIR'],
-            capture_output=True, text=True)
-        if r.returncode == 0 and r.stdout.strip() == '/home/openhands/.openhands/gh':
-            break
-        time.sleep(2)
-    else:
-        raise RuntimeError('Новая настройка не появилась в контейнере')
-except Exception:
-    f.write_text(original)
-    if attempted_restart:
-        subprocess.run(['systemctl','restart','openhands-agent'], timeout=240)
-    raise SystemExit('НЕ ПРОЙДЕНО: возвращён исходный Compose')
-print('ПРОЙДЕНО: GH_CONFIG_DIR=/home/openhands/.openhands/gh')
-r = subprocess.run(['docker','exec','openhands-agent','gh','auth','status','--hostname','github.com'],
-    capture_output=True, text=True)
-print(r.stdout)
-print(r.stderr)
-PY
+```yaml
+environment:
+  GH_CONFIG_DIR: /home/openhands/.openhands/gh
 ```
 
-Если gh сообщает not logged in после настройки каталога, это ожидаемый незавершённый шаг. Не записывать токен в Compose/Git/.env; следующий вход gh будет сохранять свои credentials в указанном постоянном runtime directory. Нельзя считать доступ к приватному репозиторию или запись в него проверенными по одному существованию hosts.yml.
+Каталог находится внутри существующего bind mount /srv/openhands-agent/config → /home/openhands/.openhands. Host path: /srv/openhands-agent/config/gh; owner 10001:10001 (openhands), mode 700. Не удалять и не заменять его при пересоздании контейнера. Дополнительный том не нужен.
+
+Применение выполнено самим OpenHands через существующий SSH: создан каталог, точечно изменён Compose, config --quiet завершился с exit 0. Пользователь перезапустил только службу OpenHands, затем один раз выполнил вход в существующий аккаунт через gh auth login --hostname github.com --git-protocol https --web. CLI сохранил credentials в постоянном hosts.yml. Ошибка запуска Chromium не помешала завершить device flow через браузер пользователя.
+
+После повторного перезапуска службы сам OpenHands выполнил:
+
+```bash
+ssh mini-server hostname
+gh auth status --hostname github.com
+gh api repos/prokprokopsystem/amnesia-next --jq '.permissions.push'
+```
+
+Получены mini-server, активный аккаунт prokprokopsystem с конфигом /home/openhands/.openhands/gh/hosts.yml и true. Это проверка доступности и разрешений; реальная запись в репозиторий не выполнялась. Новый container ID в финальном отчёте не измерялся.
+
+При обычной работе с домашнего или рабочего компьютера открывать Canvas; SSH и GitHub используются агентом на сервере. Повторный вход потребуется только при фактической потере/отзыве авторизации. Не повторять настройку заранее. Не выводить hosts.yml и не записывать credentials в Compose/Git/.env.
+
+Ранее подготовленная inline-команда изменения Compose удалена из текущей инструкции: настройка уже применена. Её история сохранена в Git; запуск поверх действующей конфигурации не нужен.
