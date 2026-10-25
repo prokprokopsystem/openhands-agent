@@ -1,0 +1,45 @@
+# Производный образ OpenHands Canvas с постоянным набором PDF-инструментов.
+#
+# База: фактически работающий сохранённый образ openhands-agent-canvas-ssh:1.6.1-restored
+#       (sha256:293042314e9e535e63c2c65f8df591e3eb545c5d781e402efb799b8a2a5d5a21,
+#        Debian 13 trixie, Python 3.13.14, пользователь openhands uid/gid 10001).
+# Назначение: добавить только инструменты чтения/обработки/создания PDF.
+# Не менять версии Canvas/SDK, модель, профиль, ENTRYPOINT/CMD/WORKDIR/USER образа.
+#
+# Python-пакеты изолированы в /opt/pdf-tools/venv и НЕ подменяют системный python3
+# и не добавляются в PATH backend. Вызов: /opt/pdf-tools/venv/bin/python ...
+#
+# Версии системных пакетов зафиксированы по кандидатам репозитория Debian 13 на момент сборки.
+# Сборка на mini-server (docker-группа, без sudo):
+#   cd /srv/openhands-agent/build-pdf-tools && \
+#   docker build -f Dockerfile.pdf-tools -t openhands-agent-canvas-ssh:1.6.1-restored-pdftools .
+
+FROM openhands-agent-canvas-ssh:1.6.1-restored
+
+USER root
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Системные PDF-инструменты, OCR и шрифты с кириллицей/польскими буквами.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      poppler-utils=25.03.0-5+deb13u2 \
+      qpdf=12.2.0-1 \
+      tesseract-ocr=5.5.0-1+b1 \
+      tesseract-ocr-eng=1:4.1.0-2 \
+      tesseract-ocr-pol=1:4.1.0-2 \
+      tesseract-ocr-rus=1:4.1.0-2 \
+      fonts-dejavu-core=2.37-8 \
+      fonts-noto-core=20201225-2 \
+ && rm -rf /var/lib/apt/lists/*
+
+# Изолированное Python-окружение для PDF-библиотек (рендер, структура, создание PDF).
+RUN python3 -m venv /opt/pdf-tools/venv \
+ && /opt/pdf-tools/venv/bin/pip install --no-cache-dir --upgrade pip \
+ && /opt/pdf-tools/venv/bin/pip install --no-cache-dir \
+      "PyMuPDF==1.26.4" \
+      "pypdf==6.21.2" \
+      "reportlab==5.1.0" \
+ && /opt/pdf-tools/venv/bin/pip check
+
+# Возврат к штатному непривилегированному пользователю образа.
+USER openhands
