@@ -44,23 +44,44 @@ docker image inspect openhands-agent-canvas-ssh:1.6.1-restored-pdftools --format
 
 ```bash
 docker run --rm --entrypoint bash openhands-agent-canvas-ssh:1.6.1-restored-pdftools -c '
-  set -e
-  T=$(mktemp -d); cd "$T"
-  # двухстраничный PDF с кириллицей/польским через reportlab + DejaVu
+  set -euo pipefail
+  T=$(mktemp -d); trap "rm -rf \"$T\"" EXIT; cd "$T"
   /opt/pdf-tools/venv/bin/python - <<PY
+from reportlab.pdfgen import canvas
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+pdfmetrics.registerFont(TTFont("DejaVu", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"))
+c = canvas.Canvas("t.pdf")
+for text in ["P04 Y1 — Отчёт — ąćęłńóśźż", "Страница 2"]:
+    c.setFont("DejaVu", 20)
+    c.drawString(72, 700, text)
+    c.showPage()
+c.save()
 import pymupdf
-d=pymupdf.open(); 
-for t in ["Отчёт P04 — тест ąćęłńóśźż","Страница 2 — Y1"]:
-    p=d.new_page(); p.insert_text((72,100), t, fontfile="/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", fontsize=16)
-d.save("t.pdf")
+from pypdf import PdfReader, PdfWriter
+d = pymupdf.open("t.pdf")
+d[0].get_pixmap(dpi=150).save("page.png")
+d[0].get_pixmap(dpi=200, clip=pymupdf.Rect(60, 100, 550, 200)).save("clip.png")
+assert "P04 Y1" in d[0].get_text()
+r = PdfReader("t.pdf")
+w = PdfWriter()
+w.append(r)
+w.append(r, pages=[0])
+w.write("merged.pdf")
+assert len(PdfReader("merged.pdf").pages) == 3
+w = PdfWriter()
+w.add_page(r.pages[0].rotate(90))
+w.write("split-rotated.pdf")
+assert len(PdfReader("split-rotated.pdf").pages) == 1
+assert PdfReader("split-rotated.pdf").pages[0].rotation == 90
 PY
-  pdftotext t.pdf - | head -4
-  pdftoppm -r 80 -png -f 1 -l 1 t.pdf page
-  pdfimages -list t.pdf
+  pdftotext t.pdf text.txt
+  grep -F "P04 Y1" text.txt
   qpdf --check t.pdf
-  /opt/pdf-tools/venv/bin/python -c "import pypdf;r=pypdf.PdfReader(\"t.pdf\");r.pages[0].rotate(90);w=pypdf.PdfWriter();w.add_page(r.pages[0]);w.write(\"r.pdf\")"
-  qpdf --check r.pdf
-  printf \"OCR test\" | tesseract stdin stdout
+  qpdf --check merged.pdf
+  qpdf --check split-rotated.pdf
+  tesseract page.png ocr -l eng+pol+rus
+  grep -F "P04" ocr.txt
 '
 ```
 
@@ -75,16 +96,18 @@ PY
 sudo bash /srv/openhands-agent/build-pdf-tools/switch-pdf-image.sh
 ```
 
-Скрипт: делает бэкап `compose.yaml`, меняет только строку `image:`, проверяет compose,
-перезапускает только `openhands-agent.service`, ждёт `healthy` до ~5 минут; при неуспехе
-автоматически возвращает бэкап и перезапускает прежний образ.
+Исправлено 25 октября: скрипт сохраняет точные исходные байты Compose в памяти процесса, без .bak-копий и отдельных lockfiles. До переключения проверяет точные ID обоих образов и наследование Entrypoint/Cmd/User/WorkingDir. После правки сравнивает разобранную конфигурацию: разрешено изменение только image сервиса openhands.
 
-Ручной откат при необходимости:
+Успех означает успешный systemctl restart, новый ID контейнера, точный ожидаемый image ID и running/healthy. Старый healthy-контейнер успехом не считается. При исключении возвращает исходные байты и проверяет healthy прежнего image; если проверка отката не удалась, прямо сообщает это. Внезапное завершение процесса/питания может потерять сохранённые в памяти байты; прежний образ и версия Compose в Git остаются основой ручного восстановления. Дополнительные архивы не создаются.
 
+Перед запуском серверная копия скрипта должна совпадать с исправленной версией этого PR. Более раннюю копию с .bak не запускать.
+
+Проверки без Docker/systemd, включая ошибки Compose/restart/health и откат:
 ```bash
-sudo cp /srv/openhands-agent/deployment/compose.yaml.bak-<TS> /srv/openhands-agent/deployment/compose.yaml
-sudo systemctl restart openhands-agent.service
+python3 deployment/docker/tests/test_switch_pdf_image.py
 ```
+
+Фактический серверный запуск исправленной версии пока не выполнен. После него отдельно проверить рабочие PDF-tools, SSH и GitHub.
 
 Другие сервисы (AMNESIA, Nextcloud, Telegram-gateway, firewall, хостовый Docker) не затрагиваются.
 Старый образ `openhands-agent-canvas-ssh:1.6.1-restored` не удаляется — он остаётся точкой отката.
@@ -105,3 +128,8 @@ sudo systemctl restart openhands-agent.service
   - **Итог:** `A1 DO 100.00 → X6:1 → Y1`, возврат `Y1 → X6:6 → 0 V`; питание COM → +24 V от X8:7.
 - **Устаревшие скрытые имена символов:** элемент A1 в QET имеет тип/текст `a1omron.elmt` / `Delta AX-308EA0MA1P` / `Delta_AX3`, но актуально по PDF и MASTER — `Omron CP2E-N40DT1-D`. Скрытые имена не использовать для идентификации аппарата.
 - **Применение к Canvas НЕ выполнено** (нужен `systemctl restart` = sudo). Готов `switch-pdf-image.sh`.
+
+
+### Отображение схемы в Canvas — замечание 25 октября
+
+В отчёте агента заявлено визуальное чтение PDF. Однако на переданном скриншоте справа открыт .openhands/memory/MEMORY.md с неработающей встроенной ссылкой на P04-training/renders/лист07_full.png. Это не показ схемы пользователю. Открыть реальный PNG напрямую через доступный Canvas preview/file viewer по проверенному пути и убедиться, что пользователь видит страницу. Не создавать ещё один служебный документ вместо картинки и не считать сломанную ссылку подтверждённым preview. Наблюдение не доказывает, что агент сам не видел изображение ранее; оно фиксирует неполадку выдачи результата пользователю.
