@@ -13,11 +13,12 @@
 
 - ответы `ESTABLISHED,RELATED`;
 - DNS TCP/UDP 53;
-- внешний HTTP/HTTPS TCP 80/443.
+- внешний HTTP/HTTPS TCP 80/443;
+- SSH из контейнера `10.89.0.2` на хост-адрес Docker gateway `10.89.0.1:22` (единственное разрешённое направление к хосту — Canvas→хост).
 
 Запрещены:
 
-- mini-server и Docker gateway;
+- mini-server и прочие (кроме SSH `10.89.0.2 → 10.89.0.1:22`) обращения к Docker gateway и внутренним адресам хоста;
 - WireGuard и сети `10.0.0.0/8`;
 - LAN `192.168.0.0/16`;
 - чужие Docker-сети `172.16.0.0/12`;
@@ -49,7 +50,7 @@
 bash /srv/openhands-agent/deployment/network/check-egress.sh
 ```
 
-Скрипт сам выполняет сетевые команды через `docker exec openhands-agent`. Он проверяет внешний HTTPS и блокировку AMNESIA, Nextcloud, SSH mini-server, Docker gateway, LAN-роутера, VPS, публичного SSH и IPv6.
+Скрипт сам выполняет сетевые команды через `docker exec openhands-agent`. Он проверяет внешний DNS/HTTP/HTTPS и доступность обычного SSH к хосту через Docker gateway (`10.89.0.2 → 10.89.0.1:22`), а также блокировку AMNESIA, Nextcloud, SSH mini-server, прочих обращений к Docker gateway, LAN-роутера, VPS, публичного SSH и IPv6.
 
 ## Аварийное удаление правил
 
