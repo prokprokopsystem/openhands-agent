@@ -5,8 +5,11 @@ receive the HookEvent JSON on stdin, and the conversation transcript is read
 from the SDK's own persistence directory (``event-*.json`` per event), which is
 written by the agent server regardless of this plugin.
 
-Scope is deliberately narrow: only projects listed in ``stage1/config.json``
-are captured and written. Everything else stays read-only.
+Scope: ``scope="global"`` writes every conversation it can attribute safely —
+to the project taken from the conversation's own workspace metadata when that
+workspace is a real project directory, otherwise to the general bucket. Nothing
+is ever attributed to a project that cannot be derived from existing metadata,
+and no document is created by this code.
 """
 
 from __future__ import annotations
@@ -82,21 +85,120 @@ def enabled(cfg: dict[str, Any]) -> bool:
     return bool(cfg.get("enabled"))
 
 
-def project_for(cfg: dict[str, Any], working_dir: str | None) -> tuple[str, dict[str, Any]] | None:
-    """Map a conversation working dir to a registered stage-1 project."""
-    if not working_dir:
-        return None
+def general_id(cfg: dict[str, Any]) -> str:
+    return str(cfg.get("general_project_id") or "general")
+
+
+def global_scope(cfg: dict[str, Any]) -> bool:
+    return str(cfg.get("scope") or "global") == "global"
+
+
+def _under(path: Path, root: str) -> bool:
     try:
-        target = Path(working_dir).resolve()
+        path.relative_to(Path(root).expanduser().resolve())
+        return True
     except Exception:
-        return None
-    for key, spec in (cfg.get("projects") or {}).items():
+        return False
+
+
+def _looks_like_hash(name: str) -> bool:
+    return bool(re.fullmatch(r"[0-9a-f]{6,}", name))
+
+
+def find_doc(cfg: dict[str, Any], project_path: Path) -> str | None:
+    """Existing decision document of a project; nothing is ever created."""
+    for relative in cfg.get("doc_candidates") or []:
+        candidate = project_path / relative
         try:
-            if Path(key).resolve() == target:
-                return key, spec
+            if candidate.is_file():
+                return str(candidate)
         except Exception:
             continue
     return None
+
+
+def explicit_spec(cfg: dict[str, Any], path: Path) -> dict[str, Any] | None:
+    for key, spec in (cfg.get("projects") or {}).items():
+        try:
+            if Path(key).expanduser().resolve() == path:
+                return spec
+        except Exception:
+            continue
+    return None
+
+
+def session_working_dir(cfg: dict[str, Any], session_id: str | None) -> str | None:
+    """Workspace recorded by the agent server for this conversation."""
+    if not session_id:
+        return None
+    root = Path(cfg.get("conversations_root", Path.home() / ".openhands/agent-canvas/conversations"))
+    for name in (session_id.replace("-", ""), session_id):
+        try:
+            meta = json.loads((root / name / "meta.json").read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        working_dir = (meta.get("workspace") or {}).get("working_dir") or meta.get("working_dir")
+        if working_dir:
+            return working_dir
+    return None
+
+
+def resolve_context(
+    cfg: dict[str, Any],
+    working_dir: str | None = None,
+    session_id: str | None = None,
+) -> dict[str, Any]:
+    """Decide which project a conversation belongs to, from existing metadata only.
+
+    Order of precedence: an explicit entry in ``projects``, then a real directory
+    under one of ``project_roots`` (identity = directory name), otherwise the
+    general bucket. Ephemeral workspaces (per-canvas hash dirs under /tmp or the
+    container's scratch space) are never turned into projects.
+    """
+    ctx: dict[str, Any] = {
+        "project_id": None,
+        "project_path": None,
+        "canonical_doc": None,
+        "explicit": False,
+        "write": True,
+        "recall": True,
+    }
+    path_text = working_dir or session_working_dir(cfg, session_id)
+    if not path_text:
+        return ctx
+    try:
+        path = Path(path_text).expanduser().resolve()
+    except Exception:
+        return ctx
+
+    spec = explicit_spec(cfg, path)
+    if spec is not None:
+        ctx.update(
+            project_id=spec.get("project_id") or path.name,
+            project_path=str(path),
+            canonical_doc=spec.get("canonical_doc") or find_doc(cfg, path),
+            explicit=True,
+            write=bool(spec.get("write", True)),
+            recall=bool(spec.get("recall", True)),
+        )
+        return ctx
+
+    if str(cfg.get("scope") or "global") != "global":
+        return ctx
+    if not path.is_dir():
+        return ctx
+    if any(_under(path, root) for root in cfg.get("ephemeral_roots") or []):
+        return ctx
+    if any(_looks_like_hash(part) for part in path.parts[-2:]):
+        return ctx
+    if not any(_under(path, root) for root in cfg.get("project_roots") or []):
+        return ctx
+    ctx.update(
+        project_id=path.name,
+        project_path=str(path),
+        canonical_doc=find_doc(cfg, path),
+    )
+    return ctx
 
 
 # ------------------------------------------------------------- filesystem ----
@@ -392,7 +494,9 @@ def doc_facts(path: str | None) -> dict[str, Any]:
     """Parse the canonical decision document into {decision_id: status} + meta."""
     info: dict[str, Any] = {"path": path, "ok": False, "date": None, "sha256": None, "decisions": {}}
     if not path:
-        info["reason"] = "not_configured"
+        # A project without a decision document is a normal case in global mode:
+        # facts are still stored, they are just not doc-confirmed.
+        info["reason"] = "no_project_document"
         return info
     try:
         raw = Path(path).read_bytes()

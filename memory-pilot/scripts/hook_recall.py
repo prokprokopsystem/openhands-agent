@@ -107,22 +107,46 @@ def fragments(query: str) -> list[str]:
     return out
 
 
-def stage1_fragments(query: str, working_dir: str | None) -> list[str]:
-    """Facts written automatically for this project (M3 stage-1 write path).
+def stage1_verdict(info: dict, ids: list[str], general: bool) -> str:
+    """Describe the live status of the decisions named in a stored fact."""
+    if general:
+        return "общий факт, вне проекта — документально не подтверждается"
+    if info.get("reason") == "no_project_document":
+        return "у проекта нет канонического документа — актуальность не подтверждена"
+    if not info.get("ok"):
+        return "документ недоступен — актуальность не подтверждена"
+    if not ids:
+        return f"документ {info.get('date') or '?'} — решения не названы"
+    parts = [f"{i} — {info['decisions'].get(i, 'в документе нет')}" for i in ids]
+    return f"документ {info.get('date') or '?'}: " + "; ".join(parts)
+
+
+def stage1_fragments(query: str, working_dir: str | None, session_id: str | None = None) -> list[str]:
+    """Facts written automatically (M3 stage-1 write path), project first.
 
     Kept separate from the corpus search: a missing or broken stage-1 store must
-    not be reported as "memory unavailable".
+    not be reported as "memory unavailable". In global mode a project chat sees
+    its own project facts plus generally useful facts; a chat without a project
+    sees only the general bucket, so nothing is borrowed from a random project.
     """
     import stage1_common as s1
 
     cfg = s1.load_config()
     if not s1.enabled(cfg):
         return []
-    resolved = s1.project_for(cfg, working_dir)
-    if resolved is None:
+    ctx = s1.resolve_context(cfg, working_dir, session_id)
+    if not ctx.get("recall", True):
         return []
-    _, spec = resolved
-    if not spec.get("recall"):
+    if not s1.global_scope(cfg) and not ctx.get("explicit"):
+        return []
+
+    general = s1.general_id(cfg)
+    targets: list[str] = []
+    if ctx.get("project_id"):
+        targets.append(ctx["project_id"])
+    if s1.global_scope(cfg) and general not in targets:
+        targets.append(general)
+    if not targets:
         return []
 
     with s1.store_lock(cfg["store"], wait=3.0) as got:
@@ -130,43 +154,47 @@ def stage1_fragments(query: str, working_dir: str | None) -> list[str]:
             log("stage1 store busy, fragments skipped")
             return []
         mem = s1.build_memory(cfg, with_llm=False)
-        hits = mem.search(
-            query,
-            top_k=6,
-            filters={
-                "agent_id": cfg.get("agent_id", "stage1-write"),
-                "project_id": spec.get("project_id"),
-            },
-        )
+        hits: list[tuple[str, dict]] = []
+        for project_id in targets:
+            try:
+                found = mem.search(
+                    query,
+                    top_k=4,
+                    filters={"agent_id": cfg.get("agent_id", "stage1-write"), "project_id": project_id},
+                )
+            except Exception as exc:
+                log(f"stage1 search for {project_id} failed: {type(exc).__name__}: {exc}")
+                continue
+            hits.extend((project_id, hit) for hit in found.get("results") or [])
         mem = None
         s1.release_store()
+    if not hits:
+        return []
+
     # Current status is taken from the document itself at read time: a fact
     # stored yesterday may describe a decision the document has since replaced.
-    info = s1.doc_facts(spec.get("canonical_doc"))
+    info = s1.doc_facts(ctx.get("canonical_doc"))
     out: list[str] = []
-    for hit in hits.get("results", []):
+    general_used = 0
+    for project_id, hit in hits:
         meta = hit.get("metadata") or {}
+        is_general = not meta.get("project_path")
+        if is_general and general_used >= 1:
+            continue
         body = " ".join((hit.get("memory") or "").split())
         if len(body) > FRAGMENT_CHARS:
             body = body[:FRAGMENT_CHARS].rsplit(" ", 1)[0] + "…"
         conv = str(meta.get("source_conversation") or "?")
-        ids = sorted(
-            {re.sub(r"\s+", "", m).replace("К", "K") for m in s1.DECISION_RE.findall(body)}
-        )
-        if not info.get("ok"):
-            verdict = "документ недоступен — актуальность не подтверждена"
-        elif not ids:
-            verdict = f"документ {info.get('date') or '?'} — решения не названы"
-        else:
-            parts = [
-                f"{i} — {info['decisions'].get(i, 'в документе нет')}" for i in ids
-            ]
-            verdict = f"документ {info.get('date') or '?'}: " + "; ".join(parts)
+        ids = sorted({re.sub(r"\s+", "", m).replace("К", "K") for m in s1.DECISION_RE.findall(body)})
+        verdict = stage1_verdict(info, ids, is_general)
+        label = meta.get("project_id") or project_id
         out.append(
-            f"- {meta.get('project_id', '?')} · записано из разговора {conv[:8]}"
+            f"- {label} · записано из разговора {conv[:8]}"
             f" · {meta.get('observation_date', '?')} · {verdict}\n  {body}"
         )
-        if len(out) >= 2:
+        if is_general:
+            general_used += 1
+        if len(out) >= 3:
             break
     return out
 
@@ -186,7 +214,7 @@ def main() -> int:
     started = time.time()
     degraded: str | None = None
     try:
-        parts = stage1_fragments(query[:1000], event.get("working_dir"))
+        parts = stage1_fragments(query[:1000], event.get("working_dir"), session_id)
     except Exception as exc:
         log(f"stage1 search failed: {type(exc).__name__}: {exc}")
         parts = []

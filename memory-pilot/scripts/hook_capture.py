@@ -42,16 +42,22 @@ def main() -> int:
     if not s1.enabled(cfg):
         return 0
 
-    resolved = s1.project_for(cfg, event.get("working_dir"))
-    if resolved is None:
-        return 0
-    _, project = resolved
-
     session_id = event.get("session_id") or ""
     if not session_id:
         s1.log(HOOK, "no session_id")
         return 0
     conv_hex = session_id.replace("-", "")
+
+    # Project comes from the conversation's own workspace metadata (the hook
+    # event carries it; the stored meta.json is the fallback). No project is
+    # ever invented: an unknown or ephemeral workspace goes to the general bucket.
+    ctx = s1.resolve_context(cfg, event.get("working_dir"), session_id)
+    if not ctx.get("write"):
+        return 0
+    # scope=test is the previous limited mode: only projects listed in the config.
+    if not s1.global_scope(cfg) and not ctx.get("explicit"):
+        return 0
+    project_id = ctx.get("project_id") or s1.general_id(cfg)
 
     events = s1.events_dir(cfg, session_id)
     if events is None:
@@ -73,15 +79,21 @@ def main() -> int:
             fresh = [r for r in records if r.get("event_id") not in known]
             for record in fresh:
                 record["conversation_id"] = session_id
-                record["project_id"] = project.get("project_id")
+                record["project_id"] = project_id
+                if ctx.get("project_path"):
+                    record["project_path"] = ctx["project_path"]
             s1.append_queue(conv_hex, fresh)
             state["last_index"] = highest
             state["last_capture_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-            state["project_id"] = project.get("project_id")
+            state["project_id"] = project_id
+            state["project_path"] = ctx.get("project_path")
             state["captured_total"] = int(state.get("captured_total", 0)) + len(fresh)
             s1.write_state(conv_hex, state)
             if fresh:
-                s1.log(HOOK, f"{conv_hex}: +{len(fresh)} turns (queued={len(known) + len(fresh)})")
+                s1.log(
+                    HOOK,
+                    f"{conv_hex}: +{len(fresh)} turns (queued={len(known) + len(fresh)}) project={project_id}",
+                )
         except Exception as exc:
             s1.log(HOOK, f"{conv_hex}: capture failed: {type(exc).__name__}: {exc}")
     real_stdout.close()

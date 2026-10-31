@@ -56,7 +56,7 @@ def encrypted_key(plaintext: str) -> str:
     return cipher.encrypt(plaintext.encode()).decode()
 
 
-def create_conversation(prompt: str, profile: str = "deepseek-chat") -> str:
+def create_conversation(prompt: str, profile: str = "deepseek-chat", workspace: str = PROJECT) -> str:
     import sys as _sys
 
     _sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -85,7 +85,7 @@ def create_conversation(prompt: str, profile: str = "deepseek-chat") -> str:
         "secrets_encrypted": True,
         "agent_settings": agent_settings,
         "plugins": [{"source": PLUGIN}],
-        "workspace": {"kind": "LocalWorkspace", "working_dir": PROJECT},
+        "workspace": {"kind": "LocalWorkspace", "working_dir": workspace},
         "confirmation_policy": {"kind": "NeverConfirm"},
         "max_iterations": 40,
         "stuck_detection": True,
@@ -149,7 +149,7 @@ def show_state() -> None:
     doc = Path(PROJECT) / "Решения.md"
     print("\n--- canonical document -------------------------------------------")
     print(doc.read_text(encoding="utf-8").strip() if doc.exists() else "(missing)")
-    print("\n--- queue --------------------------------------------------------")
+    print(f"\n--- queue (scope={json.loads((ROOT / 'stage1' / 'config.json').read_text(encoding='utf-8')).get('scope')}) ---")
     queue = ROOT / "stage1" / "queue"
     for path in sorted(queue.glob("*.jsonl")):
         print(f"{path.name}: {len(path.read_text(encoding='utf-8').splitlines())} pending turns")
@@ -175,11 +175,12 @@ def main() -> int:
     parser.add_argument("conversation_id", nargs="?")
     parser.add_argument("--label", default="")
     parser.add_argument("--text", default="")
+    parser.add_argument("--workspace", default=PROJECT, help="LocalWorkspace path for the new chat")
     args = parser.parse_args()
 
     if args.command in ("say", "ask"):
         print(f"# {args.label or args.command}: {args.text[:120]}")
-        conversation_id = create_conversation(args.text)
+        conversation_id = create_conversation(args.text, workspace=args.workspace)
         status = wait(conversation_id)
         report(conversation_id, status)
         show_state()

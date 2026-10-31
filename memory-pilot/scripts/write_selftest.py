@@ -29,6 +29,11 @@ CONV_ROOT = BASE / "conversations"
 CFG_PATH = BASE / "config.json"
 DOC_PATH = BASE / "Решения.md"
 PROJECT_WORKDIR = "/projects/memory-pilot-test"
+# Global mode: an auto-detected project root and an ephemeral scratch area, so
+# the test proves attribution without depending on the live config's roots.
+AUTO_ROOT = BASE / "projects"
+AUTO_PROJECT = AUTO_ROOT / "auto-project"
+SCRATCH = BASE / "scratch" / "conversation-9f2c7a1b"
 
 os.environ["MEMORY_STAGE1_CONFIG"] = str(CFG_PATH)
 sys.path.insert(0, str(SCRIPTS))
@@ -44,14 +49,17 @@ def check(name: str, ok: bool, detail: str = "") -> None:
 
 # ------------------------------------------------------------------ setup ----
 
-def write_config(store: Path | None = None) -> None:
+def write_config(store: Path | None = None, scope: str = "global") -> None:
     live = json.loads((ROOT / "stage1" / "config.json").read_text(encoding="utf-8"))
     live.update(
         {
+            "scope": scope,
             "store": str(store or BASE / "store"),
             "collection": "selftest_memories",
             "agent_id": "selftest-write",
             "conversations_root": str(CONV_ROOT),
+            "project_roots": [str(AUTO_ROOT)],
+            "ephemeral_roots": [str(BASE / "scratch"), "/tmp", "/home/openhands/workspace"],
         }
     )
     live["projects"] = {
@@ -115,13 +123,13 @@ def run_hook(script: str, payload: dict, extra: list[str] | None = None) -> tupl
     return proc.returncode, proc.stdout, proc.stderr
 
 
-def capture(conv_hex: str) -> tuple[int, str, str]:
+def capture(conv_hex: str, working_dir: str = PROJECT_WORKDIR) -> tuple[int, str, str]:
     return run_hook(
         "hook_capture.py",
         {
             "event_type": "Stop",
             "session_id": conv_hex,
-            "working_dir": PROJECT_WORKDIR,
+            "working_dir": working_dir,
             "metadata": {"reason": "agent_finished"},
         },
     )
@@ -413,6 +421,201 @@ def test_k_scenarios() -> None:
     )
 
 
+MSG_AUTO = [
+    ("user", "Принято решение K7 по проекту auto-project: питание шкафа идёт от блока DR-120-24 через автомат QF1."),
+    ("assistant", "Записал K7 в Решения.md, статус — действует."),
+    ("user", "Отвергнутый вариант: блок питания DR-60-24 не подходит, мощность меньше требуемой."),
+]
+
+MSG_GENERAL = [
+    ("user", "Запомни на будущее, это общий факт для всех наших работ: в контейнере OpenHands нельзя перезапускать службу systemctl без sudo, поэтому агент работает без перезапуска сервисов."),
+    ("assistant", "Понял, учту: systemctl без sudo недоступен."),
+    ("user", "Ещё ограничение: рабочий каталог /tmp в контейнере не сохраняется после пересоздания контейнера, хранить результаты надо в /projects."),
+    ("user", "Погода сегодня холодная, кофе опять остыл."),
+]
+
+AUTO_DOC = [
+    "# Решения проекта auto-project",
+    "",
+    "Дата пересмотра: 2026-10-31",
+    "Версия: selftest-global",
+    "",
+    "## K7 — питание шкафа",
+    "Статус: действует",
+    "",
+    "## История изменений",
+    "",
+    "- 2026-10-31 — файл создан роботом-тестом, не автоматикой памяти.",
+    "",
+]
+
+
+def test_global_scope() -> None:
+    """Global mode: auto-detected project, general bucket, no false attribution."""
+    AUTO_PROJECT.mkdir(parents=True, exist_ok=True)
+    (AUTO_PROJECT / "Решения.md").write_text("\n".join(AUTO_DOC), encoding="utf-8")
+    SCRATCH.mkdir(parents=True, exist_ok=True)
+    before_files = sorted(p.name for p in AUTO_PROJECT.iterdir())
+
+    project_conv = new_conversation(MSG_AUTO, "auto project")
+    capture(project_conv, str(AUTO_PROJECT))
+    write_batch(project_conv)
+
+    general_conv = new_conversation(MSG_GENERAL, "general chat")
+    capture(general_conv, str(SCRATCH))
+    write_batch(general_conv)
+
+    memory = mem()
+    facts = all_facts(memory)
+    auto = [r for r in facts if "K7" in (r.get("memory") or "")]
+    auto_meta = (auto[0].get("metadata") or {}) if auto else {}
+    check(
+        "T7a global: unlisted project directory is detected from the workspace",
+        bool(auto)
+        and auto_meta.get("project_id") == "auto-project"
+        and auto_meta.get("scope") == "project",
+        f"facts={len(auto)} meta={json.dumps(auto_meta, ensure_ascii=False)[:150]}",
+    )
+    check(
+        "T7b global: project with its own document confirms the decision",
+        bool(auto) and auto_meta.get("doc_confirmed") is True,
+        str((auto_meta.get("doc_statuses") or auto_meta.get("doc_reason")))[:120],
+    )
+
+    gen = [r for r in facts if "systemctl" in (r.get("memory") or "") or "/tmp" in (r.get("memory") or "")]
+    gen_meta = (gen[0].get("metadata") or {}) if gen else {}
+    check(
+        "T7c global: ephemeral workspace facts go to the general bucket",
+        bool(gen)
+        and gen_meta.get("project_id") == "general"
+        and gen_meta.get("scope") == "general",
+        f"facts={len(gen)} meta={json.dumps(gen_meta, ensure_ascii=False)[:150]}",
+    )
+    check(
+        "T7d global: general facts are never marked document-confirmed",
+        bool(gen) and gen_meta.get("doc_confirmed") is False and gen_meta.get("doc_reason") == "no_project_document",
+        str(gen_meta.get("doc_reason")),
+    )
+    noise = [t for t in texts(memory) if "кофе" in t or "Погода" in t]
+    check("T7e global: chatter from the general chat is not stored", not noise, str(noise)[:150])
+
+    cross = [
+        r
+        for r in facts
+        if "systemctl" in (r.get("memory") or "")
+        and (r.get("metadata") or {}).get("project_id") != "general"
+    ]
+    check("T7f global: general facts are not attached to a project", not cross, f"{len(cross)} misattributed")
+
+    after_files = sorted(p.name for p in AUTO_PROJECT.iterdir())
+    check(
+        "T7g global: no documents are created automatically",
+        before_files == after_files,
+        f"{before_files} -> {after_files}",
+    )
+
+
+def test_global_recall() -> None:
+    """Recall must reach the right bucket: project chat sees project facts,
+    general chat sees general facts, and neither borrows the other's project."""
+    import gc
+
+    gc.collect()
+    rc, out, _ = run_hook(
+        "hook_recall.py",
+        {
+            "event_type": "UserPromptSubmit",
+            "session_id": "selftest-recall-general",
+            "working_dir": str(SCRATCH),
+            "message": "Что нельзя делать в контейнере OpenHands и где хранить результаты?",
+        },
+    )
+    context = ""
+    try:
+        context = json.loads(out).get("additionalContext", "")
+    except Exception:
+        pass
+    check(
+        "T8a global recall: general chat finds general facts",
+        rc == 0 and "systemctl" in context,
+        context.replace("\n", " ")[:220],
+    )
+    check(
+        "T8b global recall: general chat gets no project facts",
+        rc == 0 and "K7" not in context and "DR-120-24" not in context,
+        context.replace("\n", " ")[:160],
+    )
+
+    rc, out, _ = run_hook(
+        "hook_recall.py",
+        {
+            "event_type": "UserPromptSubmit",
+            "session_id": "selftest-recall-auto",
+            "working_dir": str(AUTO_PROJECT),
+            "message": "Как питается шкаф проекта auto-project?",
+        },
+    )
+    context = ""
+    try:
+        context = json.loads(out).get("additionalContext", "")
+    except Exception:
+        pass
+    check(
+        "T8c global recall: project chat finds its own facts",
+        rc == 0 and ("K7" in context or "DR-120-24" in context),
+        context.replace("\n", " ")[:220],
+    )
+
+
+def test_test_scope_rollback() -> None:
+    """scope=test must restore the previous limited mode exactly."""
+    write_config(scope="test")
+    before = len(all_facts(mem()))
+    scratch_conv = new_conversation(
+        [("user", "Принято решение K9 по проекту scratch-rollback: реле K9 ставим на выход Q0.3, чтобы проверить ограниченный режим.")],
+        "scope=test scratch",
+    )
+    capture(scratch_conv, str(SCRATCH))
+    queued = len(queue_records(scratch_conv))
+    write_batch(scratch_conv)
+    after = len(all_facts(mem()))
+    check(
+        "T9a rollback: scope=test captures nothing outside the listed projects",
+        queued == 0 and after == before,
+        f"queued={queued} facts {before}->{after}",
+    )
+
+    import gc
+
+    gc.collect()
+    rc, out, _ = run_hook(
+        "hook_recall.py",
+        {
+            "event_type": "UserPromptSubmit",
+            "session_id": "selftest-scope-test",
+            "working_dir": str(SCRATCH),
+            "message": "Что известно про ограничения контейнера?",
+        },
+    )
+    check("T9b rollback: scope=test injects no stage-1 facts outside projects", "записано из разговора" not in out, f"rc={rc}")
+
+    rc, out, _ = run_hook(
+        "hook_recall.py",
+        {
+            "event_type": "UserPromptSubmit",
+            "session_id": "selftest-scope-test-project",
+            "working_dir": PROJECT_WORKDIR,
+            "message": "Что известно про проект TEST-WRITE-01?",
+        },
+    )
+    check(
+        "T9c rollback: scope=test still recalls the listed project",
+        "записано из разговора" in out,
+        f"rc={rc} len={len(out)}",
+    )
+    write_config()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--keep", action="store_true", help="keep the selftest store")
@@ -423,6 +626,8 @@ def main() -> int:
     (BASE / "queue").mkdir(parents=True, exist_ok=True)
     (BASE / "state").mkdir(parents=True, exist_ok=True)
     CONV_ROOT.mkdir(parents=True, exist_ok=True)
+    AUTO_ROOT.mkdir(parents=True, exist_ok=True)
+    SCRATCH.mkdir(parents=True, exist_ok=True)
     write_config()
     write_doc({"K1": ("реле K1 от выхода Q0.0", "действует")})
 
@@ -434,6 +639,9 @@ def main() -> int:
     test_doc_fail_closed()
     test_failure_isolation()
     test_k_scenarios()
+    test_global_scope()
+    test_global_recall()
+    test_test_scope_rollback()
 
     passed = sum(1 for _, ok, _ in RESULTS if ok)
     print(f"\n{passed}/{len(RESULTS)} checks passed in {time.time() - started:.1f}s")

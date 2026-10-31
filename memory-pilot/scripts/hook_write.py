@@ -42,23 +42,58 @@ def batch_messages(records: list[dict[str, Any]]) -> list[dict[str, str]]:
     ]
 
 
-def spec_by_project(cfg: dict[str, Any], project_id: str | None) -> tuple[str, dict[str, Any]] | None:
-    for key, spec in (cfg.get("projects") or {}).items():
-        if spec.get("project_id") == project_id:
-            return key, spec
-    return None
+def spec_for(cfg: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
+    """Resolve the write target from what capture recorded, not from a whitelist.
+
+    The canonical document is re-checked here (not taken from the queue) so a
+    document that appeared since capture is picked up, and a deleted one stops
+    confirming decisions.
+    """
+    project_id = record.get("project_id") or s1.general_id(cfg)
+    path_text = record.get("project_path")
+    doc = None
+    if path_text:
+        try:
+            path = Path(path_text).resolve()
+        except Exception:
+            path = None
+        if path is not None and path.is_dir():
+            spec = s1.explicit_spec(cfg, path)
+            if spec is not None:
+                project_id = spec.get("project_id") or project_id
+            doc = (spec or {}).get("canonical_doc") or s1.find_doc(cfg, path)
+    return {
+        "project_id": project_id,
+        "project_path": path_text,
+        "canonical_doc": doc,
+        "general": not path_text,
+    }
+
+
+def instructions_for(cfg: dict[str, Any], spec: dict[str, Any]) -> str:
+    """Fill the extraction prompt for a project or for the general bucket."""
+    template = cfg.get("custom_instructions") or ""
+    if spec.get("project_path"):
+        scope_line = f"проект «{spec['project_id']}» (каталог {spec['project_path']})"
+        suffix = f" Указывай проект «{spec['project_id']}» в каждом факте."
+    else:
+        scope_line = "проект не определён — это общий разговор агента"
+        suffix = " Не приписывай факты проекту, если он не назван в диалоге."
+    return (
+        template.replace("{{scope_line}}", scope_line)
+        .replace("{{project_suffix}}", suffix)
+        .replace("{{project_id}}", str(spec["project_id"]))
+        .replace("{{date}}", time.strftime("%Y-%m-%d"))
+    )
 
 
 def memory_for(cfg: dict[str, Any], spec: dict[str, Any], cache: dict[str, Any]):
     """One Memory per project: custom_instructions needs the project name/date."""
-    key = spec.get("project_id", "?")
+    key = spec["project_id"]
     if key in cache:
         return cache[key]
     scoped = dict(cfg)
-    template = cfg.get("custom_instructions") or ""
-    scoped["custom_instructions"] = template.replace("{{project_id}}", str(key)).replace(
-        "{{date}}", time.strftime("%Y-%m-%d")
-    )
+    scoped["custom_instructions"] = instructions_for(cfg, spec)
     cache[key] = s1.build_memory(scoped, with_llm=True)
     return cache[key]
 
@@ -104,15 +139,12 @@ def process_conversation(conv_hex: str, cfg: dict[str, Any], cache: dict[str, An
         ids = ",".join(str(r.get("event_id")) for r in batch)
         batch_id = hashlib.sha256(f"{conv_hex}|{ids}".encode()).hexdigest()[:16]
 
-        resolved = spec_by_project(cfg, batch[0].get("project_id"))
-        if resolved is None:
-            outcome["status"] = "project_not_registered"
-            return outcome
-        _, spec = resolved
+        spec = spec_for(cfg, batch[0])
 
         agent_id = cfg.get("agent_id", "stage1-write")
         metadata = {
-            "project_id": batch[0].get("project_id"),
+            "project_id": spec["project_id"],
+            "scope": "project" if spec.get("project_path") else "general",
             "observation_date": (batch[0].get("ts") or "")[:10],
             "source": f"conversation:{batch[0].get('conversation_id')}",
             "source_conversation": batch[0].get("conversation_id"),
@@ -120,7 +152,9 @@ def process_conversation(conv_hex: str, cfg: dict[str, Any], cache: dict[str, An
             "batch_id": batch_id,
             "stage": "stage1-auto",
         }
-        outcome.update(records=len(batch), batch_id=batch_id)
+        if spec.get("project_path"):
+            metadata["project_path"] = spec["project_path"]
+        outcome.update(records=len(batch), batch_id=batch_id, project_id=spec["project_id"])
 
         try:
             mem = memory_for(cfg, spec, cache)
