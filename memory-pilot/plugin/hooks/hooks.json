@@ -1,0 +1,15 @@
+{
+  "user_prompt_submit": [
+    {
+      "matcher": "*",
+      "hooks": [
+        {
+          "type": "command",
+          "name": "mem0-recall",
+          "command": "/projects/memory-pilot/venv/bin/python /projects/memory-pilot/scripts/hook_recall.py",
+          "timeout": 25
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,5 @@
+{
+  "name": "memory-pilot",
+  "version": "0.1.0",
+  "description": "Read-only long-term memory: injects relevant Mem0 fragments into each user message (M3 read stage)."
+}
