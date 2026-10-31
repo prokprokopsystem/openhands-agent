@@ -223,6 +223,13 @@ def main() -> int:
         return 0
 
     text = render(kept)
+    if degraded:
+        # Corpus search failed but stage-1 facts are usable: say so instead of
+        # presenting a partial selection as the whole memory.
+        text += (
+            "\n[Часть памяти недоступна (поиск по корпусу не выполнен): "
+            f"{degraded[:120]} — подборка неполная.]"
+        )
     log(f"{len(kept)} hits ({elapsed:.2f}s): {query[:60]!r}")
     emit(text)
     return 0
