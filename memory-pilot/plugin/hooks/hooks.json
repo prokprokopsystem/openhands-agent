@@ -11,5 +11,44 @@
         }
       ]
     }
+  ],
+  "stop": [
+    {
+      "matcher": "*",
+      "hooks": [
+        {
+          "type": "command",
+          "name": "mem0-capture",
+          "command": "/projects/memory-pilot/venv/bin/python /projects/memory-pilot/scripts/hook_capture.py",
+          "timeout": 30
+        }
+      ]
+    }
+  ],
+  "session_end": [
+    {
+      "matcher": "*",
+      "hooks": [
+        {
+          "type": "command",
+          "name": "mem0-write-flush",
+          "command": "/projects/memory-pilot/venv/bin/python /projects/memory-pilot/scripts/hook_write.py",
+          "timeout": 180
+        }
+      ]
+    }
+  ],
+  "session_start": [
+    {
+      "matcher": "*",
+      "hooks": [
+        {
+          "type": "command",
+          "name": "mem0-write-sweep",
+          "command": "/projects/memory-pilot/venv/bin/python /projects/memory-pilot/scripts/hook_write.py --sweep",
+          "timeout": 180
+        }
+      ]
+    }
   ]
 }

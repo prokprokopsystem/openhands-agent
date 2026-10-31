@@ -10,6 +10,7 @@ Any failure exits 0 with no output, so a broken index can never block a chat.
 
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -106,6 +107,70 @@ def fragments(query: str) -> list[str]:
     return out
 
 
+def stage1_fragments(query: str, working_dir: str | None) -> list[str]:
+    """Facts written automatically for this project (M3 stage-1 write path).
+
+    Kept separate from the corpus search: a missing or broken stage-1 store must
+    not be reported as "memory unavailable".
+    """
+    import stage1_common as s1
+
+    cfg = s1.load_config()
+    if not s1.enabled(cfg):
+        return []
+    resolved = s1.project_for(cfg, working_dir)
+    if resolved is None:
+        return []
+    _, spec = resolved
+    if not spec.get("recall"):
+        return []
+
+    with s1.store_lock(cfg["store"], wait=3.0) as got:
+        if not got:
+            log("stage1 store busy, fragments skipped")
+            return []
+        mem = s1.build_memory(cfg, with_llm=False)
+        hits = mem.search(
+            query,
+            top_k=6,
+            filters={
+                "agent_id": cfg.get("agent_id", "stage1-write"),
+                "project_id": spec.get("project_id"),
+            },
+        )
+        mem = None
+        s1.release_store()
+    # Current status is taken from the document itself at read time: a fact
+    # stored yesterday may describe a decision the document has since replaced.
+    info = s1.doc_facts(spec.get("canonical_doc"))
+    out: list[str] = []
+    for hit in hits.get("results", []):
+        meta = hit.get("metadata") or {}
+        body = " ".join((hit.get("memory") or "").split())
+        if len(body) > FRAGMENT_CHARS:
+            body = body[:FRAGMENT_CHARS].rsplit(" ", 1)[0] + "…"
+        conv = str(meta.get("source_conversation") or "?")
+        ids = sorted(
+            {re.sub(r"\s+", "", m).replace("К", "K") for m in s1.DECISION_RE.findall(body)}
+        )
+        if not info.get("ok"):
+            verdict = "документ недоступен — актуальность не подтверждена"
+        elif not ids:
+            verdict = f"документ {info.get('date') or '?'} — решения не названы"
+        else:
+            parts = [
+                f"{i} — {info['decisions'].get(i, 'в документе нет')}" for i in ids
+            ]
+            verdict = f"документ {info.get('date') or '?'}: " + "; ".join(parts)
+        out.append(
+            f"- {meta.get('project_id', '?')} · записано из разговора {conv[:8]}"
+            f" · {meta.get('observation_date', '?')} · {verdict}\n  {body}"
+        )
+        if len(out) >= 2:
+            break
+    return out
+
+
 def main() -> int:
     try:
         event = json.load(sys.stdin)
@@ -119,16 +184,24 @@ def main() -> int:
     session_id = event.get("session_id")
 
     started = time.time()
+    degraded: str | None = None
     try:
-        parts = fragments(query[:1000])
+        parts = stage1_fragments(query[:1000], event.get("working_dir"))
+    except Exception as exc:
+        log(f"stage1 search failed: {type(exc).__name__}: {exc}")
+        parts = []
+    try:
+        parts += fragments(query[:1000])
     except Exception as exc:
         log(f"search failed: {type(exc).__name__}: {exc}")
-        degraded_notice(session_id, f"{type(exc).__name__}: {exc}")
-        return 0
+        degraded = f"{type(exc).__name__}: {exc}"
     elapsed = time.time() - started
 
     if not parts:
-        log(f"no hits ({elapsed:.2f}s): {query[:60]!r}")
+        if degraded:
+            degraded_notice(session_id, degraded)
+        else:
+            log(f"no hits ({elapsed:.2f}s): {query[:60]!r}")
         return 0
 
     def render(items: list[str]) -> str:
