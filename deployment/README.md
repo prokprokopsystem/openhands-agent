@@ -178,11 +178,42 @@ systemd openhands-agent.service
 5. Устанавливает права `10001:10001`, mode 600.
 
 Результат после `prepare.sh`:
-- `config/agent-profiles/default.json` — UUID-профиль с 10 инструментами WORK MODE, critic_enabled: true, RU system_message_suffix
+- `config/agent-profiles/default.json` — UUID-профиль `default` (`id 2e07efc4-...`) с 10 инструментами WORK MODE, critic_enabled: true, RU system_message_suffix
 - `config/profiles/deepseek-chat.json` — модель `deepseek/deepseek-v4-pro`, base_url `https://api.deepseek.com/v1`
-- `config/settings.json` — `active_profile: deepseek-chat`, `active_agent_profile_id: 2e07efc4-...`
+- `config/settings.json` — `active_profile: deepseek-chat`, `active_agent_profile_id: 2e07efc4-...` (то есть `default`)
+
+`seed-config.sh` создаёт только эти три файла. Шаблон
+`deployment/config/agent-profiles/work.json` в bootstrap не входит и скриптом не
+копируется — активный рабочий профиль `work` восстанавливается из него отдельным
+явным действием. Причина: `default.json` — другой профиль (`id 2e07efc4-...`,
+имя `default`), он не является исходным шаблоном для `work` и не может его
+заменить.
 
 Существующая конфигурация не перезаписывается. Для принудительного обновления: `seed-config.sh --force`.
+`--force` не применять на рабочем сервере: он перезапишет действующие
+`settings.json` и `default.json` шаблонами.
+
+### Шаблон профиля `work`
+
+`deployment/config/agent-profiles/work.json` — безопасный шаблон активного
+профиля: `id f8d9c25a-7235-4809-b0ff-692416343ca1`, `name work`, `revision 5`,
+10 инструментов WORK MODE, `llm_profile_ref deepseek-chat`, текст правил вместе с
+разделом «Начало нового чата» (2590 символов). API-ключей, токенов и ссылок на
+файлы секретов в шаблоне нет: профиль ссылается на LLM-профиль по имени, ключ
+остаётся в `profiles/deepseek-chat.json`.
+
+Шаблон восстанавливает совпадающие по документации поля, но не является
+заявленной побайтовой копией серверного файла. Порядок восстановления при
+отсутствии профиля:
+
+1. скопировать шаблон в `/srv/openhands-agent/config/agent-profiles/work.json`;
+2. установить владельца `10001:10001` и mode 600;
+3. прописать `active_agent_profile_id` в `settings.json` (правка только этого
+   поля, с копией `*.bak-YYYYMMDD`);
+4. проверить загрузку `AgentProfileStore().load("work")` и `GET /api/agent-profiles`.
+
+Действующий серверный `work.json` подменять шаблоном не нужно: он уже содержит
+актуальную ревизию и работает.
 
 
 ## Где хранятся глобальные инструкции агента
@@ -214,8 +245,11 @@ systemd openhands-agent.service
 4. проверить JSON и загрузку профиля: `AgentProfileStore().load("work")`;
 5. повторно вызвать `GET /api/agent-profiles` и убедиться, что сервер видит новую ревизию.
 
-Шаблоны `deployment/config/` содержат тот же раздел, поэтому восстановление из
-Git не теряет правила. Сами рабочие файлы конфигурации остаются вне Git (DEC-015).
+Шаблоны `deployment/config/agent-profiles/default.json` и `work.json` содержат тот
+же раздел «Начало нового чата», поэтому текст правил не теряется при
+восстановлении из Git. Сам активный профиль восстанавливается только из
+`work.json`; `seed-config.sh` его не копирует (см. выше). Сами рабочие файлы
+конфигурации остаются вне Git (DEC-015).
 
 
 ## Восстановление постоянного SSH из сохранённых компонентов — 24 октября 2026
