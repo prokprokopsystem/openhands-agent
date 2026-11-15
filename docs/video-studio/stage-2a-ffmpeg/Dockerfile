@@ -1,6 +1,6 @@
-# FFmpeg + ffprobe, статическая сборка BtbN (GPL), закреплённая версия и сумма.
-# Образ намеренно минимальный: нет Chromium, Node, HyperFrames и других приложений.
-# База Debian нужна, потому что бинарники BtbN собраны под glibc, а не под musl.
+# FFmpeg + ffprobe, сборка BtbN (GPL), закреплённая версия и сумма.
+# Образ минимальный: нет Chromium, Node, HyperFrames и других приложений.
+# База Debian, потому что бинарники BtbN собраны под glibc, а не под musl.
 # Корневая ФС в рантайме монтируется read-only.
 
 FROM debian:bookworm-slim@sha256:c67e92c8099ba22853ab4cfda7cfb494d253d6012ca82dee98ba8976772af018 AS fetch
@@ -31,7 +31,10 @@ RUN groupadd -g 10001 studio \
 
 COPY --from=fetch /ffmpeg-bin/ffmpeg /usr/local/bin/ffmpeg
 COPY --from=fetch /ffmpeg-bin/ffprobe /usr/local/bin/ffprobe
+COPY guard.sh /usr/local/bin/ffmpeg-guard
+
+RUN chmod 0755 /usr/local/bin/ffmpeg-guard
 
 USER 10001:10001
 WORKDIR /work
-ENTRYPOINT ["/usr/local/bin/ffmpeg"]
+ENTRYPOINT ["/usr/local/bin/ffmpeg-guard"]

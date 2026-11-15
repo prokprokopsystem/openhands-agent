@@ -1,10 +1,21 @@
 name: video-studio
 
+# Схема защиты диска:
+#   • ffmpeg может писать только в tmpfs /out — предел объёма задаёт ядро;
+#   • каталог хоста НЕ монтируется в контейнер вообще, поэтому процесс
+#     монтажа физически не имеет цели для записи на диск;
+#   • результат забирается наружу одним шагом docker cp (scripts/run-render.sh),
+#     объём копии заведомо не больше размера tmpfs.
+#
+# Контейнер работает постоянно (sleep infinity), потому что tmpfs живёт только
+# пока контейнер запущен. Рендеры выполняются внутри него через docker exec.
 services:
-  ffmpeg:
+  studio:
     image: video-studio/ffmpeg:8.0.1
     build:
       context: ./image/ffmpeg
+    entrypoint: ["/bin/sleep"]
+    command: ["infinity"]
     user: "10001:10001"
     read_only: true
     init: true
@@ -19,24 +30,24 @@ services:
       - ALL
     network_mode: "none"
     restart: "no"
-    # RLIMIT_FSIZE: ядро не даст записать один файл больше 4 GiB.
+    # Второй независимый предел: размер одного файла (ядро).
     ulimits:
-      fsize: 4294967296
+      fsize: 1073741824
     tmpfs:
-      - /tmp:size=1g,mode=1777
+      # 1777, потому что uid/gid в опциях tmpfs этот runtime не принимает:
+      # смонтированный tmpfs принадлежит root, а процесс работает от 10001.
+      # В контейнере существует единственный пользователь, поэтому риск нулевой.
+      - /out:size=1g,mode=1777
+      - /tmp:size=256m,mode=1777
       - /run:size=16m,mode=0755
     volumes:
       - type: bind
         source: ./work
         target: /work
         read_only: true
-      - type: bind
-        source: ./out
-        target: /out
-        read_only: false
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
-    entrypoint: ["/usr/local/bin/ffmpeg"]
+    stop_grace_period: 10s
