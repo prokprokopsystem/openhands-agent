@@ -74,25 +74,64 @@ if [ "$APPLY" = "1" ]; then
     die "подтверждение не совпало: ожидалось --confirm-serial $EXPECT_SERIAL"
 fi
 
-# Подписи файловых систем в разделе: тип через blkid -p (чтение с устройства,
-# а не из кэша udev) плюс список от wipefs -n (только печать). Пустая строка
-# означает, что стирать нечего.
-probe_signatures() {
-  local part="$1" probe_out err_file wipefs_out
+# Раздел должен читаться. blkid на отсутствующий путь отвечает кодом 2 без
+# текста в stderr, поэтому «сигнатуры нет» и «доступа нет» по нему неразличимы.
+# Чтение первых 512 байт отвечает на этот вопрос напрямую.
+assert_part_readable() {
+  local part="$1" err_file rc msg
   err_file=$(mktemp) || die "mktemp не удался"
-  probe_out=$(blkid -p -o value -s TYPE "$part" 2>"$err_file" || true)
-  if [ -s "$err_file" ]; then
-    local msg
-    msg=$(tr '\n' ' ' < "$err_file")
-    rm -f "$err_file"
-    die "blkid -p не смог проверить $part: $msg"
-  fi
+  rc=0
+  dd if="$part" of=/dev/null bs=512 count=1 status=none 2>"$err_file" || rc=$?
+  msg=$(tr '\n' ' ' < "$err_file" | tr -s ' ' | sed 's/^ //; s/ $//')
   rm -f "$err_file"
-  wipefs_out=""
-  if command -v wipefs >/dev/null 2>&1; then
-    wipefs_out=$(wipefs -n "$part" 2>/dev/null | awk '$1 ~ /^0x/ {print $2}' | sort -u | tr '\n' ' ' || true)
-  fi
-  printf '%s' "$probe_out $wipefs_out" | tr -s ' ' | sed 's/^ //; s/ $//'
+  [ "$rc" = 0 ] || die "раздел $part не читается (dd, код $rc): ${msg:-без сообщения}"
+  [ -z "$msg" ] || die "чтение $part сообщило об ошибке: $msg"
+}
+
+# Подписи файловых систем в разделе: тип из blkid -p (чтение с устройства, а не
+# из кэша udev) плюс типы из wipefs -n. Столбцы wipefs заданы явно: вывод по
+# умолчанию начинается с имени устройства, и разбор по положению давал пустоту.
+# Пустой результат означает, что стирать нечего; ошибка любой из утилит — отказ,
+# а не «чисто».
+probe_signatures() {
+  local part="$1" out err_file rc blkid_types wipefs_types msg
+  assert_part_readable "$part"
+  out=$(mktemp) || die "mktemp не удался"
+  err_file=$(mktemp) || { rm -f "$out"; die "mktemp не удался"; }
+
+  # blkid: 0 — тип опознан либо у найденного объекта нет токена TYPE (так
+  # выглядит таблица разделов), 2 — ничего не опознано. Остальные коды —
+  # ошибка. Текст в stderr — тоже ошибка, даже при коде 2.
+  rc=0
+  blkid -p -o value -s TYPE "$part" >"$out" 2>"$err_file" || rc=$?
+  blkid_types=$(tr '\n' ' ' < "$out" | tr -s ' ' | sed 's/^ //; s/ $//')
+  msg=$(tr '\n' ' ' < "$err_file" | tr -s ' ' | sed 's/^ //; s/ $//')
+  case "$rc" in
+    0|2)
+      if [ -n "$msg" ]; then
+        rm -f "$out" "$err_file"
+        die "blkid -p не смог прочитать $part (код $rc): $msg"
+      fi
+      ;;
+    *)
+      rm -f "$out" "$err_file"
+      die "blkid -p завершился с кодом $rc${msg:+: $msg}
+Считать раздел чистым по такому ответу нельзя."
+      ;;
+  esac
+
+  # wipefs: столбцы перечислены явно, формат по умолчанию не разбирается.
+  # Ненулевой код — ошибка чтения, а не отсутствие подписей.
+  rc=0
+  wipefs --no-act --noheadings --output TYPE "$part" >"$out" 2>"$err_file" || rc=$?
+  wipefs_types=$(tr '\n' ' ' < "$out" | tr -s ' ' | sed 's/^ //; s/ $//')
+  msg=$(tr '\n' ' ' < "$err_file" | tr -s ' ' | sed 's/^ //; s/ $//')
+  rm -f "$out" "$err_file"
+  [ "$rc" = 0 ] || die "wipefs -n завершился с кодом $rc${msg:+: $msg}
+Считать раздел чистым по такому ответу нельзя."
+
+  { printf '%s\n' $blkid_types; printf '%s\n' $wipefs_types; } \
+    | awk 'NF' | sort -u | tr '\n' ' ' | sed 's/ $//'
 }
 
 # Проверка адресации: раздел обязан быть первым разделом именно того узла, на

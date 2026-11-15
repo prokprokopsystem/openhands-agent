@@ -128,15 +128,37 @@ echo "${FAKE_UUID:-test-uuid-1234}" > "$FAKE_STATE/uuid"
 exit 0
 EOF
 
+  # Коды возврата как у настоящего blkid 2.41: 0 — токен найден (или объект
+  # опознан, но токена TYPE у него нет), 2 — ничего не опознано; при ошибке
+  # чтения тоже 2, но с текстом в stderr. На отсутствующий путь — 2 без текста.
   cat > "$bin/blkid" <<'EOF'
 #!/bin/sh
+echo "blkid $*" >> "$FAKE_LOG"
 st="$FAKE_STATE"
+dev=""; token=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -s|--match-tag) token="$2"; shift ;;
+    -o|--output) shift ;;
+    -p|--probe|-t|--poll) ;;
+    -*) ;;
+    *) dev="$1" ;;
+  esac
+  shift
+done
+[ "${FAKE_BLKID_FAIL_NOSTDERR:-0}" = 1 ] && exit 4
+[ -n "$dev" ] && [ ! -e "$dev" ] && exit 2
+[ "${FAKE_BLKID_DENIED:-0}" = 1 ] && { echo "blkid: error: $dev: Permission denied" >&2; exit 2; }
+sig=$(cat "$st/sig" 2>/dev/null)
 uuid=$(cat "$st/uuid" 2>/dev/null)
 [ -n "$uuid" ] || uuid="${FAKE_UUID:-test-uuid-1234}"
-sig=$(cat "$st/sig" 2>/dev/null)
-case "$*" in
-  *"-s TYPE"*) [ -n "$sig" ] || exit 2; echo "$sig" ;;
-  *"-s UUID"*) echo "$uuid" ;;
+case "$token" in
+  TYPE)
+    [ -n "$sig" ] && { echo "$sig"; exit 0; }
+    # Таблица разделов без файловой системы: код 0, но токена TYPE нет.
+    [ "${FAKE_BLKID_DOS_ONLY:-0}" = 1 ] && exit 0
+    exit 2 ;;
+  UUID) [ -n "$sig" ] || exit 2; echo "$uuid" ;;
   *) echo "$uuid" ;;
 esac
 EOF
@@ -174,18 +196,45 @@ EOF
 exit 0
 EOF
 
+  # Формат и коды возврата как у util-linux 2.41: по умолчанию печатается
+  # DEVICE OFFSET TYPE UUID LABEL, поэтому разбор по положению столбца на этом
+  # выводе даёт пустоту. Ошибка открытия — код 1 и текст в stderr.
   cat > "$bin/wipefs" <<'EOF'
 #!/bin/sh
 echo "wipefs $*" >> "$FAKE_LOG"
 st="$FAKE_STATE"
+dev=""; output=""; noact=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -n|--no-act) noact=1 ;;
+    -i|--noheadings|-a|--all|-q|--quiet|-f|--force) ;;
+    -O|--output) output="$2"; shift ;;
+    --output=*) output="${1#*=}" ;;
+    -*) ;;
+    *) dev="$1" ;;
+  esac
+  shift
+done
+[ -n "$dev" ] || { echo "wipefs: error: no device specified" >&2; exit 1; }
+[ -e "$dev" ] || { echo "wipefs: error: $dev: probing initialization failed: No such file or directory" >&2; exit 1; }
+[ -r "$dev" ] || { echo "wipefs: error: $dev: probing initialization failed: Permission denied" >&2; exit 1; }
 sig=$(cat "$st/sig" 2>/dev/null)
-case "$*" in
-  *-n*)
-    # Только печать: формат как у настоящего wipefs, строки начинаются с 0x.
-    [ -n "$sig" ] && printf 'offset               type\n----------------------------------------------------------------\n0x00000003    %s\n' "$sig"
-    exit 0 ;;
-esac
-[ "${FAKE_WIPEFS_FAIL:-0}" = 1 ] && { echo "wipefs: не удалось стереть (подставной)" >&2; exit 1; }
+if [ "$noact" = 1 ]; then
+  [ "${FAKE_WIPEFS_PROBE_FAIL:-0}" = 1 ] && {
+    echo "wipefs: error: $dev: probing initialization failed: Input/output error" >&2; exit 1; }
+  if [ -n "$output" ]; then
+    case "$output" in
+      TYPE) [ -n "$sig" ] && echo "$sig" ;;
+      OFFSET|OFFSET,TYPE) [ -n "$sig" ] && printf '0x3 %s\n' "$sig" ;;
+      *) echo "wipefs: error: unsupported column: $output" >&2; exit 1 ;;
+    esac
+  else
+    printf 'DEVICE    OFFSET TYPE UUID LABEL\n'
+    [ -n "$sig" ] && printf '%s 0x3    %s\n' "$dev" "$sig"
+  fi
+  exit 0
+fi
+[ "${FAKE_WIPEFS_FAIL:-0}" = 1 ] && { echo "wipefs: error: $dev: erase failed" >&2; exit 1; }
 [ "${FAKE_WIPEFS_KEEP:-0}" = 1 ] || : > "$st/sig"
 exit 0
 EOF
@@ -269,7 +318,8 @@ setup_env() {
         FAKE_SERIAL_SWITCH FAKE_SERIAL FAKE_ROOT FAKE_HOST_FREE_GIB \
         FAKE_TOTAL_KI MIN_GIB FAKE_PARTTYPE FAKE_PARTLABEL FAKE_PART_START \
         FAKE_PART_BYTES FAKE_FUSER_BUSY FAKE_WIPEFS_FAIL FAKE_WIPEFS_KEEP \
-        FAKE_MKFS_FAIL FAKE_UUID
+        FAKE_MKFS_FAIL FAKE_UUID FAKE_WIPEFS_PROBE_FAIL FAKE_BLKID_DOS_ONLY \
+        FAKE_BLKID_FAIL_NOSTDERR FAKE_BLKID_DENIED
 }
 
 # Для проверок verify-storage: смонтированное хранилище с маркером и записью
@@ -828,6 +878,110 @@ grep -q '^  sgdisk --zap-all' "$SB/out.txt" && bad "в плане повторн
 grep -qF "wipefs -a" "$SB/out.txt" && ok "в плане есть стирание подписей" || bad "в плане нет wipefs"
 grep -qF "stdin от /dev/null" "$SB/out.txt" && ok "в плане видно неинтерактивность" || bad "нет пометки stdin"
 cmp -s "$FAKE_FSTAB" "$SB/fstab.orig" && ok "fstab не изменён" || bad "fstab изменён"
+
+# =============================================================================
+head_ "S26. setup-ssd-storage.sh: подпись видит только wipefs, blkid пуст"
+setup_env
+cp "$SRC/host/setup-ssd-storage.sh" "$SB/host/"
+patch_ssd "$SB/host/setup-ssd-storage.sh"
+make_expected_layout
+echo dos > "$FAKE_STATE/sig"
+out=$(FAKE_ROOT=1 FAKE_BLKID_DOS_ONLY=1 "$SB/host/setup-ssd-storage.sh" --apply --confirm-serial 24257G400264 2>&1); rc=$?
+printf '%s' "$out" > "$SB/out.txt"
+[ "$rc" = 0 ] && ok "код 0" || { bad "код $rc"; tail -6 "$SB/out.txt"; }
+grep -q "найдено: dos" "$SB/out.txt" && ok "подпись dos найдена по wipefs" || bad "подпись не найдена"
+[ "$(grep -c '^wipefs -a' "$FAKE_LOG")" = 1 ] && ok "стирание выполнено" || bad "стирание не выполнено"
+
+# =============================================================================
+head_ "S27. setup-ssd-storage.sh: wipefs -n отказал — чистым не считается"
+setup_env
+cp "$SRC/host/setup-ssd-storage.sh" "$SB/host/"
+patch_ssd "$SB/host/setup-ssd-storage.sh"
+make_expected_layout
+out=$(FAKE_ROOT=1 FAKE_WIPEFS_PROBE_FAIL=1 "$SB/host/setup-ssd-storage.sh" --apply --confirm-serial 24257G400264 2>&1); rc=$?
+[ "$rc" != 0 ] && ok "код $rc" || bad "ошибка пробы не замечена"
+printf '%s' "$out" | grep -q "wipefs -n завершился с кодом 1" && ok "код возврата назван" || bad "нет кода возврата"
+printf '%s' "$out" | grep -q "Считать раздел чистым" && ok "сказано, что чистым не считается" || bad "нет пояснения"
+[ "$(grep -c '^wipefs -a' "$FAKE_LOG")" = 0 ] && ok "стирание не выполнялось" || bad "wipefs -a вызван"
+[ "$(grep -c '^mkfs.ext4' "$FAKE_LOG")" = 0 ] && ok "mkfs не выполнялся" || bad "mkfs вызван"
+
+# =============================================================================
+head_ "S28. setup-ssd-storage.sh: blkid отказал с непонятным кодом без stderr"
+setup_env
+cp "$SRC/host/setup-ssd-storage.sh" "$SB/host/"
+patch_ssd "$SB/host/setup-ssd-storage.sh"
+make_expected_layout
+out=$(FAKE_ROOT=1 FAKE_BLKID_FAIL_NOSTDERR=1 "$SB/host/setup-ssd-storage.sh" --apply --confirm-serial 24257G400264 2>&1); rc=$?
+[ "$rc" != 0 ] && ok "код $rc" || bad "отказ blkid не замечен"
+printf '%s' "$out" | grep -q "blkid -p завершился с кодом 4" && ok "код назван" || bad "нет кода"
+[ "$(grep -c '^wipefs -a' "$FAKE_LOG")" = 0 ] && ok "стирание не выполнялось" || bad "wipefs -a вызван"
+[ "$(grep -c '^mkfs.ext4' "$FAKE_LOG")" = 0 ] && ok "mkfs не выполнялся" || bad "mkfs вызван"
+
+# =============================================================================
+head_ "S29. setup-ssd-storage.sh: blkid не смог прочитать раздел"
+setup_env
+cp "$SRC/host/setup-ssd-storage.sh" "$SB/host/"
+patch_ssd "$SB/host/setup-ssd-storage.sh"
+make_expected_layout
+out=$(FAKE_ROOT=1 FAKE_BLKID_DENIED=1 "$SB/host/setup-ssd-storage.sh" --apply --confirm-serial 24257G400264 2>&1); rc=$?
+[ "$rc" != 0 ] && ok "код $rc" || bad "ошибка чтения не замечена"
+printf '%s' "$out" | grep -q "Permission denied" && ok "причина названа" || bad "нет сообщения"
+[ "$(grep -c '^mkfs.ext4' "$FAKE_LOG")" = 0 ] && ok "mkfs не выполнялся" || bad "mkfs вызван"
+
+# =============================================================================
+head_ "S30. setup-ssd-storage.sh: столбцы wipefs заданы явно"
+setup_env
+cp "$SRC/host/setup-ssd-storage.sh" "$SB/host/"
+patch_ssd "$SB/host/setup-ssd-storage.sh"
+make_expected_layout
+echo ntfs > "$FAKE_STATE/sig"
+out=$(FAKE_ROOT=1 "$SB/host/setup-ssd-storage.sh" --apply --confirm-serial 24257G400264 2>&1); rc=$?
+[ "$rc" = 0 ] && ok "код 0" || bad "код $rc"
+probe_line=$(grep -m1 '^wipefs --no-act' "$FAKE_LOG")
+[ -n "$probe_line" ] && ok "проба вызвана с --no-act" || bad "проба не найдена в журнале"
+case "$probe_line" in
+  *"--output TYPE"*) ok "столбец TYPE задан явно" ;;
+  *) bad "столбец не задан: $probe_line" ;;
+esac
+case "$probe_line" in
+  *"--noheadings"*) ok "заголовок отключён" ;;
+  *) bad "нет --noheadings: $probe_line" ;;
+esac
+
+# =============================================================================
+head_ "S31. probe_signatures на настоящих wipefs и blkid"
+setup_env
+if ! command -v wipefs >/dev/null 2>&1 || ! command -v blkid >/dev/null 2>&1; then
+  ok "пропущено: wipefs или blkid не установлены"
+else
+  awk '/^assert_part_readable\(\)/{f=1} f{print} f&&/^}$/{n++; if(n==2) exit}' \
+    "$SRC/host/setup-ssd-storage.sh" > "$SB/funcs.sh"
+  cat > "$SB/real-probe.sh" <<'EOF'
+#!/bin/bash
+set -u
+. "$1"
+die() { echo "ОТКАЗ: $*" >&2; exit 1; }
+probe_signatures "$2"
+EOF
+  truncate -s 2M "$SB/blank.img"
+  truncate -s 2M "$SB/dos.img"
+  truncate -s 2M "$SB/luks.img"
+  printf '\x55\xaa' | dd of="$SB/dos.img" bs=1 seek=510 conv=notrunc status=none 2>/dev/null
+  printf 'LUKS\xba\xbe' | dd of="$SB/luks.img" bs=1 conv=notrunc status=none 2>/dev/null
+  real_path="/usr/sbin:/usr/bin:/sbin:/bin"
+  got=$(PATH="$real_path" bash "$SB/real-probe.sh" "$SB/funcs.sh" "$SB/blank.img" 2>&1)
+  [ -z "$got" ] && ok "пустой файл: сигнатур нет" || bad "пустой файл: [$got]"
+  got=$(PATH="$real_path" bash "$SB/real-probe.sh" "$SB/funcs.sh" "$SB/dos.img" 2>&1)
+  [ "$got" = "dos" ] && ok "DOS/MBR найден настоящим wipefs" || bad "DOS/MBR: [$got]"
+  got=$(PATH="$real_path" bash "$SB/real-probe.sh" "$SB/funcs.sh" "$SB/luks.img" 2>&1)
+  [ "$got" = "crypto_LUKS" ] && ok "crypto_LUKS найден" || bad "crypto_LUKS: [$got]"
+  chmod 000 "$SB/blank.img"
+  got=$(PATH="$real_path" bash "$SB/real-probe.sh" "$SB/funcs.sh" "$SB/blank.img" 2>&1); rc=$?
+  chmod 644 "$SB/blank.img"
+  [ "$rc" != 0 ] && ok "нет прав на чтение — отказ" || bad "нечитаемый файл принят за чистый"
+  got=$(PATH="$real_path" bash "$SB/real-probe.sh" "$SB/funcs.sh" "$SB/nosuch.img" 2>&1); rc=$?
+  [ "$rc" != 0 ] && ok "файла нет — отказ" || bad "отсутствующий файл принят за чистый"
+fi
 
 # =============================================================================
 head_ "L1. setup-storage.sh: примерка ничего не исполняет"
