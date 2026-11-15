@@ -304,7 +304,7 @@ cmp -s "$FAKE_FSTAB" "$SB/fstab.orig" && ok "fstab не изменён" || bad "
 [ ! -f "$FAKE_STATE/mounted" ] && ok "ничего не смонтировано" || bad "появилось монтирование"
 n=$(grep -c '^  ' "$SB/out.txt")
 [ "$n" -ge 8 ] && ok "в плане $n шагов" || bad "в плане всего $n шагов"
-for s in "sgdisk --zap-all" "sgdisk --new=1:0:0" "mkfs.ext4" "fstab" "mount" "маркер"; do
+for s in "sgdisk --zap-all" "sgdisk --new=1:0:0" "mkfs.ext4" "fstab" "создать точку монтирования" "mount" "маркер"; do
   grep -qF "$s" "$SB/out.txt" && ok "план содержит: $s" || bad "в плане нет: $s"
 done
 grep -q "Ничего не изменено" "$SB/out.txt" && ok "сказано, что изменений нет" || bad "нет предупреждения"
@@ -362,6 +362,26 @@ grep -q "UUID=test-uuid-1234 $FAKE_MOUNT ext4" "$FAKE_FSTAB" && ok "новая �
 for d in in out tmp archive; do
   [ -d "$FAKE_MOUNT/$d" ] && ok "каталог $d создан" || bad "каталога $d нет"
 done
+
+# =============================================================================
+head_ "S4b. setup-ssd-storage.sh: точки монтирования нет — создаётся до mount"
+setup_env
+rmdir "$FAKE_MOUNT"
+cp "$SRC/host/setup-ssd-storage.sh" "$SB/host/"
+patch_ssd "$SB/host/setup-ssd-storage.sh"
+# mount не создаёт каталог. Если шаг создания отсутствует, mount падает уже
+# после mkfs и откат оставляет отформатированный раздел.
+out=$(FAKE_ROOT=1 "$SB/host/setup-ssd-storage.sh" --apply --confirm-serial 24257G400264 2>&1); rc=$?
+[ "$rc" = 0 ] && ok "код 0" || { bad "код $rc"; printf '%s\n' "$out" | tail -4; }
+[ -d "$FAKE_MOUNT" ] && ok "точка монтирования создана" || bad "каталога $FAKE_MOUNT нет"
+[ "$(grep -c '^mount ' "$FAKE_LOG")" = 1 ] && ok "mount выполнен один раз" \
+  || bad "mount: $(grep -c '^mount ' "$FAKE_LOG") раз"
+ln_mkdir=$(grep -n '^+ создать точку монтирования' <<<"$out" | cut -d: -f1)
+ln_mount=$(grep -n '^+ mount' <<<"$out" | cut -d: -f1)
+[ -n "$ln_mkdir" ] && [ -n "$ln_mount" ] && [ "$ln_mkdir" -lt "$ln_mount" ] \
+  && ok "каталог создан до mount (строки $ln_mkdir < $ln_mount)" \
+  || bad "порядок нарушен: каталог=$ln_mkdir mount=$ln_mount"
+[ -f "$FAKE_MOUNT/.storage-size-gib" ] && ok "маркер записан" || bad "маркера нет"
 
 # =============================================================================
 head_ "S5. setup-ssd-storage.sh: повторный запуск после успеха"
@@ -540,6 +560,23 @@ out=$(IMAGE=/tmp/vs-evil.img MOUNT=/tmp/vs-evil-mnt FSTAB=/tmp/vs-evil-fstab \
 [ ! -e /tmp/vs-evil.img ] && ok "IMAGE из среды не принят" || { bad "создан /tmp/vs-evil.img"; rm -f /tmp/vs-evil.img; }
 printf '%s' "$out" | grep -qF "$FAKE_IMAGE" && ok "использован зашитый путь образа" || bad "путь подменён"
 [ ! -e /tmp/vs-evil-fstab ] && ok "FSTAB из среды не принят" || { bad "создан /tmp/vs-evil-fstab"; rm -f /tmp/vs-evil-fstab; }
+
+# =============================================================================
+head_ "L4b. setup-storage.sh: точки монтирования нет — создаётся до mount"
+setup_env
+rmdir "$FAKE_MOUNT"
+cp "$SRC/host/setup-storage.sh" "$SB/host/"
+patch_loop "$SB/host/setup-storage.sh"
+out=$(FAKE_ROOT=1 FAKE_HOST_FREE_GIB=500 "$SB/host/setup-storage.sh" --apply 2>&1); rc=$?
+[ "$rc" = 0 ] && ok "код 0" || { bad "код $rc"; printf '%s\n' "$out" | tail -4; }
+[ -d "$FAKE_MOUNT" ] && ok "точка монтирования создана" || bad "каталога $FAKE_MOUNT нет"
+[ "$(grep -c '^mount ' "$FAKE_LOG")" = 1 ] && ok "mount выполнен один раз" \
+  || bad "mount: $(grep -c '^mount ' "$FAKE_LOG") раз"
+ln_mkdir=$(grep -n '^+ создать точку монтирования' <<<"$out" | cut -d: -f1)
+ln_mount=$(grep -n '^+ mount' <<<"$out" | cut -d: -f1)
+[ -n "$ln_mkdir" ] && [ -n "$ln_mount" ] && [ "$ln_mkdir" -lt "$ln_mount" ] \
+  && ok "каталог создан до mount (строки $ln_mkdir < $ln_mount)" \
+  || bad "порядок нарушен: каталог=$ln_mkdir mount=$ln_mount"
 
 # =============================================================================
 head_ "L5. setup-storage.sh: отказ mount — образ удалён, fstab восстановлен"

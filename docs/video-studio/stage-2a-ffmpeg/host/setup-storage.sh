@@ -175,6 +175,12 @@ do_fstab() {
   rm -f "$tmp"
 }
 
+do_mountpoint() {
+  # mount не создаёт точку монтирования: без этого шага mount падал бы уже
+  # после mkfs, то есть откат оставлял бы созданный образ.
+  [ -d "$MOUNT" ] || install -d -m 0755 "$MOUNT"
+}
+
 do_mount() {
   mount "$MOUNT" || die "mount $MOUNT не удался"
   MOUNTED_BY_US=1
@@ -208,6 +214,7 @@ step "2. План выполнения"
 stage "fallocate -l ${SIZE_GIB}G $IMAGE (с проверкой фактического размера)" do_image
 stage "mkfs.ext4 -q -m 0 -L $LABEL $IMAGE" do_mkfs
 stage "добавить строку в $FSTAB (резервная копия, findmnt --verify, проверка после записи)" do_fstab
+stage "создать точку монтирования $MOUNT" do_mountpoint
 stage "mount $MOUNT" do_mount
 stage "создать in/tmp/out/archive, выставить владельцев" do_dirs
 stage "записать маркер $SIZE_GIB GiB" do_marker

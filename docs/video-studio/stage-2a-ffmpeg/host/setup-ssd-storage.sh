@@ -281,6 +281,12 @@ do_fstab() {
   rm -f "$tmp"
 }
 
+do_mountpoint() {
+  # mount не создаёт точку монтирования: без этого шага mount падал бы уже
+  # после разметки и mkfs, то есть откат оставлял бы отформатированный раздел.
+  [ -d "$MOUNT" ] || install -d -m 0755 "$MOUNT"
+}
+
 do_mount() {
   mount "$MOUNT" || die "mount $MOUNT не удался"
   MOUNTED_BY_US=1
@@ -322,6 +328,7 @@ stage "sgdisk --zap-all $DEV" do_zap
 stage "sgdisk --new=1:0:0 --typecode=1:8300 --change-name=1:$LABEL $DEV" do_partition
 stage "mkfs.ext4 -m 0 -i $INODE_BYTES -L $LABEL ${DEV}-part1" do_mkfs
 stage "добавить строку UUID в $FSTAB (резервная копия, findmnt --verify, проверка после записи)" do_fstab
+stage "создать точку монтирования $MOUNT" do_mountpoint
 stage "mount $MOUNT" do_mount
 stage "создать in/out/tmp/archive, выставить владельцев" do_dirs
 stage "записать маркер размера из df" do_marker
