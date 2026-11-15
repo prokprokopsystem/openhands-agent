@@ -38,9 +38,14 @@ case "${1:-} ${2:-}" in
   "-dno MODEL")         echo "Extreme 55AE" ;;
   "-dno TRAN")          echo "usb" ;;
   "-dno PTTYPE")        [ -f "$st/zapped" ] && echo gpt || echo "${FAKE_PTTYPE:-dos}" ;;
+  "-no PARTTYPE")       [ -n "${FAKE_PARTTYPE:-}" ] && echo "$FAKE_PARTTYPE"; true ;;
+  "-no PARTLABEL")      [ -n "${FAKE_PARTLABEL:-}" ] && echo "$FAKE_PARTLABEL"; true ;;
+  "-no NAME")           echo "$FAKE_DEV"; [ -e "${FAKE_DEV}-part1" ] && echo "${FAKE_DEV}-part1"; true ;;
+  "-bno START")         [ -e "${FAKE_DEV}-part1" ] && echo "${FAKE_PART_START:-2048}"; true ;;
+  "-bno SIZE")          [ -e "${FAKE_DEV}-part1" ] && echo "${FAKE_PART_BYTES:-1000203837440}"; true ;;
   "-bdno SIZE")         echo "${FAKE_SIZE:-1000204886016}" ;;
   "-no LABEL")          [ -n "${FAKE_LABEL:-}" ] && echo "$FAKE_LABEL"; true ;;
-  "-no FSTYPE")         echo "${FAKE_FSTYPE:-ntfs}" ;;
+  "-no FSTYPE")         f=$(cat "$st/sig" 2>/dev/null); [ -n "$f" ] && echo "$f" || { [ -n "${FAKE_FSTYPE:-}" ] && echo "$FAKE_FSTYPE"; true; } ;;
   "-no PKNAME")         echo sdz ;;
   "-pno NAME,MOUNTPOINTS") [ "${FAKE_MOUNTED:-0}" = 1 ] && echo "${FAKE_DEV}-part1 $FAKE_MOUNT" || echo "${FAKE_DEV}-part1 "; true ;;
   "-o NAME,SIZE,FSTYPE") echo "${FAKE_DEV} 931.5G ext4 VIDEO_STUDIO $FAKE_MOUNT" ;;
@@ -100,7 +105,8 @@ case "$*" in
     [ "${FAKE_SERIAL_SWITCH:-0}" = 1 ] && touch "$FAKE_STATE/serial_changed"
     ;;
   *--new*)
-    : > "${FAKE_DEV}-part1"
+    : > "$(dirname "$FAKE_DEV")/real1"
+    ln -sfn real1 "${FAKE_DEV}-part1"
     ;;
 esac
 exit 0
@@ -109,12 +115,30 @@ EOF
   cat > "$bin/mkfs.ext4" <<'EOF'
 #!/bin/sh
 echo "mkfs.ext4 $*" >> "$FAKE_LOG"
+# Приглашение mke2fs при неинтерактивном запуске обязано быть невозможно:
+# stdin должен быть /dev/null, иначе сценарий D4 повторяется.
+stdin_link=$(readlink /proc/self/fd/0 2>/dev/null)
+if [ "$stdin_link" != "/dev/null" ]; then
+  echo "stdin-bad: mkfs.ext4 получил $stdin_link" >> "$FAKE_LOG"
+  : > "$FAKE_STATE/mkfs_stdin_bad"
+fi
+[ "${FAKE_MKFS_FAIL:-0}" = 1 ] && { echo "mkfs.ext4: отказ (подставной)" >&2; exit 1; }
+echo ext4 > "$FAKE_STATE/sig"
+echo "${FAKE_UUID:-test-uuid-1234}" > "$FAKE_STATE/uuid"
 exit 0
 EOF
 
   cat > "$bin/blkid" <<'EOF'
 #!/bin/sh
-echo "test-uuid-1234"
+st="$FAKE_STATE"
+uuid=$(cat "$st/uuid" 2>/dev/null)
+[ -n "$uuid" ] || uuid="${FAKE_UUID:-test-uuid-1234}"
+sig=$(cat "$st/sig" 2>/dev/null)
+case "$*" in
+  *"-s TYPE"*) [ -n "$sig" ] || exit 2; echo "$sig" ;;
+  *"-s UUID"*) echo "$uuid" ;;
+  *) echo "$uuid" ;;
+esac
 EOF
 
   cat > "$bin/mount" <<'EOF'
@@ -147,6 +171,30 @@ exit 0
 EOF
   cat > "$bin/swapon" <<'EOF'
 #!/bin/sh
+exit 0
+EOF
+
+  cat > "$bin/wipefs" <<'EOF'
+#!/bin/sh
+echo "wipefs $*" >> "$FAKE_LOG"
+st="$FAKE_STATE"
+sig=$(cat "$st/sig" 2>/dev/null)
+case "$*" in
+  *-n*)
+    # Только печать: формат как у настоящего wipefs, строки начинаются с 0x.
+    [ -n "$sig" ] && printf 'offset               type\n----------------------------------------------------------------\n0x00000003    %s\n' "$sig"
+    exit 0 ;;
+esac
+[ "${FAKE_WIPEFS_FAIL:-0}" = 1 ] && { echo "wipefs: не удалось стереть (подставной)" >&2; exit 1; }
+[ "${FAKE_WIPEFS_KEEP:-0}" = 1 ] || : > "$st/sig"
+exit 0
+EOF
+
+  cat > "$bin/fuser" <<'EOF'
+#!/bin/sh
+[ "${FAKE_FUSER_BUSY:-0}" = 1 ] || exit 1
+[ "${1:-}" = "-s" ] && exit 0
+echo "  4242"
 exit 0
 EOF
   cat > "$bin/chown" <<'EOF'
@@ -219,7 +267,9 @@ setup_env() {
   export PATH="$SB/bin:$PATH"
   unset FAKE_MOUNTED FAKE_MOUNT_FAIL FAKE_VERIFY_FAIL FAKE_LABEL FAKE_PTTYPE \
         FAKE_SERIAL_SWITCH FAKE_SERIAL FAKE_ROOT FAKE_HOST_FREE_GIB \
-        FAKE_TOTAL_KI MIN_GIB
+        FAKE_TOTAL_KI MIN_GIB FAKE_PARTTYPE FAKE_PARTLABEL FAKE_PART_START \
+        FAKE_PART_BYTES FAKE_FUSER_BUSY FAKE_WIPEFS_FAIL FAKE_WIPEFS_KEEP \
+        FAKE_MKFS_FAIL FAKE_UUID
 }
 
 # Для проверок verify-storage: смонтированное хранилище с маркером и записью
@@ -291,6 +341,18 @@ run_ssd() {
 run_loop() {
   bash "$SB/host/setup-storage.sh" "$@"
 }
+# Узел раздела в /dev — отдельная ссылка на тот же диск. В песочнице это
+# symlink, иначе проверка «раздел принадлежит этому диску» ничего не значит.
+make_part() {
+  : > "$SB/dev/real1"
+  ln -sfn real1 "${FAKE_DEV}-part1"
+}
+# Состояние «первая попытка уже создала разметку и раздел».
+make_expected_layout() {
+  make_part
+  export FAKE_PTTYPE=gpt FAKE_PARTTYPE=0fc63daf-8483-4772-8e79-3d69d8477de4
+  export FAKE_PARTLABEL=VIDEO_STUDIO
+}
 plan_lines() { grep -c '^  ' "$1" 2>/dev/null || true; }
 exec_lines() { grep -c '^+ ' "$1" 2>/dev/null || true; }
 
@@ -311,7 +373,7 @@ cmp -s "$FAKE_FSTAB" "$SB/fstab.orig" && ok "fstab не изменён" || bad "
 [ ! -f "$FAKE_STATE/mounted" ] && ok "ничего не смонтировано" || bad "появилось монтирование"
 n=$(grep -c '^  ' "$SB/out.txt")
 [ "$n" -ge 8 ] && ok "в плане $n шагов" || bad "в плане всего $n шагов"
-for s in "sgdisk --zap-all" "sgdisk --new=1:0:0" "mkfs.ext4" "fstab" "создать точку монтирования" "mount" "маркер"; do
+for s in "sgdisk --zap-all" "sgdisk --new=1:0:0" "wipefs -a" "mkfs.ext4" "stdin от /dev/null" "fstab" "создать точку монтирования" "mount" "маркер"; do
   grep -qF "$s" "$SB/out.txt" && ok "план содержит: $s" || bad "в плане нет: $s"
 done
 grep -q "Ничего не изменено" "$SB/out.txt" && ok "сказано, что изменений нет" || bad "нет предупреждения"
@@ -511,7 +573,8 @@ cp "$SRC/host/setup-ssd-storage.sh" "$SB/host/"
 patch_ssd "$SB/host/setup-ssd-storage.sh"
 out=$(FAKE_ROOT=1 FAKE_LABEL=VIDEO_STUDIO "$SB/host/setup-ssd-storage.sh" --apply --confirm-serial 24257G400264 2>&1); rc=$?
 [ "$rc" != 0 ] && ok "код $rc" || bad "переформатирование разрешено"
-printf '%s' "$out" | grep -q "wipefs -a" && ok "дан ручной путь пересоздания" || bad "нет инструкции"
+printf '%s' "$out" | grep -q "не совпадает с ожидаемой" && ok "разметка не совпала — отказ" || bad "нет сообщения о расхождении"
+printf '%s' "$out" | grep -q "разберитесь в состоянии диска вручную" && ok "дан ручной путь" || bad "нет инструкции"
 [ ! -s "$FAKE_LOG" ] && ok "устройство не тронуто" || bad "вызваны: $(head -2 "$FAKE_LOG")"
 
 # =============================================================================
@@ -569,6 +632,202 @@ rm -f "$FAKE_DEV"
 out=$(FAKE_ROOT=1 "$SB/host/setup-ssd-storage.sh" --apply --confirm-serial 24257G400264 2>&1); rc=$?
 [ "$rc" != 0 ] && ok "код $rc" || bad "запуск разрешён"
 printf '%s' "$out" | grep -q "не найден" && ok "причина названа" || bad "нет сообщения"
+
+# =============================================================================
+head_ "S14. setup-ssd-storage.sh: старая сигнатура NTFS — wipefs до mkfs"
+setup_env
+cp "$SRC/host/setup-ssd-storage.sh" "$SB/host/"
+patch_ssd "$SB/host/setup-ssd-storage.sh"
+make_expected_layout
+echo ntfs > "$FAKE_STATE/sig"
+out=$(FAKE_ROOT=1 "$SB/host/setup-ssd-storage.sh" --apply --confirm-serial 24257G400264 2>&1); rc=$?
+printf '%s' "$out" > "$SB/out.txt"
+[ "$rc" = 0 ] && ok "код 0" || { bad "код $rc"; tail -6 "$SB/out.txt"; }
+[ "$(grep -c '^sgdisk' "$FAKE_LOG")" = 0 ] && ok "разметка не пересоздавалась" \
+  || bad "sgdisk вызван: $(grep '^sgdisk' "$FAKE_LOG" | head -2)"
+[ "$(grep -c '^wipefs -a' "$FAKE_LOG")" = 1 ] && ok "wipefs -a ровно один раз" \
+  || bad "wipefs -a: $(grep -c '^wipefs -a' "$FAKE_LOG") раз"
+grep '^wipefs -a' "$FAKE_LOG" | grep -qF "${FAKE_DEV}-part1" \
+  && ok "wipefs только по разделу" || bad "wipefs адресован не разделу: $(grep '^wipefs -a' "$FAKE_LOG")"
+grep '^wipefs -a' "$FAKE_LOG" | grep -qxF "wipefs -a $FAKE_DEV" \
+  && bad "wipefs по всему диску" || ok "wipefs по диску не вызывался"
+[ "$(grep -c '^mkfs.ext4' "$FAKE_LOG")" = 1 ] && ok "mkfs.ext4 ровно один раз" \
+  || bad "mkfs.ext4: $(grep -c '^mkfs.ext4' "$FAKE_LOG") раз"
+lw=$(grep -n '^wipefs -a' "$FAKE_LOG" | cut -d: -f1)
+lm=$(grep -n '^mkfs.ext4' "$FAKE_LOG" | cut -d: -f1)
+[ -n "$lw" ] && [ -n "$lm" ] && [ "$lw" -lt "$lm" ] \
+  && ok "wipefs выполнен до mkfs ($lw < $lm)" || bad "порядок: wipefs=$lw mkfs=$lm"
+[ ! -f "$FAKE_STATE/mkfs_stdin_bad" ] && ok "mkfs получил stdin /dev/null" \
+  || bad "$(grep 'stdin-bad' "$FAKE_LOG" | head -1)"
+grep -q "найдено: ntfs" "$SB/out.txt" && ok "найденная сигнатура названа" || bad "нет сообщения о сигнатуре"
+[ "$(cat "$FAKE_STATE/sig" 2>/dev/null)" != ntfs ] && ok "сигнатуры NTFS в разделе нет" \
+  || bad "сигнатура NTFS осталась"
+[ -f "$FAKE_MOUNT/.storage-size-gib" ] && ok "маркер записан" || bad "маркера нет"
+
+# =============================================================================
+head_ "S15. setup-ssd-storage.sh: сигнатур нет — wipefs не вызывается"
+setup_env
+cp "$SRC/host/setup-ssd-storage.sh" "$SB/host/"
+patch_ssd "$SB/host/setup-ssd-storage.sh"
+make_expected_layout
+out=$(FAKE_ROOT=1 "$SB/host/setup-ssd-storage.sh" --apply --confirm-serial 24257G400264 2>&1); rc=$?
+printf '%s' "$out" > "$SB/out.txt"
+[ "$rc" = 0 ] && ok "код 0" || { bad "код $rc"; tail -5 "$SB/out.txt"; }
+[ "$(grep -c '^wipefs -a' "$FAKE_LOG")" = 0 ] && ok "стирание не выполнялось" \
+  || bad "wipefs -a вызван: $(grep '^wipefs -a' "$FAKE_LOG" | head -2)"
+[ "$(grep -c '^mkfs.ext4' "$FAKE_LOG")" = 1 ] && ok "mkfs.ext4 один раз" || bad "mkfs.ext4 не один раз"
+grep -q "wipefs не требуется" "$SB/out.txt" && ok "причина названа" || bad "нет пояснения"
+[ ! -f "$FAKE_STATE/mkfs_stdin_bad" ] && ok "mkfs получил stdin /dev/null" || bad "stdin не /dev/null"
+
+# =============================================================================
+head_ "S16. setup-ssd-storage.sh: wipefs не убрал сигнатуру — отказ до mkfs"
+setup_env
+cp "$SRC/host/setup-ssd-storage.sh" "$SB/host/"
+patch_ssd "$SB/host/setup-ssd-storage.sh"
+make_expected_layout
+echo ntfs > "$FAKE_STATE/sig"
+out=$(FAKE_ROOT=1 FAKE_WIPEFS_KEEP=1 "$SB/host/setup-ssd-storage.sh" --apply --confirm-serial 24257G400264 2>&1); rc=$?
+[ "$rc" != 0 ] && ok "код $rc" || bad "запуск продолжен"
+printf '%s' "$out" | grep -q "остались подписи" && ok "причина названа" || bad "нет сообщения"
+printf '%s' "$out" | grep -q "обязан быть" && ok "объяснено требование неинтерактивности" || bad "нет пояснения"
+[ "$(grep -c '^mkfs.ext4' "$FAKE_LOG")" = 0 ] && ok "mkfs не выполнялся" || bad "mkfs выполнен"
+cmp -s "$FAKE_FSTAB" "$SB/fstab.orig" && ok "fstab не изменён" || bad "fstab изменён"
+[ ! -f "$FAKE_STATE/mounted" ] && ok "монтирования не было" || bad "смонтировано"
+
+# =============================================================================
+head_ "S17. setup-ssd-storage.sh: wipefs вернул ошибку — отказ"
+setup_env
+cp "$SRC/host/setup-ssd-storage.sh" "$SB/host/"
+patch_ssd "$SB/host/setup-ssd-storage.sh"
+make_expected_layout
+echo ntfs > "$FAKE_STATE/sig"
+out=$(FAKE_ROOT=1 FAKE_WIPEFS_FAIL=1 "$SB/host/setup-ssd-storage.sh" --apply --confirm-serial 24257G400264 2>&1); rc=$?
+[ "$rc" != 0 ] && ok "код $rc" || bad "ошибка не замечена"
+printf '%s' "$out" | grep -q "wipefs не удался" && ok "причина названа" || bad "нет сообщения"
+[ "$(grep -c '^mkfs.ext4' "$FAKE_LOG")" = 0 ] && ok "mkfs не выполнялся" || bad "mkfs выполнен"
+
+# =============================================================================
+head_ "S18. setup-ssd-storage.sh: раздел открыт процессом — отказ"
+setup_env
+cp "$SRC/host/setup-ssd-storage.sh" "$SB/host/"
+patch_ssd "$SB/host/setup-ssd-storage.sh"
+make_expected_layout
+echo ntfs > "$FAKE_STATE/sig"
+out=$(FAKE_ROOT=1 FAKE_FUSER_BUSY=1 "$SB/host/setup-ssd-storage.sh" --apply --confirm-serial 24257G400264 2>&1); rc=$?
+[ "$rc" != 0 ] && ok "код $rc" || bad "запуск разрешён"
+printf '%s' "$out" | grep -q "открыт процессом" && ok "причина названа" || bad "нет сообщения"
+printf '%s' "$out" | grep -q "4242" && ok "PID назван" || bad "PID не назван"
+[ "$(grep -c '^wipefs -a' "$FAKE_LOG")" = 0 ] && ok "стирание не выполнялось" || bad "wipefs -a выполнен"
+
+# =============================================================================
+head_ "S19. setup-ssd-storage.sh: другой серийный номер — отказ до wipefs"
+setup_env
+cp "$SRC/host/setup-ssd-storage.sh" "$SB/host/"
+patch_ssd "$SB/host/setup-ssd-storage.sh"
+make_expected_layout
+echo ntfs > "$FAKE_STATE/sig"
+out=$(FAKE_ROOT=1 FAKE_SERIAL=9999WRONG "$SB/host/setup-ssd-storage.sh" --apply --confirm-serial 24257G400264 2>&1); rc=$?
+[ "$rc" != 0 ] && ok "код $rc" || bad "запуск разрешён"
+printf '%s' "$out" | grep -q "серийный" && ok "причина названа" || bad "нет сообщения"
+[ "$(grep -c '^wipefs -a' "$FAKE_LOG")" = 0 ] && ok "стирание не выполнялось" || bad "wipefs -a выполнен"
+
+# =============================================================================
+head_ "S20. setup-ssd-storage.sh: раздел не принадлежит диску — отказ"
+setup_env
+cp "$SRC/host/setup-ssd-storage.sh" "$SB/host/"
+patch_ssd "$SB/host/setup-ssd-storage.sh"
+export FAKE_PTTYPE=gpt FAKE_PARTTYPE=0fc63daf-8483-4772-8e79-3d69d8477de4
+export FAKE_PARTLABEL=VIDEO_STUDIO
+: > "$SB/dev/real1"
+: > "${FAKE_DEV}-part1"          # обычный файл, а не узел раздела на том же диске
+echo ntfs > "$FAKE_STATE/sig"
+out=$(FAKE_ROOT=1 "$SB/host/setup-ssd-storage.sh" --apply --confirm-serial 24257G400264 2>&1); rc=$?
+[ "$rc" != 0 ] && ok "код $rc" || bad "запуск разрешён"
+printf '%s' "$out" | grep -q "не принадлежит" && ok "причина названа" || bad "нет сообщения"
+[ "$(grep -c '^wipefs -a' "$FAKE_LOG")" = 0 ] && ok "стирание не выполнялось" || bad "wipefs -a выполнен по чужому узлу"
+
+# =============================================================================
+head_ "S21. setup-ssd-storage.sh: mkfs отказал — откат без повторного форматирования"
+setup_env
+cp "$SRC/host/setup-ssd-storage.sh" "$SB/host/"
+patch_ssd "$SB/host/setup-ssd-storage.sh"
+make_expected_layout
+out=$(FAKE_ROOT=1 FAKE_MKFS_FAIL=1 "$SB/host/setup-ssd-storage.sh" --apply --confirm-serial 24257G400264 2>&1); rc=$?
+[ "$rc" != 0 ] && ok "код $rc" || bad "ошибка не замечена"
+printf '%s' "$out" | grep -q "mkfs.ext4 отказал" && ok "причина названа" || bad "нет сообщения"
+printf '%s' "$out" | grep -q "Повторного форматирования не было" && ok "сказано про повтор" || bad "нет пояснения"
+[ "$(grep -c '^mkfs.ext4' "$FAKE_LOG")" = 1 ] && ok "mkfs вызван один раз" \
+  || bad "mkfs вызван $(grep -c '^mkfs.ext4' "$FAKE_LOG") раз"
+cmp -s "$FAKE_FSTAB" "$SB/fstab.orig" && ok "fstab не изменён" || bad "fstab изменён"
+[ ! -f "$FAKE_STATE/mounted" ] && ok "монтирования не было" || bad "смонтировано"
+[ ! -f "$FAKE_MOUNT/.storage-size-gib" ] && ok "маркер не записан" || bad "маркер записан"
+
+# =============================================================================
+head_ "S22. setup-ssd-storage.sh: продолжение после сбоя — ext4 уже есть"
+setup_env
+cp "$SRC/host/setup-ssd-storage.sh" "$SB/host/"
+patch_ssd "$SB/host/setup-ssd-storage.sh"
+make_expected_layout
+echo ext4 > "$FAKE_STATE/sig"
+echo "aaaa-bbbb-cccc" > "$FAKE_STATE/uuid"
+out=$(FAKE_ROOT=1 FAKE_LABEL=VIDEO_STUDIO "$SB/host/setup-ssd-storage.sh" --apply --confirm-serial 24257G400264 2>&1); rc=$?
+printf '%s' "$out" > "$SB/out.txt"
+[ "$rc" = 0 ] && ok "код 0" || { bad "код $rc"; tail -6 "$SB/out.txt"; }
+[ "$(grep -c '^sgdisk' "$FAKE_LOG")" = 0 ] && ok "разметка не пересоздавалась" || bad "sgdisk вызван"
+[ "$(grep -c '^wipefs' "$FAKE_LOG")" = 0 ] && ok "wipefs не вызывался" || bad "wipefs вызван"
+[ "$(grep -c '^mkfs.ext4' "$FAKE_LOG")" = 0 ] && ok "повторного форматирования нет" || bad "mkfs вызван"
+grep -q "форматирование не повторяется" "$SB/out.txt" && ok "сказано, что формат пропущен" || bad "нет пояснения"
+[ "$(grep -c '^mount ' "$FAKE_LOG")" = 1 ] && ok "mount выполнен" || bad "mount не выполнен"
+grep -q "UUID=aaaa-bbbb-cccc $FAKE_MOUNT" "$FAKE_FSTAB" && ok "в fstab записан существующий UUID" \
+  || bad "fstab: $(tail -1 "$FAKE_FSTAB")"
+[ -f "$FAKE_MOUNT/.storage-size-gib" ] && ok "маркер записан" || bad "маркера нет"
+
+# =============================================================================
+head_ "S23. setup-ssd-storage.sh: геометрия не совпала — отказ без правки"
+setup_env
+cp "$SRC/host/setup-ssd-storage.sh" "$SB/host/"
+patch_ssd "$SB/host/setup-ssd-storage.sh"
+make_expected_layout
+export FAKE_PART_START=4096
+out=$(FAKE_ROOT=1 "$SB/host/setup-ssd-storage.sh" --apply --confirm-serial 24257G400264 2>&1); rc=$?
+[ "$rc" != 0 ] && ok "код $rc" || bad "запуск разрешён"
+printf '%s' "$out" | grep -q "не совпадает с ожидаемой" && ok "причина названа" || bad "нет сообщения"
+printf '%s' "$out" | grep -q "начало '4096'" && ok "фактическое значение показано" || bad "нет фактических значений"
+[ ! -s "$FAKE_LOG" ] && ok "ни одной внешней команды" || bad "вызваны: $(head -2 "$FAKE_LOG")"
+
+# =============================================================================
+head_ "S24. setup-ssd-storage.sh: раздел смонтирован — отказ до стирания"
+setup_env
+cp "$SRC/host/setup-ssd-storage.sh" "$SB/host/"
+patch_ssd "$SB/host/setup-ssd-storage.sh"
+make_expected_layout
+echo ntfs > "$FAKE_STATE/sig"
+out=$(FAKE_ROOT=1 FAKE_MOUNTED=1 "$SB/host/setup-ssd-storage.sh" --apply --confirm-serial 24257G400264 2>&1); rc=$?
+[ "$rc" != 0 ] && ok "код $rc" || bad "запуск разрешён"
+printf '%s' "$out" | grep -q "смонтировано" && ok "причина названа" || bad "нет сообщения"
+[ "$(grep -c '^wipefs -a' "$FAKE_LOG")" = 0 ] && ok "стирание не выполнялось" || bad "wipefs -a выполнен"
+[ "$(grep -c '^mkfs.ext4' "$FAKE_LOG")" = 0 ] && ok "mkfs не выполнялся" || bad "mkfs выполнен"
+
+# =============================================================================
+head_ "S25. setup-ssd-storage.sh: примерка на частично созданной разметке"
+setup_env
+cp "$SRC/host/setup-ssd-storage.sh" "$SB/host/"
+patch_ssd "$SB/host/setup-ssd-storage.sh"
+make_expected_layout
+echo ntfs > "$FAKE_STATE/sig"
+out=$("$SB/host/setup-ssd-storage.sh" 2>&1); rc=$?
+printf '%s' "$out" > "$SB/out.txt"
+[ "$rc" = 0 ] && ok "код 0" || bad "код $rc"
+[ "$(exec_lines "$SB/out.txt")" = 0 ] && ok "ни одной исполненной команды" \
+  || bad "в примере есть исполнение: $(grep '^+ ' "$SB/out.txt" | head -2)"
+[ ! -s "$FAKE_LOG" ] && ok "внешние команды не вызваны" || bad "вызваны: $(head -2 "$FAKE_LOG")"
+grep -q "разметка уже создана предыдущей попыткой" "$SB/out.txt" \
+  && ok "разметка узнана" || bad "разметка не узнана"
+grep -q '^  sgdisk --zap-all' "$SB/out.txt" && bad "в плане повторный sgdisk --zap-all" \
+  || ok "повторного sgdisk в плане нет"
+grep -qF "wipefs -a" "$SB/out.txt" && ok "в плане есть стирание подписей" || bad "в плане нет wipefs"
+grep -qF "stdin от /dev/null" "$SB/out.txt" && ok "в плане видно неинтерактивность" || bad "нет пометки stdin"
+cmp -s "$FAKE_FSTAB" "$SB/fstab.orig" && ok "fstab не изменён" || bad "fstab изменён"
 
 # =============================================================================
 head_ "L1. setup-storage.sh: примерка ничего не исполняет"

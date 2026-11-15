@@ -37,6 +37,8 @@ UUID=""
 BACKUP_FSTAB=""
 FSTAB_MODIFIED=0
 MOUNTED_BY_US=0
+NEED_PARTITION=1
+FS_READY=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -71,6 +73,82 @@ if [ "$APPLY" = "1" ]; then
   [ "$CONFIRM_SERIAL" = "$EXPECT_SERIAL" ] || \
     die "подтверждение не совпало: ожидалось --confirm-serial $EXPECT_SERIAL"
 fi
+
+# Подписи файловых систем в разделе: тип через blkid -p (чтение с устройства,
+# а не из кэша udev) плюс список от wipefs -n (только печать). Пустая строка
+# означает, что стирать нечего.
+probe_signatures() {
+  local part="$1" probe_out err_file wipefs_out
+  err_file=$(mktemp) || die "mktemp не удался"
+  probe_out=$(blkid -p -o value -s TYPE "$part" 2>"$err_file" || true)
+  if [ -s "$err_file" ]; then
+    local msg
+    msg=$(tr '\n' ' ' < "$err_file")
+    rm -f "$err_file"
+    die "blkid -p не смог проверить $part: $msg"
+  fi
+  rm -f "$err_file"
+  wipefs_out=""
+  if command -v wipefs >/dev/null 2>&1; then
+    wipefs_out=$(wipefs -n "$part" 2>/dev/null | awk '$1 ~ /^0x/ {print $2}' | sort -u | tr '\n' ' ' || true)
+  fi
+  printf '%s' "$probe_out $wipefs_out" | tr -s ' ' | sed 's/^ //; s/ $//'
+}
+
+# Проверка адресации: раздел обязан быть первым разделом именно того узла, на
+# который сейчас ведёт зашитая by-id ссылка. Это защита от wipefs по чужому
+# устройству, если диск вынули и вставили другой.
+assert_part_target() {
+  local part="$1" cur_real base n
+  [ -e "$part" ] || die "раздел $part не найден"
+  cur_real=$(readlink -f "$DEV" 2>/dev/null || true)
+  [ -n "$cur_real" ] || die "$DEV больше никуда не ведёт — устройство отключено"
+  [ "$cur_real" = "$real" ] || \
+    die "by-id ссылка теперь ведёт на $cur_real вместо $real — устройство переподключено"
+  [ "$(lsblk -dno SERIAL "$DEV" 2>/dev/null || true)" = "$EXPECT_SERIAL" ] || \
+    die "серийный номер изменился с момента проверки — не тот диск"
+  [ "$(lsblk -dno MODEL "$DEV" 2>/dev/null | sed 's/[[:space:]]*$//')" = "$EXPECT_MODEL" ] || \
+    die "модель изменилась с момента проверки — не тот диск"
+  base=$(basename "$real")
+  for n in $FORBIDDEN_NAMES; do
+    [ "$base" != "$n" ] || die "$real — запрещённое имя устройства ($n)"
+  done
+  [ "$(readlink -f "$part" 2>/dev/null || true)" = "${real}1" ] || \
+    die "$part не принадлежит $real — работа с этим разделом запрещена"
+}
+
+# Раздел не должен быть смонтирован, занят как swap, служить основой для dm и
+# держаться открытым каким-либо процессом.
+assert_part_free() {
+  local part="$1" sysdir holders pids
+  findmnt -S "$part" -n -o TARGET 2>/dev/null | grep -q . && \
+    die "$part смонтирован: $(findmnt -S "$part" -n -o TARGET | tr '\n' ' ')"
+  lsblk -pno NAME,MOUNTPOINTS "$part" 2>/dev/null | awk '$2 != "" {print $1}' | grep -q . && \
+    die "раздел смонтирован в дереве: $(lsblk -pno NAME,MOUNTPOINTS "$part" 2>/dev/null | awk '$2 != "" {print $1}' | tr '\n' ' ')"
+  swapon --show=NAME --noheadings 2>/dev/null | grep -qx "$part" && die "$part используется как swap"
+
+  # Имя в sysfs — узел ядра (sdc1), а не by-id ссылка.
+  sysdir="/sys/block/$(basename "$real")/$(basename "$(readlink -f "$part")")"
+  if [ -d "$sysdir/holders" ]; then
+    holders=$(ls -A "$sysdir/holders" 2>/dev/null || true)
+    [ -z "$holders" ] || die "раздел используется как основа: $(printf '%s' "$holders" | tr '\n' ' ')"
+  fi
+
+  # fuser без -m перечисляет процессы с открытым устройством; на несмонтированном
+  # разделе это единственная доступная проверка. Оба инструмента присутствуют
+  # на mini-server; если исчезнут оба, работа не начинается.
+  if command -v fuser >/dev/null 2>&1; then
+    if fuser -s "$part" 2>/dev/null; then
+      pids=$(fuser "$part" 2>&1 | tr -s ' ')
+      die "раздел открыт процессом:$pids"
+    fi
+  elif command -v lsof >/dev/null 2>&1; then
+    pids=$(lsof -t "$part" 2>/dev/null | tr '\n' ' ')
+    [ -z "$pids" ] || die "раздел открыт процессом: $pids"
+  else
+    die "нет ни fuser, ни lsof — проверить, что раздел свободен, нечем"
+  fi
+}
 
 # Единственная точка исполнения. В плане печатает, в --apply печатает и
 # выполняет. Именно поэтому план не может ничего изменить: он и есть этот же
@@ -174,28 +252,89 @@ if swapon --show=NAME --noheadings 2>/dev/null | grep -qx "$real"; then
 fi
 say "ПРОЙДЕНО: монтирований и swap нет"
 
-step "3. Защита от повторного форматирования"
+step "3. Разметка и файловые системы"
 
 pttype=$(lsblk -dno PTTYPE "$DEV" 2>/dev/null || true)
 labels=$(lsblk -no LABEL "$DEV" 2>/dev/null | grep -v '^$' | sort -u | tr '\n' ' ' || true)
 fstypes=$(lsblk -no FSTYPE "$DEV" 2>/dev/null | grep -v '^$' | sort -u | tr '\n' ' ' || true)
+part_count=$(lsblk -no NAME "$DEV" 2>/dev/null | tail -n +2 | grep -c . || true)
+part_type=$(lsblk -no PARTTYPE "${DEV}-part1" 2>/dev/null | tr -d ' ' || true)
+part_label=$(lsblk -no PARTLABEL "${DEV}-part1" 2>/dev/null | tr -d ' ' || true)
+# lsblk дополняет числа пробелами до ширины столбца, поэтому пробелы снимаются
+# до разбора: иначе " 2048" не пройдёт проверку «только цифры».
+part_start=$(lsblk -bno START "${DEV}-part1" 2>/dev/null | tr -d '[:space:]' || true)
+part_bytes=$(lsblk -bno SIZE "${DEV}-part1" 2>/dev/null | tr -d '[:space:]' || true)
+disk_bytes=$(lsblk -bdno SIZE "$DEV" 2>/dev/null | tr -d '[:space:]' || true)
+case "$part_count" in ''|*[!0-9]*) part_count=0 ;; esac
+case "$part_start" in ''|*[!0-9]*) part_start=0 ;; esac
+case "$part_bytes" in ''|*[!0-9]*) part_bytes=0 ;; esac
+case "$disk_bytes" in ''|*[!0-9]*) disk_bytes=0 ;; esac
 
 say "  таблица разделов: ${pttype:-нет}"
+say "  разделов:         $part_count"
 say "  файловые системы: ${fstypes:-нет}"
 say "  метки:            ${labels:-нет}"
 
-# Флага переформатирования нет намеренно. Один раз стереть чужой диск можно
-# только осознанно: сначала разметка снимается вручную, затем скрипт видит
-# чистое устройство. Так «--reformat по привычке» не уничтожит хранилище.
-for l in $labels; do
-  [ "$l" != "$LABEL" ] || die "на устройстве уже есть метка $LABEL — хранилище создано.
-Пересоздание не выполняется автоматически. Если оно действительно нужно:
+# Признак нашего хранилища — метка раздела или метка ФС. Пока их нет, диск
+# считается чужим и размечается заново (владелец разрешил уничтожить данные
+# только на этом SSD). Как только признак появился, расхождение с ожидаемой
+# геометрией — повод остановиться, а не переделать.
+our_trace=0
+[ "$part_label" = "$LABEL" ] && our_trace=1
+case " $labels " in *" $LABEL "*) our_trace=1 ;; esac
+
+layout_ok=0
+if [ "$pttype" = "gpt" ] && [ "$part_count" = "1" ] && [ "$part_start" = "2048" ] && \
+   { [ "$part_type" = "0fc63daf-8483-4772-8e79-3d69d8477de4" ] || [ "$part_type" = "8300" ]; }; then
+  if [ "$part_bytes" -gt 0 ] && [ "$disk_bytes" -ge "$part_bytes" ]; then
+    tail_gap=$(( disk_bytes - part_bytes ))
+    [ "$tail_gap" -le 4194304 ] && layout_ok=1
+  fi
+fi
+
+if [ "$our_trace" = "1" ]; then
+  if [ "$layout_ok" = "1" ]; then
+    NEED_PARTITION=0
+    say "ПРОЙДЕНО: разметка создана предыдущей попыткой и совпадает с ожидаемой"
+    say "  GPT, один раздел, тип 8300, метка $LABEL, начало 2048, размер $part_bytes байт"
+    say "  повторные sgdisk --zap-all и --new не выполняются"
+  else
+    die "разметка не совпадает с ожидаемой, а следы хранилища $LABEL уже есть —
+автоматически не исправляю.
+Ожидалось: GPT, ровно один раздел, тип 8300, метка $LABEL, начало 2048,
+размер до конца диска.
+Фактически: таблица '${pttype:-нет}', разделов $part_count, тип '${part_type:-нет}',
+метка раздела '${part_label:-нет}', начало '${part_start:-нет}', размер '${part_bytes:-нет}'.
+Решение принимает человек: разберитесь в состоянии диска вручную."
+  fi
+else
+  NEED_PARTITION=1
+  say "  разметки нашего хранилища нет: будет создана заново"
+  if [ -n "$pttype" ]; then
+    say "  ВНИМАНИЕ: разметка '$pttype' будет уничтожена при --apply"
+  fi
+fi
+
+is_ext4=0
+case " $fstypes " in *" ext4 "*) is_ext4=1 ;; esac
+our_fs_label=0
+case " $labels " in *" $LABEL "*) our_fs_label=1 ;; esac
+
+if [ "$our_fs_label" = "1" ]; then
+  if [ "$layout_ok" = "1" ] && [ "$is_ext4" = "1" ]; then
+    UUID=$(blkid -p -o value -s UUID "${DEV}-part1" 2>/dev/null || true)
+    [ -n "$UUID" ] || die "ext4 с меткой $LABEL есть, но UUID раздела не читается — разберитесь вручную"
+    FS_READY=1
+    say "ПРОЙДЕНО: раздел уже содержит ext4 с меткой $LABEL, UUID $UUID"
+    say "  wipefs и mkfs.ext4 не выполняются: форматирование не повторяется"
+  else
+    die "на устройстве уже есть метка $LABEL, но это не ext4 в ожидаемой разметке —
+автоматическое переформатирование не выполняется.
+Если пересоздание действительно нужно:
   1. Убедитесь, что данные не нужны.
-  2. Снимите разметку вручную: sudo wipefs -a $DEV
+  2. Снимите подписи вручную: sudo wipefs -a ${DEV}-part1
   3. Запустите этот скрипт заново."
-done
-if [ -n "$pttype" ]; then
-  say "  ВНИМАНИЕ: разметка '$pttype' будет уничтожена при --apply"
+  fi
 fi
 
 step "4. Точка монтирования"
@@ -224,14 +363,39 @@ do_partition() {
   [ -b "${DEV}-part1" ] || die "раздел ${DEV}-part1 не появился после разметки"
 }
 
+do_wipe() {
+  local part="${DEV}-part1" found
+  # Адресация и занятость перепроверяются непосредственно перед стиранием:
+  # между началом работы и этим шагом диск могли вынуть, а раздел — открыть.
+  assert_part_target "$part"
+  assert_part_free "$part"
+
+  # Причина приглашения mkfs — подписи прежней ФС внутри раздела: sgdisk
+  # переписывает только таблицу разделов. Если подписей нет, wipefs не нужен.
+  found=$(probe_signatures "$part")
+  if [ -z "$found" ]; then
+    say "  подписей файловых систем в разделе нет, wipefs не требуется"
+    return 0
+  fi
+  say "  найдено: $found — стираю подписи только в разделе $part"
+  wipefs -a "$part" || die "wipefs не удался — дальше не иду"
+  udevadm settle --timeout=10 >/dev/null 2>&1 || true
+
+  found=$(probe_signatures "$part")
+  [ -z "$found" ] || die "после wipefs в разделе остались подписи: $found
+Дальше не иду: mkfs.ext4 снова спросил бы подтверждение, а --apply обязан быть
+неинтерактивным. Разберитесь вручную."
+}
+
 do_mkfs() {
-  # Проверка «не тот диск» повторяется непосредственно перед записью: между
-  # началом работы и этим шагом диск могли вынуть и вставить другой.
-  [ "$(lsblk -dno SERIAL "$DEV")" = "$EXPECT_SERIAL" ] || \
-    die "серийный номер изменился с момента проверки — устройство переподключено"
-  findmnt -S "$real" -n -o TARGET 2>/dev/null | grep -q . && \
-    die "появились монтирования на $real"
-  mkfs.ext4 -m 0 -i "$INODE_BYTES" -L "$LABEL" "${DEV}-part1"
+  local part="${DEV}-part1"
+  assert_part_target "$part"
+  assert_part_free "$part"
+  # stdin от /dev/null: приглашение mkfs.ext4 при неинтерактивном запуске
+  # превращается в немедленный отказ с кодом 1, а не в ожидание человека.
+  # -F не используется: он отключает защиту, которую мы как раз проверяем.
+  mkfs.ext4 -m 0 -i "$INODE_BYTES" -L "$LABEL" "$part" < /dev/null || \
+    die "mkfs.ext4 отказал. Повторного форматирования не было; причина — в выводе выше."
   UUID=$(blkid -s UUID -o value "${DEV}-part1")
   [ -n "$UUID" ] || die "не удалось получить UUID раздела"
   # Ссылку /dev/disk/by-uuid создаёт udev. Без ожидания findmnt --verify на
@@ -355,9 +519,18 @@ do_verify() {
 
 step "5. План выполнения"
 
-stage "sgdisk --zap-all $DEV" do_zap
-stage "sgdisk --new=1:0:0 --typecode=1:8300 --change-name=1:$LABEL $DEV" do_partition
-stage "mkfs.ext4 -m 0 -i $INODE_BYTES -L $LABEL ${DEV}-part1" do_mkfs
+if [ "$NEED_PARTITION" = "1" ]; then
+  stage "sgdisk --zap-all $DEV" do_zap
+  stage "sgdisk --new=1:0:0 --typecode=1:8300 --change-name=1:$LABEL $DEV" do_partition
+else
+  say "  разметка уже создана предыдущей попыткой — sgdisk не повторяется"
+fi
+if [ "$FS_READY" = "1" ]; then
+  say "  ext4 с меткой $LABEL уже есть — wipefs и mkfs.ext4 не повторяются"
+else
+  stage "стереть подписи файловых систем в разделе (wipefs -a ${DEV}-part1)" do_wipe
+  stage "mkfs.ext4 -m 0 -i $INODE_BYTES -L $LABEL ${DEV}-part1 (stdin от /dev/null)" do_mkfs
+fi
 stage "создать точку монтирования $MOUNT" do_mountpoint
 stage "добавить строку UUID в $FSTAB (резервная копия, findmnt --verify, проверка после записи)" do_fstab
 stage "mount $MOUNT" do_mount
