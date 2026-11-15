@@ -13,6 +13,13 @@
 set -uo pipefail
 
 SRC="$(cd "$(dirname "$0")/.." && pwd)"
+# Раскладка репозитория держит модуль сверки в корне этапа, раскладка на сервере
+# — в каталоге образа. Стенд должен работать в обеих.
+SIZE_LIB=""
+for c in "$SRC/size-check.sh" "$SRC/image/ffmpeg/size-check.sh"; do
+  [ -r "$c" ] && { SIZE_LIB="$c"; break; }
+done
+[ -n "$SIZE_LIB" ] || { printf 'не найден size-check.sh ни в корне, ни в image/ffmpeg\n' >&2; exit 2; }
 PASS=0
 FAIL=0
 TMPROOT=$(mktemp -d /tmp/vs-tests.XXXXXX)
@@ -79,8 +86,19 @@ case "${1:-}" in
 esac
 EOF
 
-  cat > "$bin/df" <<'EOF'
+  # GNU coreutils df объявляет -P и --output взаимоисключающими и выходит кодом 1.
+# Имитация это повторяет: иначе недопустимая команда проходит стенд молча.
+cat > "$bin/df" <<'EOF'
 #!/bin/sh
+case "$*" in
+  *-P*)
+    case "$*" in
+      *--output*)
+        echo "df: options -P and --output are mutually exclusive" >&2
+        echo "Try 'df --help' for more information." >&2
+        exit 1 ;;
+    esac ;;
+esac
 case "$*" in
   *-BG*--output=size*) printf 'Size\n%sG\n' "$(( ${FAKE_TOTAL_KI:-41943040} / 1048576 ))" ;;
   *--output=size*)     printf 'Size\n%s\n' "${FAKE_TOTAL_KI:-41943040}" ;;
@@ -312,7 +330,7 @@ setup_env() {
   : > "$SB/dev/real"
   ln -s real "$FAKE_DEV"
   make_fakes "$SB/bin"
-  cp "$SRC/size-check.sh" "$SB/"
+  cp "$SIZE_LIB" "$SB/size-check.sh"
   export PATH="$SB/bin:$PATH"
   unset FAKE_MOUNTED FAKE_MOUNT_FAIL FAKE_VERIFY_FAIL FAKE_LABEL FAKE_PTTYPE \
         FAKE_SERIAL_SWITCH FAKE_SERIAL FAKE_ROOT FAKE_HOST_FREE_GIB \
@@ -327,7 +345,7 @@ setup_env() {
 seed_verify_env() {
   local marker="$1" total_ki="$2" prod_mount="$3"
   cp "$SRC/scripts/verify-storage.sh" "$SB/scripts/"
-  cp "$SRC/size-check.sh" "$SB/"
+  cp "$SIZE_LIB" "$SB/size-check.sh"
   sed -i -e "s|^PRODUCTION_MOUNT=.*|PRODUCTION_MOUNT=\"$prod_mount\"|" \
          -e "s|^ROOT=.*|ROOT=\"$SB\"|" \
          -e "s|/etc/fstab|$FAKE_FSTAB|g" "$SB/scripts/verify-storage.sh"
@@ -511,7 +529,7 @@ head_ "S4c. setup-ssd-storage.sh: модуль сверки размера то�
 setup_env
 rm -f "$SB/size-check.sh"
 mkdir -p "$SB/image/ffmpeg"
-cp "$SRC/size-check.sh" "$SB/image/ffmpeg/size-check.sh"
+cp "$SIZE_LIB" "$SB/image/ffmpeg/size-check.sh"
 cp "$SRC/host/setup-ssd-storage.sh" "$SB/host/"
 patch_ssd "$SB/host/setup-ssd-storage.sh"
 out=$(FAKE_ROOT=1 "$SB/host/setup-ssd-storage.sh" --apply --confirm-serial 24257G400264 2>&1); rc=$?
@@ -984,6 +1002,100 @@ EOF
 fi
 
 # =============================================================================
+head_ "S32. ни один скрипт не сочетает df -P с --output"
+# GNU df объявляет эти опции взаимоисключающими и выходит кодом 1. Проверка
+# статическая: одна команда df не должна иметь оба признака.
+bad_df=$(grep -rn --include=*.sh 'df ' "$SRC"/host "$SRC"/scripts \
+  | awk '{
+      code = $0
+      sub(/^[^:]*:[0-9]+:/, "", code)
+      if (code ~ /^[ \t]*#/) next
+      if (code ~ /df / && code ~ /-P/ && code ~ /--output/) print "'"$SRC"'" code
+    }')
+[ -z "$bad_df" ] && ok "несовместимых вызовов df нет" || bad "найдено: $bad_df"
+
+# =============================================================================
+head_ "S33. подставной df отвергает -P вместе с --output, как настоящий"
+setup_env
+out=$("$SB/bin/df" -Pk --output=size /tmp 2>&1); rc=$?
+[ "$rc" = 1 ] && ok "подставной df: код 1" || bad "подставной df: код $rc"
+printf '%s' "$out" | grep -q "mutually exclusive" && ok "подставной df: причина названа" || bad "нет причины: $out"
+real_path="/usr/bin:/bin:/usr/sbin:/sbin"
+if PATH="$real_path" command -v df >/dev/null 2>&1; then
+  out=$(PATH="$real_path" df -Pk --output=size /tmp 2>&1); rc=$?
+  [ "$rc" = 1 ] && ok "настоящий df: код 1 — поведение совпадает" || bad "настоящий df: код $rc"
+  printf '%s' "$out" | grep -q "mutually exclusive" && ok "настоящий df: та же причина" || bad "иное сообщение: $out"
+  out=$(PATH="$real_path" df -Pk /tmp 2>&1); rc=$?
+  [ "$rc" = 0 ] && ok "настоящий df -Pk без --output: код 0" || bad "df -Pk: код $rc"
+else
+  ok "пропущено: настоящего df нет"
+fi
+out=$("$SB/bin/df" -Pk /tmp 2>&1); rc=$?
+[ "$rc" = 0 ] && ok "подставной df -Pk: код 0" || bad "df -Pk: код $rc"
+out=$("$SB/bin/df" -BG --output=size /tmp 2>&1); rc=$?
+[ "$rc" = 0 ] && ok "подставной df --output без -P: код 0" || bad "df --output: код $rc"
+
+# =============================================================================
+head_ "S34. do_marker на настоящем df создаёт корректный маркер"
+setup_env
+real_path="/usr/bin:/bin:/usr/sbin:/sbin"
+if ! PATH="$real_path" command -v df >/dev/null 2>&1; then
+  ok "пропущено: настоящего df нет"
+else
+  awk '/^do_marker\(\)/{f=1} f{print} f&&/^}$/{exit}' \
+    "$SRC/host/setup-ssd-storage.sh" > "$SB/marker-func.sh"
+  cat > "$SB/marker-run.sh" <<'EOF'
+#!/bin/bash
+set -uE
+MOUNT="$1"
+say() { printf '%s\n' "$*"; }
+die() { printf 'ОТКАЗ: %s\n' "$*" >&2; exit 1; }
+. "$2"
+do_marker
+EOF
+  marker_dir="$SB/marker-mnt"
+  mkdir -p "$marker_dir"
+  out=$(PATH="$real_path" bash "$SB/marker-run.sh" "$marker_dir" "$SB/marker-func.sh" 2>&1); rc=$?
+  [ "$rc" = 0 ] && ok "код 0" || bad "код $rc: $out"
+  marker="$marker_dir/.storage-size-gib"
+  if [ -f "$marker" ]; then
+    ok "маркер создан"
+    declared=$(cat "$marker")
+    case "$declared" in
+      ''|*[!0-9]*) bad "маркер не целое число: '$declared'" ;;
+      *) ok "маркер — целое число: $declared GiB" ;;
+    esac
+    total_ki=$(PATH="$real_path" df -Pk "$marker_dir" | awk 'NR==2{print $2}')
+    expect=$(( total_ki / 1048576 ))
+    [ "$declared" = "$expect" ] && ok "значение совпало с df ($expect GiB)" \
+      || bad "маркер $declared, по df $expect"
+    mode=$(stat -c '%a' "$marker")
+    [ "$mode" = "444" ] && ok "права 0444" || bad "права $mode"
+    printf '%s' "$out" | grep -q "маркер: $expect GiB" && ok "значение напечатано" \
+      || bad "нет строки о маркере: $out"
+    chmod 0644 "$marker"
+    out=$(PATH="$real_path" bash "$SB/marker-run.sh" "$marker_dir" "$SB/marker-func.sh" 2>&1); rc=$?
+    [ "$rc" = 0 ] && ok "повторный запуск перезаписывает маркер" || bad "повтор: код $rc: $out"
+  else
+    bad "маркера нет: $out"
+  fi
+  # df, который не смог ответить, должен дать отказ, а не пустой маркер.
+  mkdir -p "$SB/bin-broken"
+  cat > "$SB/bin-broken/df" <<'EOF'
+#!/bin/sh
+echo "df: simulated failure" >&2
+exit 1
+EOF
+  chmod +x "$SB/bin-broken/df"
+  malformed="$SB/malformed-mnt"
+  mkdir -p "$malformed"
+  out=$(PATH="$SB/bin-broken:$real_path" bash "$SB/marker-run.sh" "$malformed" "$SB/marker-func.sh" 2>&1); rc=$?
+  [ "$rc" != 0 ] && ok "отказ df — ненулевой код" || bad "отказ df не замечен"
+  [ ! -f "$malformed/.storage-size-gib" ] && ok "маркер не создан при отказе df" \
+    || bad "маркер создан при отказе df"
+fi
+
+# =============================================================================
 head_ "L1. setup-storage.sh: примерка ничего не исполняет"
 setup_env
 cp "$SRC/host/setup-storage.sh" "$SB/host/"
@@ -1209,7 +1321,7 @@ printf '%s' "$out" | grep -q "хранилище на разделе" && ok "в�
 
 # =============================================================================
 head_ "V1. size-check.sh: границы допуска 1 GiB"
-. "$SRC/size-check.sh"
+. "$SIZE_LIB"
 check() { if size_matches "$1" "$2"; then echo yes; else echo no; fi; }
 [ "$(check 972029 927)" = no ] && ok "927 GiB против маркера 927 при 972029 KiB — нет" || bad "завышенный размер принят"
 [ "$(check $((927*1048576)) 927)" = yes ] && ok "точное совпадение принято" || bad "точное совпадение отклонено"

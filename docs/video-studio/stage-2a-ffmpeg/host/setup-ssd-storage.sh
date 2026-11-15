@@ -538,7 +538,14 @@ do_dirs() {
 }
 
 do_marker() {
-  size_ki=$(df -Pk --output=size "$MOUNT" | awk 'NR==2{print $1}')
+  local size_ki size_gib df_out
+  # -P и --output у GNU df взаимоисключающие: вместе они дают код 1. Поэтому
+  # размер берётся из обычного -Pk, второй столбец второй строки — 1024-блоки.
+  df_out=$(df -Pk "$MOUNT") || die "df не смог определить размер $MOUNT"
+  size_ki=$(printf '%s\n' "$df_out" | awk 'NR==2{print $2}')
+  case "$size_ki" in
+    ''|*[!0-9]*) die "df вернул не число для $MOUNT: '${size_ki}'" ;;
+  esac
   size_gib=$(( size_ki / 1048576 ))
   [ "$size_gib" -gt 0 ] || die "не удалось определить размер $MOUNT"
   printf '%s\n' "$size_gib" > "$MOUNT/.storage-size-gib"
@@ -547,8 +554,13 @@ do_marker() {
 }
 
 do_verify() {
+  local df_out
   declared=$(tr -dc '0-9' < "$MOUNT/.storage-size-gib")
-  total=$(df -Pk "$MOUNT" | awk 'NR==2{print $2}')
+  df_out=$(df -Pk "$MOUNT") || die "df не смог определить размер $MOUNT"
+  total=$(printf '%s\n' "$df_out" | awk 'NR==2{print $2}')
+  case "$total" in
+    ''|*[!0-9]*) die "df вернул не число для $MOUNT: '${total}'" ;;
+  esac
   # shellcheck disable=SC1090
   . "$SIZE_CHECK_LIB"
   size_matches "$total" "$declared" || die "размер $total KiB не совпал с маркером $declared GiB"
