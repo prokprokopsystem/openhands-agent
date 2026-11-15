@@ -4,8 +4,8 @@
 # Два режима:
 #   tmpfs (по умолчанию) — как на этапе 2а: вывод в tmpfs 1 GiB, затем публикация
 #                          потоком tar в каталог out/;
-#   disk  (MODE=disk)    — вывод напрямую в дисковое хранилище 40 GiB, где объём
-#                          ограничивает файловая система.
+#   disk  (MODE=disk)    — вывод напрямую в дисковое хранилище, где объём
+#                          ограничивает файловая система хранилища.
 #
 #   ./scripts/run-render.sh -i /work/in.mp4 -c:v libx264 /out/out.mp4
 #   MODE=disk ./scripts/run-render.sh -i /work/in.mp4 -c:v libx264 /out/out.mp4
@@ -16,7 +16,7 @@ MODE="${MODE:-tmpfs}"
 STORAGE="${STORAGE:-/srv/video-studio-data}"
 MIN_FREE_GIB="${MIN_FREE_GIB:-60}"
 MAX_TOTAL_GIB="${MAX_TOTAL_GIB:-15}"
-MIN_STORAGE_FREE_GIB="${MIN_STORAGE_FREE_GIB:-2}"
+MIN_STORAGE_FREE_GIB="${MIN_STORAGE_FREE_GIB:-20}"
 
 die() { printf 'ОТКАЗ: %s\n' "$1" >&2; exit 1; }
 

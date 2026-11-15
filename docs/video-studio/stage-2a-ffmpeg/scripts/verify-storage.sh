@@ -7,9 +7,12 @@
 #   ./scripts/verify-storage.sh          # проверки без заполнения
 #   ./scripts/verify-storage.sh --fill   # плюс проверка отказа при переполнении
 #
-# Проверка --fill создаёт внутри хранилища файлы до отказа файловой системы,
-# затем удаляет их. Общий раздел хоста при этом не заполняется: размер образа
-# фиксирован, а занятые блоки освобождаются удалением.
+# Источник хранилища определяется по факту (findmnt), поэтому скрипт одинаково
+# работает и с loop-образом, и с разделом SSD, и с логическим томом.
+#
+# Проверка --fill считает число файлов из свободного места, а не из фиксированных
+# 80 GiB: на хранилище 927 GiB фиксированное число не достигало предела и давало
+# ложное «предел не действует».
 set -euo pipefail
 
 ROOT="${ROOT:-/home/igor/video-studio}"
@@ -29,20 +32,47 @@ bad() { printf '  НЕ ПРОЙДЕНО: %s\n' "$1"; fail=$((fail+1)); }
 cd "$ROOT"
 
 echo "== 1. Хранилище на хосте =="
+source=""
 if findmnt -no TARGET "$MOUNT" >/dev/null 2>&1; then
   fstype=$(findmnt -no FSTYPE "$MOUNT")
+  source=$(findmnt -no SOURCE "$MOUNT")
   size=$(df -BG --output=size "$MOUNT" | awk 'NR==2{gsub(/G/,"",$1); print $1}')
   [ "$fstype" = "ext4" ] && ok "тип файловой системы ext4" || bad "тип '$fstype' вместо ext4"
 else
   bad "$MOUNT не смонтирован"
 fi
 
-[ -e "$IMAGE" ] && ok "образ $IMAGE на месте" || bad "нет образа $IMAGE"
-grep -qF "$IMAGE $MOUNT " /etc/fstab 2>/dev/null \
-  && ok "запись в /etc/fstab есть (монтирование после перезагрузки)" \
-  || bad "в /etc/fstab нет записи — после перезагрузки хранилище не поднимется"
+case "$source" in
+  /dev/mapper/*|/dev/dm-*)
+    ok "источник $source — логический том" ;;
+  /dev/loop*)
+    [ -f "$IMAGE" ] && ok "источник $source, образ $IMAGE на месте" \
+      || bad "источник $source, но файла образа $IMAGE нет" ;;
+  /dev/*)
+    if [ -b "$source" ]; then
+      disk=$(lsblk -no PKNAME "$source" | head -1)
+      ok "источник $source — раздел на /dev/${disk} (${source})"
+      [ -n "$disk" ] && [ "$disk" != "sda" ] \
+        && ok "раздел не на системном диске" \
+        || bad "раздел на системном диске /dev/$disk"
+    else
+      bad "источник $source не блочное устройство"
+    fi ;;
+  "") ;;
+  *)
+    bad "неизвестный источник $source" ;;
+esac
 
-declared=$(tr -dc '0-9' < "$MOUNT/.storage-size-gib" 2>/dev/null || true)
+# Строка fstab ищется по точке монтирования: у loop там путь к образу,
+# у раздела — UUID, поэтому поиск по IMAGE давал ложное «нет записи».
+if grep -qE "[[:space:]]$MOUNT[[:space:]]" /etc/fstab 2>/dev/null; then
+  ok "запись в /etc/fstab есть (монтирование после перезагрузки)"
+  grep -q "nofail" /etc/fstab && ok "в fstab есть nofail" || bad "в fstab нет nofail"
+else
+  bad "в /etc/fstab нет записи для $MOUNT — после перезагрузки хранилище не поднимется"
+fi
+
+declared=$(tr -dc '0-9' 2>/dev/null < "$MOUNT/.storage-size-gib" || true)
 if [ -n "$declared" ] && [ "$declared" -ge "$MIN_GIB" ]; then
   ok "маркер хранилища: $declared GiB"
 else
@@ -107,12 +137,18 @@ docker exec "$cid" sh -c 'mkdir -p /out/.verify && echo probe > /out/.verify/pro
   && ok "запись в /out работает" || bad "запись в /out не работает"
 
 if [ "$FILL" = "1" ]; then
-  echo "  заполняю хранилище файлами по 4 GiB до отказа (это и есть проверка предела)…"
-  result=$(docker exec "$cid" sh -c '
+  free_mib_before=$(docker exec "$cid" df -Pm /out | awk 'NR==2{print $4}')
+  # Число файлов из свободного места: 4 GiB на файл плюс запас на метаданные.
+  # Верхняя граница 400 защищает от бесконечного цикла при ошибке в расчёте.
+  want_files=$(( free_mib_before / 4096 + 2 ))
+  [ "$want_files" -gt 400 ] && want_files=400
+  echo "  свободно ${free_mib_before} MiB, буду писать до $want_files файлов по 4 GiB"
+
+  result=$(docker exec -e WANT="$want_files" "$cid" sh -c '
     set -u
     mkdir -p /out/.verify/fill
     i=0
-    while [ $i -lt 20 ]; do
+    while [ "$i" -lt "$WANT" ]; do
       i=$((i+1))
       if ! fallocate -l 4G "/out/.verify/fill/f$i" 2>/dev/null; then
         echo "ОТКАЗ НА ФАЙЛЕ $i"

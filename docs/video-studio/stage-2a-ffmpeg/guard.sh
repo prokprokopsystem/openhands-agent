@@ -68,7 +68,12 @@ case "$GUARD_MODE" in
     total=$(size_ki "$OUT_DIR")
     [ "${total:-0}" -gt 0 ] || die "не удалось определить размер $OUT_DIR"
     expected=$(( declared * 1048576 ))
-    if [ "$total" -lt $(( expected * 95 / 100 )) ] || [ "$total" -gt $(( expected * 105 / 100 )) ]; then
+    # Допуск 1 GiB, а не проценты: маркер пишется из того же df, поэтому
+    # расхождение означает подмену каталога. Процентный допуск на объёме
+    # 927 GiB пропускал бы 935 GiB корневого раздела как «похожий размер».
+    diff_ki=$(( total - expected ))
+    [ "$diff_ki" -lt 0 ] && diff_ki=$(( -diff_ki ))
+    if [ "$diff_ki" -gt 1048576 ]; then
       die "$OUT_DIR размером $((total/1024/1024)) GiB не совпадает с объявленными $declared GiB: хранилище не смонтировано"
     fi
     writable "$OUT_DIR"

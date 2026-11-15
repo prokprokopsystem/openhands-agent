@@ -10,14 +10,16 @@
 |---|---|
 | `Dockerfile`, `guard.sh`, `entrypoint.sh` | образ `video-studio/ffmpeg:8.0.1`; `entrypoint.sh` без аргументов держит контейнер живым, с аргументами передаёт их ограде и ffmpeg |
 | `compose.yaml` | режим `tmpfs`: изоляция, лимиты, `/out` в памяти 1 GiB |
-| `compose.disk.yaml` | режим `disk`: сервис `studio-disk` с хранилищем `/srv/video-studio-data` 40 GiB |
+| `compose.disk.yaml` | режим `disk`: сервис `studio-disk` с хранилищем `/srv/video-studio-data`; источник — раздел SSD, том или loop-образ |
 | `scripts/run-render.sh` | единственный разрешённый способ запуска; режим задаётся `MODE=tmpfs\|disk` |
 | `scripts/verify.sh` | 25 проверок установки в режиме `tmpfs` |
-| `scripts/verify-storage.sh` | проверки хранилища, включая тест переполнения (`--fill`) |
+| `scripts/verify-storage.sh` | проверки хранилища, включая тест переполнения (`--fill`); источник определяется по `findmnt` |
 | `scripts/check-docker-space.sh` | бюджет Docker перед установкой HyperFrames |
-| `host/setup-storage.sh` | привилегированное создание хранилища; без `--apply` только примерка |
-| `host/resize-storage.sh` | расширение без остановки контейнеров |
-| `host/remove-storage.sh` | удаление хранилища с резервной копией `fstab` |
+| `host/setup-ssd-storage.sh` | подготовка внешнего SSD: GPT + `ext4`, монтирование по UUID; dry-run по умолчанию, проверка модели и серийного номера |
+| `host/setup-storage.sh` | резервный вариант на loop-образе; без `--apply` только примерка |
+| `host/diagnose-storage.sh` | диагностика отказа, только чтение, ничего не восстанавливает |
+| `host/resize-storage.sh` | расширение loop-хранилища; для раздела и LVM объясняет, почему это невозможно |
+| `host/remove-storage.sh` | демонтаж с резервной копией `fstab`; данные удаляются только с `--delete-image` и только для файла-образа |
 | `host/check-storage.sh` | состояние хранилища, только чтение |
 
 ## Два режима
@@ -99,17 +101,20 @@ MODE=disk ./scripts/run-render.sh -i /work/in.mp4 -c:v libx264 -preset veryfast 
 ```bash
 cd /home/igor/video-studio
 
-sudo ./host/setup-storage.sh                    # 1. примерка, ничего не меняет
-sudo ./host/setup-storage.sh --apply            # 2. создать и смонтировать
-./scripts/verify-storage.sh                     # 3. базовые проверки
-./scripts/verify-storage.sh --fill              # 4. доказать предел
-docker compose -f compose.disk.yaml up -d studio-disk   # 5. включить сервис
-MODE=disk ./scripts/run-render.sh ... /out/probe.mp4     # 6. пробный запуск
+./host/setup-ssd-storage.sh                     # 1. примерка, ничего не меняет
+sudo ./host/setup-ssd-storage.sh --apply --confirm-serial 24257G400264   # 2. разметить и смонтировать
+./host/diagnose-storage.sh                      # 3. диагностика, только чтение
+./scripts/verify-storage.sh                     # 4. базовые проверки
+./scripts/verify-storage.sh --fill              # 5. доказать предел
+docker compose -f compose.disk.yaml up -d studio-disk   # 6. включить сервис
+MODE=disk ./scripts/run-render.sh ... /out/probe.mp4     # 7. пробный запуск
 ```
 
+Для loop-варианта вместо шага 2: `sudo ./host/setup-storage.sh --apply`.
+
 Откат: `docker compose -f compose.disk.yaml down`, затем
-`sudo ./host/remove-storage.sh --apply`. Режим `tmpfs` при этом остаётся рабочим
-всё время — `compose.yaml` не меняется.
+`sudo ./host/remove-storage.sh --apply`. Данные на разделе SSD скрипт не стирает.
+Режим `tmpfs` при этом остаётся рабочим всё время — `compose.yaml` не меняется.
 
 ## Остановка и полное удаление
 
