@@ -22,6 +22,14 @@
 # Проверка идёт в собственном проекте compose ($PROJECT), поэтому её down не
 # может ни остановить, ни удалить контейнеры других сервисов. Состав чужих
 # контейнеров сверяется до и после.
+#
+# Запись пробы подчинена правилу fail-closed: она выполняется только после
+# того, как пройдены все критические проверки внутри контейнера — раздел /out,
+# размер файловой системы, ограда, права /work, /scratch и маркер. Любой отказ
+# означает конец проверки без записи, а не продолжение с пометкой. Перед самой
+# записью точка монтирования и серийный номер сверяются повторно.
+# Уборка своего проекта выполняется ловушкой при любом выходе, включая сбой
+# docker exec и сигнал.
 set -euEo pipefail
 
 ROOT="${ROOT:-/home/igor/video-studio}"
@@ -34,6 +42,13 @@ MOUNT="${MOUNT:-$PRODUCTION_MOUNT}"
 MIN_GIB="${MIN_GIB:-38}"
 FILL=0
 [ "${1:-}" = "--fill" ] && FILL=1
+
+# Порог маркера. Для --fill он не может равняться MIN_GIB: тест по определению
+# идёт на хранилище не больше FILL_MAX_GIB, поэтому требование 38 GiB делало бы
+# документированный сценарий с loop-образом 2 GiB недостижимым — отказ приходил
+# бы на маркере, задолго до ворот --fill. Рабочий порог при этом не меняется.
+REQUIRED_GIB="$MIN_GIB"
+[ "$FILL" = 1 ] && REQUIRED_GIB="${TEST_MIN_GIB:-1}"
 
 # Отдельное имя проекта: compose.yaml и compose.disk.yaml лежат в одном
 # каталоге и оба объявляют name: video-studio. Без своего имени down этой
@@ -68,6 +83,21 @@ cd "$ROOT"
 # ловило бы остатки прошлой попытки.
 container_snapshot() {
   docker ps -a --format '{{.Names}}' 2>/dev/null | grep -v "^${PROJECT}" | sort || true
+}
+
+# Серийный номер диска, на котором лежит источник. Пусто, если источника нет
+# или он не раздел: у тома и loop-образа своего серийного номера не бывает.
+mount_serial() {
+  # У loop-образа и тома своего серийного номера нет: родитель у loop — не диск,
+  # и lsblk вернул бы по нему что-то постороннее.
+  case "${1:-}" in
+    /dev/loop*) return 0 ;;
+    /dev/?*) ;;
+    *) return 0 ;;
+  esac
+  local parent
+  parent=$(lsblk -no PKNAME "$1" 2>/dev/null | head -1)
+  [ -n "$parent" ] && lsblk -dno SERIAL "/dev/$parent" 2>/dev/null || true
 }
 
 echo "== 1. Хранилище на хосте =="
@@ -137,11 +167,16 @@ else
   bad "в /etc/fstab нет записи для $MOUNT"
 fi
 
-declared=$(tr -dc '0-9' < "$MOUNT/.storage-size-gib" 2>/dev/null || true)
-if [ -n "$declared" ] && [ "$declared" -ge "$MIN_GIB" ]; then
-  ok "маркер хранилища: $declared GiB"
+# Проверка на читаемость до перенаправления: ошибка открытия печатается самим
+# шеллом и в 2>/dev/null не попадает, а отчёт должен называть причину сам.
+declared=""
+if [ -r "$MOUNT/.storage-size-gib" ]; then
+  declared=$(tr -dc '0-9' < "$MOUNT/.storage-size-gib" 2>/dev/null || true)
+fi
+if [ -n "$declared" ] && [ "$declared" -ge "$REQUIRED_GIB" ]; then
+  ok "маркер хранилища: $declared GiB (порог $REQUIRED_GIB GiB)"
 else
-  bad "маркер $MOUNT/.storage-size-gib отсутствует или меньше $MIN_GIB GiB"
+  bad "маркер $MOUNT/.storage-size-gib отсутствует или меньше $REQUIRED_GIB GiB"
 fi
 
 # Та же функция, что в ограде: допуск 1 GiB абсолютный.
@@ -193,9 +228,30 @@ echo "== 2. Хранилище внутри контейнера =="
 # Остатки прошлой попытки — только своего проекта: down с чужим именем проекта
 # не должен попасть под рабочую установку.
 "${DC[@]}" down >/dev/null 2>&1 || true
+
+# С этого момента контейнер может существовать, поэтому уборка обязательна при
+# любом выходе: отказ проверки, сбой docker exec (set -e) и сигнал. Ловушка
+# знает только своё имя проекта.
+CLEANED=0
+cleanup() {
+  rc=$?
+  if [ "$CLEANED" = 0 ]; then
+    CLEANED=1
+    "${DC[@]}" down >/dev/null 2>&1 || true
+    printf 'УБОРКА: контейнеры проекта %s остановлены\n' "$PROJECT" >&2
+  fi
+  exit "$rc"
+}
+trap cleanup EXIT INT TERM HUP
+
 "${DC[@]}" up -d studio-disk >/dev/null
 cid=$("${DC[@]}" ps -q studio-disk)
-[ -n "$cid" ] || { bad "контейнер studio-disk не запустился"; exit 1; }
+[ -n "$cid" ] || die "контейнер studio-disk не запустился"
+
+# fail-closed: запись пробы разрешена, только если пройдены все критические
+# проверки. Отказ любой из них — конец проверки без записи.
+write_ok=1
+refuse() { bad "$1"; write_ok=0; }
 
 # /out обязан быть на отдельной файловой системе: если хранилище отвалилось,
 # docker привязал бы каталог с корня, и проба записалась бы на системный диск.
@@ -203,23 +259,24 @@ inside_dev=$(docker exec "$cid" stat -c %d /out)
 container_dev=$(docker exec "$cid" stat -c %d /)
 [ "$inside_dev" != "$container_dev" ] \
   && ok "/out на отдельной файловой системе от корня контейнера" \
-  || bad "/out на корневой файловой системе контейнера — запись уйдёт на системный диск"
+  || refuse "/out на корневой файловой системе контейнера — запись уйдёт на системный диск"
 
 in_total=$(docker exec "$cid" df -Pk /out | awk 'NR==2{print $2}')
 if size_matches "$in_total" "$declared"; then
   ok "/out внутри контейнера $(( in_total / 1048576 )) GiB"
 else
-  bad "/out внутри контейнера $(( in_total / 1048576 )) GiB, ожидалось около $declared GiB"
+  refuse "/out внутри контейнера $(( in_total / 1048576 )) GiB, ожидалось около $declared GiB"
 fi
 
-if docker exec "$cid" /usr/local/bin/ffmpeg-guard -version 2>&1 | grep -q 'квота .* действует'; then
+guard_out=$(docker exec "$cid" /usr/local/bin/ffmpeg-guard -version 2>&1) && guard_rc=0 || guard_rc=$?
+if [ "$guard_rc" = 0 ] && printf '%s' "$guard_out" | grep -q 'квота .* действует'; then
   ok "ограда приняла дисковый режим"
 else
-  bad "ограда не подтвердила дисковый режим"
+  refuse "ограда не подтвердила дисковый режим (код $guard_rc)"
 fi
 
 if docker exec "$cid" sh -c 'touch /work/.t' 2>/dev/null; then
-  bad "в /work можно писать"
+  refuse "в /work можно писать — привязки томов не те"
 else
   ok "/work только на чтение"
 fi
@@ -227,14 +284,46 @@ fi
 if docker exec "$cid" sh -c 'test "$(stat -c %d /out)" = "$(stat -c %d /scratch)"'; then
   ok "временный каталог /scratch на том же хранилище"
 else
-  bad "/scratch вне хранилища — временные файлы уйдут вне квоты"
+  refuse "/scratch вне хранилища — временные файлы уйдут вне квоты"
 fi
 
 if docker exec "$cid" sh -c 'test -r /storage/.storage-size-gib'; then
   ok "маркер виден контейнеру только на чтение"
 else
-  bad "контейнер не видит маркер хранилища"
+  refuse "контейнер не видит маркер хранилища"
 fi
+
+if [ "$write_ok" != 1 ]; then
+  echo
+  echo "ОТКАЗ: критическая проверка не пройдена — запись пробы не выполняется"
+  echo "ИТОГ: ПРОЙДЕНО $pass, НЕ ПРОЙДЕНО $fail"
+  exit 1
+fi
+
+# Повторная сверка непосредственно перед записью: за время проверки внутри
+# контейнера точка могла отвалиться, и проба ушла бы в каталог на корне.
+now_target=$(findmnt -no TARGET -M "$MOUNT" 2>/dev/null || true)
+now_source=$(findmnt -no SOURCE -M "$MOUNT" 2>/dev/null || true)
+now_serial=$(mount_serial "$now_source")
+recheck_ok=1
+[ "$now_target" = "$MOUNT" ] \
+  || { refuse "перед записью $MOUNT перестал быть точкой монтирования"; recheck_ok=0; }
+[ -z "$source" ] || [ "$now_source" = "$source" ] \
+  || { refuse "перед записью источник сменился: $source -> ${now_source:-нет}"; recheck_ok=0; }
+if [ "$MOUNT" = "$PRODUCTION_MOUNT" ]; then
+  [ "$now_serial" = "$PRODUCTION_SERIAL" ] \
+    || { refuse "перед записью серийный номер не $PRODUCTION_SERIAL (${now_serial:-нет})"; recheck_ok=0; }
+else
+  [ "$now_serial" != "$PRODUCTION_SERIAL" ] \
+    || { refuse "перед записью точка ведёт на рабочий SSD $PRODUCTION_SERIAL"; recheck_ok=0; }
+fi
+if [ "$recheck_ok" != 1 ]; then
+  echo
+  echo "ОТКАЗ: хранилище не подтверждено перед записью — проба не пишется"
+  echo "ИТОГ: ПРОЙДЕНО $pass, НЕ ПРОЙДЕНО $fail"
+  exit 1
+fi
+ok "перед записью точка монтирования и серийный номер те же"
 
 echo
 echo "== 3. Запись и сумма файлов =="
@@ -298,6 +387,7 @@ docker exec "$cid" /usr/local/bin/ffmpeg-guard -version >/dev/null 2>&1 \
 echo
 echo "== 5. Уборка =="
 "${DC[@]}" down >/dev/null 2>&1 || true
+CLEANED=1
 left=$("${DC[@]}" ps -aq | wc -l)
 [ "$left" -eq 0 ] && ok "контейнеры проекта $PROJECT остановлены" \
   || bad "в проекте $PROJECT остались контейнеры: $left"
@@ -309,6 +399,7 @@ else
   bad "состав контейнеров изменился: пропали '$(comm -23 <(printf '%s\n' "$containers_before") <(printf '%s\n' "$containers_after") | tr '\n' ' ')' появились '$(comm -13 <(printf '%s\n' "$containers_before") <(printf '%s\n' "$containers_after") | tr '\n' ' ')'"
 fi
 
+trap - EXIT INT TERM HUP
 echo
 echo "ИТОГ: ПРОЙДЕНО $pass, НЕ ПРОЙДЕНО $fail"
 [ "$fail" -eq 0 ] || exit 1

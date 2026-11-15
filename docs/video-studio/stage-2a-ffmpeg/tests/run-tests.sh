@@ -66,7 +66,10 @@ EOF
   cat > "$bin/findmnt" <<'EOF'
 #!/bin/sh
 st="$FAKE_STATE"
-mounted() { [ "${FAKE_MOUNTED:-0}" = 1 ] || [ -f "$st/mounted" ]; }
+mounted() {
+  [ -f "$st/unmounted" ] && return 1
+  [ "${FAKE_MOUNTED:-0}" = 1 ] || [ -f "$st/mounted" ]
+}
 target=""
 exact=0
 for a in "$@"; do
@@ -358,7 +361,9 @@ setup_env() {
         FAKE_MKFS_FAIL FAKE_UUID FAKE_WIPEFS_PROBE_FAIL FAKE_BLKID_DOS_ONLY \
         FAKE_BLKID_FAIL_NOSTDERR FAKE_BLKID_DENIED FAKE_IS_MOUNTPOINT \
         FAKE_ROOT_SOURCE FAKE_FOREIGN FAKE_FOREIGN_LOSE FAKE_OUT_DEV \
-        FAKE_ROOT_DEV FAKE_UP_FAIL FAKE_FSTYPE
+        FAKE_ROOT_DEV FAKE_UP_FAIL FAKE_FSTYPE FAKE_GUARD_FAIL \
+        FAKE_IN_TOTAL_KI FAKE_EXEC_FAIL FAKE_UNMOUNT_AFTER_UP \
+        FAKE_WORK_WRITABLE DISK_PROJECT
 }
 
 # Для проверок verify-storage: смонтированное хранилище с маркером и записью
@@ -405,11 +410,14 @@ case "$1" in
     shift
     verb=""
     for a in "$@"; do
-      case "$a" in up|down|restart|ps) verb="$a" ;; esac
+      case "$a" in up|down|restart|ps|stop) verb="$a" ;; esac
     done
     case "$verb" in
       up) [ "${FAKE_UP_FAIL:-0}" = 1 ] && { echo "compose: отказ" >&2; exit 1; }
-          : > "$st/up"; exit 0 ;;
+          : > "$st/up"
+          [ "${FAKE_UNMOUNT_AFTER_UP:-0}" = 1 ] && : > "$st/unmounted"
+          exit 0 ;;
+      stop) rm -f "$st/up"; exit 0 ;;
       down) rm -f "$st/up"; exit 0 ;;
       restart) : > "$st/restarted"; exit 0 ;;
       ps)
@@ -433,11 +441,19 @@ case "$1" in
     done
     shift
     case "$*" in
+      *"${FAKE_EXEC_FAIL:-__нет__}"*) echo "docker exec: отказ (подставной)" >&2; exit 2 ;;
       *"/scratch"*) exit 0 ;;
-      *"/work/.t"*) exit 1 ;;
+      *"/work/.t"*) [ "${FAKE_WORK_WRITABLE:-0}" = 1 ] && exit 0; exit 1 ;;
       *"/storage/.storage-size-gib"*) exit 0 ;;
-      *"ffmpeg-guard"*) echo "ffmpeg-guard: квота 40G действует"; exit 0 ;;
-      *"df -Pk /out"*) printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/sdc1 %s 10240 1000 1%% /out\n' "${FAKE_TOTAL_KI:-41943040}"; exit 0 ;;
+      *"ffmpeg-guard"*)
+        [ "${FAKE_GUARD_FAIL:-0}" = 1 ] && { echo "ОГРАДА: отказ (подставной)" >&2; exit 78; }
+        echo "ffmpeg-guard: квота 40G действует"; exit 0 ;;
+      *"sh -c"*".verify/fill"*)
+        # Заполнение обязано упереться в предел: иначе проверка не отличит
+        # действующий предел от отсутствующего.
+        printf 'ОТКАЗ НА ФАЙЛЕ 3\nзанято=2040MiB свободно=8MiB файлов=3\n'
+        exit 0 ;;
+      *"df -Pk /out"*) printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/sdc1 %s 10240 1000 1%% /out\n' "${FAKE_IN_TOTAL_KI:-${FAKE_TOTAL_KI:-41943040}}"; exit 0 ;;
       *"df -Pm /out"*) printf 'Filesystem 1048576-blocks Used Available Capacity Mounted on\n/dev/sdc1 %s %s %s 1%% /out\n' "$(( ${FAKE_TOTAL_KI:-41943040} / 1024 ))" "${FAKE_USED_MIB:-10}" "${FAKE_FREE_MIB:-40000}"; exit 0 ;;
       *"stat -c %d /out"*) echo "${FAKE_OUT_DEV:-42}"; exit 0 ;;
       *"stat -c %d /"*) echo "${FAKE_ROOT_DEV:-41}"; exit 0 ;;
@@ -1714,6 +1730,182 @@ else
   printf '%s' "$out" | grep -q "source: /srv/video-studio-data/out" \
     && ok "без STORAGE_ROOT остаётся рабочий путь" || bad "рабочий путь потерян"
 fi
+
+# --- W13. нормальный прогон: запись была, уборка одна, без ловушки ----------
+head_ "W13. verify-storage.sh: запись пробы и уборка при успехе"
+setup_env
+seed_verify_env 926 972029952 "$FAKE_MOUNT"
+patch_verify
+seed_verify_docker
+seed_verify_prod
+export FAKE_SERIAL=24257G400264
+out=$(MIN_GIB=900 run_verify 2>&1); rc=$?
+[ "$rc" = 0 ] && ok "код 0" || { bad "код $rc"; printf '%s\n' "$out" | tail -6; }
+grep -q 'mkdir -p /out/.verify' "$FAKE_LOG" && ok "проба записана" || bad "записи не было"
+printf '%s' "$out" | grep -q "перед записью точка монтирования и серийный номер те же" \
+  && ok "сверка перед записью пройдена" || bad "сверки перед записью нет"
+docker_calls | grep -q -- '--project-name video-studio-disk-check up' \
+  && ok "контейнер поднят в своём проекте" || bad "свой проект не использован"
+printf '%s' "$out" | grep -q 'УБОРКА' && bad "ловушка сработала повторно" \
+  || ok "повторной уборки нет"
+
+# --- X: fail-closed ---------------------------------------------------------
+# Общий помощник: прогон с одним подставным отказом. Проверяет код возврата,
+# отсутствие записи и уборку своего проекта после подъёма контейнера.
+fail_closed_case() {
+  local title="$1" expect="$2"; shift 2
+  head_ "$title"
+  setup_env
+  seed_verify_env 926 972029952 "$FAKE_MOUNT"
+  patch_verify
+  seed_verify_docker
+  seed_verify_prod
+  export FAKE_SERIAL=24257G400264
+  export "$@"
+  out=$(MIN_GIB=900 run_verify 2>&1); rc=$?
+  if [ "$rc" = 1 ]; then ok "код 1 — проверка прекращена"; else bad "код $rc"; fi
+  if grep -q 'mkdir -p /out/.verify' "$FAKE_LOG"; then
+    bad "проба записана вопреки отказу"
+  else
+    ok "записи пробы не было"
+  fi
+  printf '%s' "$out" | grep -q "$expect" && ok "причина названа" || bad "нет причины: $expect"
+  # Уборка: down после up.
+  if sed -n '/compose .* up /,$p' "$FAKE_LOG" | grep -q 'compose .* down'; then
+    ok "свой проект убран после отказа"
+  else
+    bad "контейнер остался после отказа"
+  fi
+  docker_calls | sed -n '/compose .* up /,$p' | grep -q 'amnesia\|paperless\|nextcloud\|openhands' \
+    && bad "уборка коснулась чужого имени" || ok "уборка только своя"
+}
+
+fail_closed_case "X1. ограда отказала — записи нет, уборка есть" \
+  "ограда не подтвердила дисковый режим" FAKE_GUARD_FAIL=1
+
+fail_closed_case "X2. размер в контейнере не тот — записи нет" \
+  "ожидалось около" FAKE_IN_TOTAL_KI=2097152
+
+fail_closed_case "X3. /out на корне контейнера — записи нет" \
+  "запись уйдёт на системный диск" FAKE_OUT_DEV=41 FAKE_ROOT_DEV=41
+
+fail_closed_case "X4. /work доступен на запись — записи нет" \
+  "привязки томов не те" FAKE_WORK_WRITABLE=1
+
+# --- X5. хранилище пропало между проверкой и записью ------------------------
+head_ "X5. verify-storage.sh: точка отвалилась перед записью — записи нет"
+setup_env
+seed_verify_env 926 972029952 "$FAKE_MOUNT"
+patch_verify
+seed_verify_docker
+seed_verify_prod
+export FAKE_SERIAL=24257G400264 FAKE_UNMOUNT_AFTER_UP=1
+out=$(MIN_GIB=900 run_verify 2>&1); rc=$?
+[ "$rc" = 1 ] && ok "код 1" || bad "код $rc"
+grep -q 'mkdir -p /out/.verify' "$FAKE_LOG" && bad "проба записана вопреки отказу" \
+  || ok "записи не было"
+printf '%s' "$out" | grep -q "перестал быть точкой монтирования" && ok "причина названа" \
+  || bad "нет сообщения о точке монтирования"
+sed -n '/compose .* up /,$p' "$FAKE_LOG" | grep -q 'compose .* down' \
+  && ok "свой проект убран" || bad "контейнер остался"
+
+# --- X6. сбой docker exec после подъёма -------------------------------------
+head_ "X6. verify-storage.sh: сбой docker exec — уборка ловушкой"
+setup_env
+seed_verify_env 926 972029952 "$FAKE_MOUNT"
+patch_verify
+seed_verify_docker
+seed_verify_prod
+export FAKE_SERIAL=24257G400264 FAKE_EXEC_FAIL='stat -c %d /out'
+out=$(MIN_GIB=900 run_verify 2>&1); rc=$?
+[ "$rc" != 0 ] && ok "код $rc — аварийное завершение" || bad "код 0 при сбое exec"
+printf '%s' "$out" | grep -q "УБОРКА: контейнеры проекта video-studio-disk-check остановлены" \
+  && ok "ловушка назвала свой проект" || bad "ловушка не сработала"
+sed -n '/compose .* up /,$p' "$FAKE_LOG" | grep -q -- '--project-name video-studio-disk-check down' \
+  && ok "down в своём проекте" || bad "down не в своём проекте"
+grep -q 'mkdir -p /out/.verify' "$FAKE_LOG" && bad "запись при сбое" || ok "записи не было"
+
+# --- X7. run-render.sh: своё имя проекта ------------------------------------
+head_ "X7. run-render.sh: MODE=disk идёт в проекте video-studio-disk"
+grep -q 'DISK_PROJECT="${DISK_PROJECT:-video-studio-disk}"' "$SRC/scripts/run-render.sh" \
+  && ok "имя проекта задано" || bad "имя проекта не задано"
+grep -q -- '--project-name "$DISK_PROJECT"' "$SRC/scripts/run-render.sh" \
+  && ok "compose получает --project-name" || bad "compose без --project-name"
+grep -q 'DISK_PROJECT не может совпадать с проектом проверки' "$SRC/scripts/run-render.sh" \
+  && ok "запрет совпадения с проектом проверки" || bad "нет запрета совпадения"
+grep -q 'stop studio-disk' "$SRC/scripts/run-render.sh" \
+  && ok "ловушка останавливает только studio-disk" || bad "ловушка не нацелена"
+grep -qE -- '--project-name[= ]+video-studio([[:space:]]|$)|-p[[:space:]]+video-studio([[:space:]]|$)' \
+  "$SRC/scripts/run-render.sh" && bad "рендер идёт в старом проекте" \
+  || ok "старое имя проекта не передаётся"
+
+# --- X8. run-render.sh: прогон на имитациях ---------------------------------
+head_ "X8. run-render.sh: прогон с имитациями — один проект, одна остановка"
+setup_env
+seed_verify_env 926 972029952 "$FAKE_MOUNT"
+seed_verify_docker
+cp "$SRC/scripts/run-render.sh" "$SB/scripts/"
+chmod +x "$SB/scripts/run-render.sh"
+cp "$SRC/compose.disk.yaml" "$SB/compose.disk.yaml"
+mkdir -p "$SB/out"
+out=$(ROOT="$SB" MODE=disk STORAGE="$FAKE_MOUNT" "$SB/scripts/run-render.sh" -version 2>&1); rc=$?
+[ "$rc" = 0 ] && ok "код 0" || { bad "код $rc"; printf '%s\n' "$out" | tail -5; }
+docker_calls | grep -q -- '--project-name video-studio-disk ' && ok "прогон в своём проекте" \
+  || bad "прогон без своего проекта"
+docker_calls | grep -q 'video-studio-disk-check' && bad "пересечение с проектом проверки" \
+  || ok "с проектом проверки не пересекается"
+stop_lines=$(docker_calls | grep ' compose .*stop ')
+[ -n "$stop_lines" ] && ok "остановка вызвана" || bad "остановки нет"
+printf '%s' "$stop_lines" | grep -q 'video-studio-disk ' && ok "остановка в своём проекте" \
+  || bad "остановка не в своём проекте"
+printf '%s' "$stop_lines" | grep -q 'stop studio-disk' && ok "остановлен только studio-disk" \
+  || bad "остановлен не только studio-disk"
+docker_calls | grep -Eq '^docker (restart|kill|rm|prune)' && bad "прямые команды над контейнерами" \
+  || ok "прямых команд нет"
+
+# --- X9. run-render.sh: запрет совпадающих имён -----------------------------
+head_ "X9. run-render.sh: имя проекта не может совпасть с чужими"
+setup_env
+seed_verify_env 926 972029952 "$FAKE_MOUNT"
+seed_verify_docker
+cp "$SRC/scripts/run-render.sh" "$SB/scripts/"
+chmod +x "$SB/scripts/run-render.sh"
+out=$(ROOT="$SB" MODE=disk DISK_PROJECT=video-studio STORAGE="$FAKE_MOUNT" \
+  "$SB/scripts/run-render.sh" -version 2>&1); rc=$?
+[ "$rc" = 1 ] && ok "код 1 для video-studio" || bad "код $rc"
+printf '%s' "$out" | grep -q "не может совпадать с проектом рабочего сервиса" \
+  && ok "причина названа" || bad "нет сообщения"
+out=$(ROOT="$SB" MODE=disk DISK_PROJECT=video-studio-disk-check STORAGE="$FAKE_MOUNT" \
+  "$SB/scripts/run-render.sh" -version 2>&1); rc=$?
+[ "$rc" = 1 ] && ok "код 1 для проекта проверки" || bad "код $rc"
+printf '%s' "$out" | grep -q "не может совпадать с проектом проверки" \
+  && ok "причина названа" || bad "нет сообщения"
+docker_calls | grep -q 'compose .* up ' && bad "контейнер поднимался при отказе" \
+  || ok "контейнер не поднимался"
+
+# --- X10. порог маркера для --fill -----------------------------------------
+head_ "X10. verify-storage.sh: порог маркера не блокирует тестовый --fill"
+grep -q 'REQUIRED_GIB="${TEST_MIN_GIB:-1}"' "$SRC/scripts/verify-storage.sh" \
+  && ok "для --fill порог отдельный" || bad "порог --fill равен рабочему"
+setup_env
+seed_verify_env 2 2097152 /nonexistent
+patch_verify
+seed_verify_docker
+: > "$FAKE_MOUNT/.fill-test-ok"
+out=$(MIN_GIB=1 run_verify --fill 2>&1); rc=$?
+[ "$rc" = 0 ] && ok "тестовый --fill на 2 GiB достижим" || { bad "код $rc"; printf '%s\n' "$out" | tail -6; }
+printf '%s' "$out" | grep -q "маркер хранилища: 2 GiB (порог 1 GiB)" \
+  && ok "порог назван в отчёте" || bad "порог не назван"
+# Рабочий порог при этом не тронут: без --fill маркер 2 GiB по-прежнему мало.
+setup_env
+seed_verify_env 2 2097152 "$FAKE_MOUNT"
+patch_verify
+seed_verify_docker
+seed_verify_prod
+out=$(MIN_GIB=38 run_verify 2>&1); rc=$?
+[ "$rc" = 1 ] && ok "без --fill порог 38 GiB действует" || bad "код $rc"
+printf '%s' "$out" | grep -q "меньше 38 GiB" && ok "рабочий порог назван" \
+  || bad "рабочий порог не назван"
 
 # =============================================================================
 printf '\n=== ИТОГ: ПРОЙДЕНО %s, НЕ ПРОЙДЕНО %s ===\n' "$PASS" "$FAIL"

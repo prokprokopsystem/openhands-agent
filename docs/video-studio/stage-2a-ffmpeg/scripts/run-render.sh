@@ -17,6 +17,7 @@ STORAGE="${STORAGE:-/srv/video-studio-data}"
 MIN_FREE_GIB="${MIN_FREE_GIB:-60}"
 MAX_TOTAL_GIB="${MAX_TOTAL_GIB:-15}"
 MIN_STORAGE_FREE_GIB="${MIN_STORAGE_FREE_GIB:-20}"
+DISK_PROJECT="${DISK_PROJECT:-video-studio-disk}"
 
 die() { printf 'ОТКАЗ: %s\n' "$1" >&2; exit 1; }
 
@@ -42,8 +43,16 @@ case "$MODE" in
 
     # Тот же каталог, что проверен выше: иначе STORAGE=… проверял бы одно
     # хранилище, а рендер писал в рабочее.
+    [ "$DISK_PROJECT" != "video-studio" ] || \
+      die "DISK_PROJECT не может совпадать с проектом рабочего сервиса studio"
+    [ "$DISK_PROJECT" != "video-studio-disk-check" ] || \
+      die "DISK_PROJECT не может совпадать с проектом проверки хранилища"
     export STORAGE_ROOT="$STORAGE"
-    DC=(docker compose -f "$ROOT/compose.disk.yaml")
+    # Своё имя проекта: в compose.disk.yaml стоит name: video-studio, то же, что
+    # у compose.yaml с рабочим сервисом studio. Без отдельного имени рендер
+    # попадал бы в тот же проект, и его остановка касалась бы чужого сервиса.
+    # Имя отличается и от проекта проверки video-studio-disk-check.
+    DC=(docker compose -f "$ROOT/compose.disk.yaml" --project-name "$DISK_PROJECT")
     "${DC[@]}" up -d studio-disk >/dev/null
     trap '"${DC[@]}" stop studio-disk >/dev/null 2>&1 || true' EXIT
 
