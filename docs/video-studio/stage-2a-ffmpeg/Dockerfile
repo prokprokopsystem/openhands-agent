@@ -32,9 +32,11 @@ RUN groupadd -g 10001 studio \
 COPY --from=fetch /ffmpeg-bin/ffmpeg /usr/local/bin/ffmpeg
 COPY --from=fetch /ffmpeg-bin/ffprobe /usr/local/bin/ffprobe
 COPY guard.sh /usr/local/bin/ffmpeg-guard
+COPY size-check.sh /usr/local/bin/size-check.sh
 COPY entrypoint.sh /usr/local/bin/studio-entrypoint
 
-RUN chmod 0755 /usr/local/bin/ffmpeg-guard /usr/local/bin/studio-entrypoint
+RUN chmod 0644 /usr/local/bin/size-check.sh \
+ && chmod 0755 /usr/local/bin/ffmpeg-guard /usr/local/bin/studio-entrypoint
 
 USER 10001:10001
 WORKDIR /work

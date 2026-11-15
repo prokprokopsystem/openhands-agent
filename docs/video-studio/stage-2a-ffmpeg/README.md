@@ -9,18 +9,40 @@
 | Файл | Назначение |
 |---|---|
 | `Dockerfile`, `guard.sh`, `entrypoint.sh` | образ `video-studio/ffmpeg:8.0.1`; `entrypoint.sh` без аргументов держит контейнер живым, с аргументами передаёт их ограде и ffmpeg |
+| `size-check.sh` | общая сверка размера с маркером: абсолютный допуск 1 GiB, один модуль для образа и хоста |
 | `compose.yaml` | режим `tmpfs`: изоляция, лимиты, `/out` в памяти 1 GiB |
 | `compose.disk.yaml` | режим `disk`: сервис `studio-disk` с хранилищем `/srv/video-studio-data`; источник — раздел SSD, том или loop-образ |
 | `scripts/run-render.sh` | единственный разрешённый способ запуска; режим задаётся `MODE=tmpfs\|disk` |
 | `scripts/verify.sh` | 25 проверок установки в режиме `tmpfs` |
-| `scripts/verify-storage.sh` | проверки хранилища, включая тест переполнения (`--fill`); источник определяется по `findmnt` |
+| `scripts/verify-storage.sh` | проверки хранилища; источник определяется по `findmnt`; `--fill` только для маленького тестового хранилища |
 | `scripts/check-docker-space.sh` | бюджет Docker перед установкой HyperFrames |
 | `host/setup-ssd-storage.sh` | подготовка внешнего SSD: GPT + `ext4`, монтирование по UUID; dry-run по умолчанию, проверка модели и серийного номера |
+| `tests/run-tests.sh` | стенд на подставных устройстве и командах: проверяет, что примерка ничего не исполняет, а отказы срабатывают |
 | `host/setup-storage.sh` | резервный вариант на loop-образе; без `--apply` только примерка |
 | `host/diagnose-storage.sh` | диагностика отказа, только чтение, ничего не восстанавливает |
-| `host/resize-storage.sh` | расширение loop-хранилища; для раздела и LVM объясняет, почему это невозможно |
-| `host/remove-storage.sh` | демонтаж с резервной копией `fstab`; данные удаляются только с `--delete-image` и только для файла-образа |
+| `host/resize-storage.sh` | расширение loop-хранилища; для раздела и LVM объясняет, почему это невозможно; примерка ничего не исполняет |
+| `host/remove-storage.sh` | демонтаж с резервной копией `fstab`; данные удаляются только с `--delete-image` и только для обычного файла-образа |
 | `host/check-storage.sh` | состояние хранилища, только чтение |
+
+## Правила для привилегированных скриптов
+
+1. Примерка ничего не исполняет. Каждый скрипт с `--apply` печатает план и
+   запускает шаги только при `--apply`; одна и та же строка не выполняется
+   дважды.
+2. Пути заданы константами. `MOUNT`, `IMAGE`, `DEV`, `FSTAB` не читаются из
+   окружения: у скрипта с `mkfs` и `umount` подмена пути означала бы работу не
+   с тем устройством.
+3. Откат срабатывает на любом выходе. Ловушка стоит на `EXIT`, а не на `ERR`:
+   ошибка в условии вида `cmd || die` в `ERR` не попадает.
+4. Размер сверяется одним модулем `size-check.sh` с абсолютным допуском 1 GiB —
+   и в образе, и на хосте.
+5. `--fill` запрещён на рабочем SSD: он пишет до `ENOSPC`. Проверка предела
+   выполняется на отдельном маленьком хранилище и требует файла
+   `.fill-test-ok`.
+
+Проверить эти правила без реального диска: `./tests/run-tests.sh`. Стенд
+подменяет устройство, `mkfs`, `mount` и `df`, поэтому привилегированных
+операций не требует.
 
 ## Два режима
 
@@ -89,7 +111,7 @@ MODE=disk ./scripts/run-render.sh -i /work/in.mp4 -c:v libx264 -preset veryfast 
 ```bash
 ./scripts/verify.sh                      # режим tmpfs
 ./scripts/verify-storage.sh              # хранилище, без заполнения
-./scripts/verify-storage.sh --fill       # плюс проверка отказа при переполнении
+./scripts/verify-storage.sh --fill       # только на маленьком тестовом хранилище
 ./scripts/check-docker-space.sh          # бюджет перед HyperFrames
 ./host/check-storage.sh                  # состояние хранилища
 ```
@@ -105,7 +127,9 @@ cd /home/igor/video-studio
 sudo ./host/setup-ssd-storage.sh --apply --confirm-serial 24257G400264   # 2. разметить и смонтировать
 ./host/diagnose-storage.sh                      # 3. диагностика, только чтение
 ./scripts/verify-storage.sh                     # 4. базовые проверки
-./scripts/verify-storage.sh --fill              # 5. доказать предел
+# 5. предел переполнения проверяется отдельно, на тестовом хранилище:
+#    MOUNT=/mnt/storage-test ./scripts/verify-storage.sh --fill
+#    На рабочем SSD --fill запрещён и отклоняется до запуска контейнера.
 docker compose -f compose.disk.yaml up -d studio-disk   # 6. включить сервис
 MODE=disk ./scripts/run-render.sh ... /out/probe.mp4     # 7. пробный запуск
 ```
@@ -114,6 +138,7 @@ MODE=disk ./scripts/run-render.sh ... /out/probe.mp4     # 7. пробный з�
 
 Откат: `docker compose -f compose.disk.yaml down`, затем
 `sudo ./host/remove-storage.sh --apply`. Данные на разделе SSD скрипт не стирает.
+Примерка того же скрипта без `--apply` печатает план и ничего не исполняет.
 Режим `tmpfs` при этом остаётся рабочим всё время — `compose.yaml` не меняется.
 
 ## Остановка и полное удаление

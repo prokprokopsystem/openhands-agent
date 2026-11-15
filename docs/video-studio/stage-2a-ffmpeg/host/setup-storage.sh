@@ -1,100 +1,217 @@
 #!/usr/bin/env bash
-# Создание хранилища видеостудии на loop-образе. РЕЗЕРВНЫЙ ВАРИАНТ.
+# Хранилище видеостудии на loop-образе. РЕЗЕРВНЫЙ ВАРИАНТ.
 #
 # Для выделенного SSD используйте host/setup-ssd-storage.sh. Этот скрипт
-# оставлен для случая, когда отдельного диска нет.
+# остаётся на случай, когда отдельного диска нет.
 #
-# По умолчанию НИЧЕГО НЕ МЕНЯЕТ: печатает команды и выходит. Изменения
-# выполняются только с явным --apply и правами root.
+#   ./host/setup-storage.sh              # план, ничего не меняет
+#   sudo ./host/setup-storage.sh --apply # создать и смонтировать
 #
-#   ./host/setup-storage.sh              # показать план
-#   sudo ./host/setup-storage.sh --apply # выполнить
+# Прогон один. План и исполнение идут через одну функцию stage(): в режиме
+# плана она только печатает, в --apply печатает и выполняет. Второго прохода
+# нет, поэтому повторного fallocate и mkfs быть не может.
 #
-# Почему loop-образ, а не новый LV: раздел / уже занимает весь том
-# ubuntu-vg, свободных экстентов нет. Уменьшение корневого LV требует
-# размонтирования /.
-set -euo pipefail
+# Почему loop-образ, а не новый LV: раздел / занимает весь том ubuntu-vg,
+# свободных экстентов нет. Уменьшение корневого LV требует размонтирования /.
+set -euEo pipefail
 
-IMAGE="${IMAGE:-/srv/video-studio-data.img}"
-MOUNT="${MOUNT:-/srv/video-studio-data}"
-SIZE_GIB="${SIZE_GIB:-40}"
-LABEL="${LABEL:-video-data}"
-CONTAINER_UID="${CONTAINER_UID:-10001}"
-CONTAINER_GID="${CONTAINER_GID:-10001}"
-OPERATOR="${OPERATOR:-igor}"
-MIN_HOST_FREE_GIB="${MIN_HOST_FREE_GIB:-60}"
+readonly IMAGE="/srv/video-studio-data.img"
+readonly MOUNT="/srv/video-studio-data"
+readonly LABEL="video-data"
+readonly OPERATOR="igor"
+readonly CONTAINER_UID=10001
+readonly CONTAINER_GID=10001
+readonly FSTAB="/etc/fstab"
+readonly FSTAB_OPTS="loop,rw,nosuid,nodev,noatime,nofail,x-systemd.device-timeout=30s"
+readonly DEFAULT_SIZE_GIB=40
+readonly MIN_HOST_FREE_GIB=60
 
 APPLY=0
+SIZE_GIB="$DEFAULT_SIZE_GIB"
+BACKUP_FSTAB=""
+FSTAB_MODIFIED=0
+MOUNTED_BY_US=0
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --apply) APPLY=1 ;;
-    --size-gib) SIZE_GIB="$2"; shift ;;
-    --image) IMAGE="$2"; shift ;;
-    --mount) MOUNT="$2"; shift ;;
-    -h|--help)
-      sed -n '2,20p' "$0"; exit 0 ;;
-    *) printf 'Неизвестный аргумент: %s\n' "$1" >&2; exit 2 ;;
+    --size-gib)
+      [ $# -ge 2 ] || { printf 'ОТКАЗ: --size-gib требует значение\n' >&2; exit 2; }
+      SIZE_GIB="$2"; shift ;;
+    -h|--help) sed -n '2,15p' "$0"; exit 0 ;;
+    *) printf 'ОТКАЗ: неизвестный аргумент %s\n' "$1" >&2; exit 2 ;;
   esac
   shift
 done
 
+case "$SIZE_GIB" in
+  ''|*[!0-9]*) printf 'ОТКАЗ: --size-gib должно быть целым числом\n' >&2; exit 2 ;;
+esac
+
 say() { printf '%s\n' "$*"; }
 die() { printf 'ОТКАЗ: %s\n' "$*" >&2; exit 1; }
-
-# run печатает команду всегда, а выполняет только с --apply.
-run() {
-  if [ "$APPLY" = "1" ]; then
-    printf '+ %s\n' "$*"
-    "$@"
-  else
-    printf '  %s\n' "$*"
-  fi
-}
+step() { printf '\n== %s ==\n' "$*"; }
 
 if [ "$APPLY" = "1" ]; then
   [ "$(id -u)" = "0" ] || die "для --apply нужен root: sudo $0 --apply"
 fi
 
-say "=== Проверки перед созданием ==="
-[ -b "$(findmnt -no SOURCE /)" ] || die "не удалось определить корневое устройство"
+stage() {
+  local desc="$1" fn="$2"
+  if [ "$APPLY" = "1" ]; then
+    printf '+ %s\n' "$desc"
+    "$fn"
+  else
+    printf '  %s\n' "$desc"
+  fi
+}
 
-# Скрипт работает только с файлом-образом. Блочное устройство здесь означало
-# бы попытку mkfs на реальном диске — это не его задача.
-if [ -b "$IMAGE" ]; then
-  die "$IMAGE — блочное устройство. Для диска используйте host/setup-ssd-storage.sh"
-fi
+rollback() {
+  rc=$?
+  # Срабатывает на любом выходе: и на необработанной ошибке (set -e), и на
+  # явном die. Ошибка в условии вида «cmd || die» в ERR не попадает, поэтому
+  # EXIT надёжнее, чем ERR: откат нужен в обоих случаях.
+  [ "$rc" = "0" ] && exit 0
+  [ "$APPLY" = "1" ] || exit "$rc"
+  [ "${ROLLING_BACK:-0}" = "1" ] && exit "$rc"
+  ROLLING_BACK=1
+  set +e
+  printf '\n=== Откат после ошибки (код %s) ===\n' "$rc" >&2
 
-if findmnt -no TARGET "$MOUNT" >/dev/null 2>&1; then
-  die "$MOUNT уже смонтирован — похоже, хранилище создано"
-fi
+  if [ "$FSTAB_MODIFIED" = "1" ] && [ -n "$BACKUP_FSTAB" ] && [ -f "$BACKUP_FSTAB" ]; then
+    cp -a "$BACKUP_FSTAB" "$FSTAB" && systemctl daemon-reload 2>/dev/null \
+      && printf 'fstab восстановлен из %s\n' "$BACKUP_FSTAB" >&2
+  fi
+
+  # Живой образ не удаляется: пока файловая система смонтирована, rm образа
+  # оставил бы систему с исчезнувшим под ней устройством. Сначала umount.
+  if [ "$MOUNTED_BY_US" = "1" ] && findmnt -no TARGET "$MOUNT" >/dev/null 2>&1; then
+    umount "$MOUNT" 2>/dev/null && printf 'размонтировано %s\n' "$MOUNT" >&2 \
+      || { printf 'ВНИМАНИЕ: %s остался смонтирован, образ не удаляю\n' "$MOUNT" >&2; \
+           printf 'Ручной разбор: fuser -vm %s\n' "$MOUNT" >&2; exit "$rc"; }
+  fi
+
+  if [ -f "$IMAGE" ] && ! findmnt -no TARGET "$MOUNT" >/dev/null 2>&1; then
+    printf 'Удаляю созданный образ %s\n' "$IMAGE" >&2
+    rm -f "$IMAGE"
+  fi
+  exit "$rc"
+}
+trap rollback EXIT
+
+step "1. Проверки перед созданием"
+
+findmnt -no TARGET "$MOUNT" >/dev/null 2>&1 && die "$MOUNT уже смонтирован — хранилище создано"
+# Скрипт работает только с файлом-образом: mkfs на реальном диске — не его задача.
+[ -b "$IMAGE" ] && die "$IMAGE — блочное устройство. Для диска: host/setup-ssd-storage.sh"
 [ -e "$IMAGE" ] && die "$IMAGE уже существует — не перезаписываю"
 
+if [ -d "$MOUNT" ] && [ -n "$(ls -A "$MOUNT" 2>/dev/null || true)" ]; then
+  die "каталог $MOUNT не пуст, а монтирования нет: там данные на системном разделе"
+fi
+
 host_free=$(df -BG --output=avail / | awk 'NR==2{gsub(/G/,"",$1); print $1}')
-need=$(( SIZE_GIB + MIN_HOST_FREE_GIB ))
-[ "$host_free" -ge "$need" ] || \
+[ "$host_free" -ge $(( SIZE_GIB + MIN_HOST_FREE_GIB )) ] || \
   die "на / свободно $host_free GiB, для $SIZE_GIB GiB нужно оставить ещё $MIN_HOST_FREE_GIB GiB"
 say "ПРОЙДЕНО: на / свободно $host_free GiB, размер хранилища $SIZE_GIB GiB"
 
-say ""
-say "=== План ==="
-run install -d -m 0755 "$(dirname "$IMAGE")"
-run fallocate -l "${SIZE_GIB}G" "$IMAGE"
-run chmod 0600 "$IMAGE"
-run mkfs.ext4 -q -m 0 -L "$LABEL" -E lazy_itable_init=0,lazy_journal_init=0 "$IMAGE"
-run install -d -m 0755 "$MOUNT"
+do_image() {
+  install -d -m 0755 "$(dirname "$IMAGE")"
+  # fallocate один раз. Файл проверяется перед форматированием: при нехватке
+  # места fallocate создаёт файл меньшего размера, и mkfs на нём дал бы ФС
+  # другого объёма, чем обещает маркер.
+  fallocate -l "${SIZE_GIB}G" "$IMAGE" || die "fallocate не удался: мало места или ФС без поддержки"
+  actual=$(( $(stat -c %s "$IMAGE") / 1073741824 ))
+  [ "$actual" -eq "$SIZE_GIB" ] || die "образ $actual GiB вместо $SIZE_GIB GiB"
+  chmod 0600 "$IMAGE"
+}
 
-say "  cp /etc/fstab /etc/fstab.bak-\$(date +%Y%m%d-%H%M%S)"
-say "  echo '<строка ниже>' >> /etc/fstab"
-say "    $IMAGE $MOUNT ext4 loop,rw,nosuid,nodev,noatime,nofail,x-systemd.device-timeout=30s 0 2"
+do_mkfs() {
+  mkfs.ext4 -q -m 0 -L "$LABEL" -E lazy_itable_init=0,lazy_journal_init=0 "$IMAGE"
+}
 
-run systemctl daemon-reload
-run mount "$MOUNT"
-run install -d -m 0755 "$MOUNT/in" "$MOUNT/tmp" "$MOUNT/out" "$MOUNT/archive"
-run chown "$OPERATOR:$OPERATOR" "$MOUNT/in"
-run chown "$CONTAINER_UID:$CONTAINER_GID" "$MOUNT/tmp" "$MOUNT/out" "$MOUNT/archive"
-run sh -c "printf '%s\n' $SIZE_GIB > $MOUNT/.storage-size-gib"
-run chmod 0444 "$MOUNT/.storage-size-gib"
-run findmnt -no SOURCE,FSTYPE,SIZE "$MOUNT"
+do_fstab() {
+  [ -f "$FSTAB" ] || die "$FSTAB не найден"
+  if grep -qE "^$IMAGE[[:space:]]+$MOUNT[[:space:]]" "$FSTAB"; then
+    say "  строка для $MOUNT уже есть в fstab, не дублирую"
+    return 0
+  fi
+  grep -qE "[[:space:]]$MOUNT[[:space:]]" "$FSTAB" && \
+    die "в fstab уже есть другая запись для $MOUNT — разберитесь вручную"
+
+  BACKUP_FSTAB="${FSTAB}.bak-$(date +%Y%m%d-%H%M%S)"
+  cp -a "$FSTAB" "$BACKUP_FSTAB" || die "не удалось создать резервную копию fstab"
+  say "  резервная копия: $BACKUP_FSTAB"
+
+  tmp=$(mktemp) || die "mktemp не удался"
+  cat "$FSTAB" > "$tmp" || die "не удалось прочитать fstab"
+  printf '%s %s ext4 %s 0 2\n' "$IMAGE" "$MOUNT" "$FSTAB_OPTS" >> "$tmp" || \
+    die "не удалось дописать строку в копию fstab"
+
+  if ! findmnt --verify --tab-file="$tmp" >/dev/null 2>&1; then
+    findmnt --verify --verbose --tab-file="$tmp" 2>&1 | sed 's/^/    /' || true
+    die "fstab не изменён: новая редакция не прошла проверку"
+  fi
+  before=$(grep -cvE '^[[:space:]]*(#|$)' "$FSTAB" || true)
+  after=$(grep -cvE '^[[:space:]]*(#|$)' "$tmp" || true)
+  before=${before:-0}
+  after=${after:-0}
+  [ "$after" -eq $(( before + 1 )) ] || \
+    die "в новой редакции $after записей вместо $(( before + 1 )) — fstab не изменён"
+
+  if ! cat "$tmp" > "$FSTAB"; then
+    cp -a "$BACKUP_FSTAB" "$FSTAB" || true
+    die "не удалось записать fstab, восстановлена резервная копия"
+  fi
+  FSTAB_MODIFIED=1
+
+  if ! grep -qE "^$IMAGE[[:space:]]+$MOUNT[[:space:]]" "$FSTAB"; then
+    cp -a "$BACKUP_FSTAB" "$FSTAB" || true
+    FSTAB_MODIFIED=0
+    die "запись в fstab не подтвердилась, восстановлена резервная копия"
+  fi
+  say "  ИЗМЕНЕНО: $FSTAB"
+  systemctl daemon-reload
+  rm -f "$tmp"
+}
+
+do_mount() {
+  mount "$MOUNT" || die "mount $MOUNT не удался"
+  MOUNTED_BY_US=1
+  src=$(findmnt -no SOURCE "$MOUNT")
+  say "  смонтирован $src"
+}
+
+do_dirs() {
+  install -d -m 0755 "$MOUNT/in" "$MOUNT/tmp" "$MOUNT/out" "$MOUNT/archive"
+  chown "$OPERATOR:$OPERATOR" "$MOUNT/in"
+  chown "$CONTAINER_UID:$CONTAINER_GID" "$MOUNT/tmp" "$MOUNT/out" "$MOUNT/archive"
+}
+
+do_marker() {
+  printf '%s\n' "$SIZE_GIB" > "$MOUNT/.storage-size-gib"
+  chmod 0444 "$MOUNT/.storage-size-gib"
+}
+
+do_verify() {
+  total=$(df -Pk "$MOUNT" | awk 'NR==2{print $2}')
+  declared=$(tr -dc '0-9' < "$MOUNT/.storage-size-gib")
+  # shellcheck disable=SC1091
+  . "$(dirname "$0")/../size-check.sh"
+  size_matches "$total" "$declared" || die "размер $total KiB не совпал с маркером $declared GiB"
+  findmnt -no SOURCE,FSTYPE,SIZE,OPTIONS "$MOUNT" | sed 's/^/  /'
+  df -h "$MOUNT" | tail -1 | sed 's/^/  /'
+}
+
+step "2. План выполнения"
+
+stage "fallocate -l ${SIZE_GIB}G $IMAGE (с проверкой фактического размера)" do_image
+stage "mkfs.ext4 -q -m 0 -L $LABEL $IMAGE" do_mkfs
+stage "добавить строку в $FSTAB (резервная копия, findmnt --verify, проверка после записи)" do_fstab
+stage "mount $MOUNT" do_mount
+stage "создать in/tmp/out/archive, выставить владельцев" do_dirs
+stage "записать маркер $SIZE_GIB GiB" do_marker
+stage "проверить результат" do_verify
 
 if [ "$APPLY" != "1" ]; then
   say ""
@@ -104,38 +221,4 @@ if [ "$APPLY" != "1" ]; then
 fi
 
 say ""
-say "=== Применение ==="
-stamp=$(date +%Y%m%d-%H%M%S)
-install -d -m 0755 "$(dirname "$IMAGE")"
-fallocate -l "${SIZE_GIB}G" "$IMAGE"
-chmod 0600 "$IMAGE"
-mkfs.ext4 -q -m 0 -L "$LABEL" -E lazy_itable_init=0,lazy_journal_init=0 "$IMAGE"
-install -d -m 0755 "$MOUNT"
-
-cp -a /etc/fstab "/etc/fstab.bak-$stamp"
-line="$IMAGE $MOUNT ext4 loop,rw,nosuid,nodev,noatime,nofail,x-systemd.device-timeout=30s 0 2"
-grep -qxF "$line" /etc/fstab || printf '%s\n' "$line" >> /etc/fstab
-say "ИЗМЕНЕНО: /etc/fstab, резервная копия /etc/fstab.bak-$stamp"
-
-systemctl daemon-reload
-if ! mount "$MOUNT"; then
-  say "ОШИБКА: монтирование не удалось, откатываю изменения"
-  sed -i "\#^$IMAGE $MOUNT #d" /etc/fstab
-  systemctl daemon-reload
-  rm -f "$IMAGE"
-  die "хранилище не создано, изменения отменены"
-fi
-
-install -d -m 0755 "$MOUNT/in" "$MOUNT/tmp" "$MOUNT/out" "$MOUNT/archive"
-chown "$OPERATOR:$OPERATOR" "$MOUNT/in"
-chown "$CONTAINER_UID:$CONTAINER_GID" "$MOUNT/tmp" "$MOUNT/out" "$MOUNT/archive"
-# Маркер размера: ограда в контейнере сверяет с ним df и так замечает, что
-# хранилище не смонтировано. Обновляется скриптом расширения.
-printf '%s\n' "$SIZE_GIB" > "$MOUNT/.storage-size-gib"
-chmod 0444 "$MOUNT/.storage-size-gib"
-
-say ""
-say "=== Результат ==="
-findmnt -no SOURCE,FSTYPE,SIZE,OPTIONS "$MOUNT"
-df -h "$MOUNT" | tail -1
-say "ПРОЙДЕНО: хранилище создано. Дальше: ./scripts/verify-storage.sh"
+say "ПРОЙДЕНО: хранилище создано. Дальше: ./host/check-storage.sh"

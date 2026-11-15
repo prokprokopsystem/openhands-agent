@@ -1,23 +1,26 @@
 #!/usr/bin/env bash
 # Проверка дискового хранилища видеостудии.
 #
-# Запускается на хосте от igor, root не нужен: все действия идут через
-# контейнер и уже смонтированную файловую систему.
+#   ./scripts/verify-storage.sh          # без заполнения, безопасно
+#   ./scripts/verify-storage.sh --fill   # тест переполнения, только на тестовом хранилище
 #
-#   ./scripts/verify-storage.sh          # проверки без заполнения
-#   ./scripts/verify-storage.sh --fill   # плюс проверка отказа при переполнении
+# Источник определяется по факту (findmnt), поэтому подходит для раздела, тома
+# и loop-образа. Сверка размера с маркером использует тот же модуль
+# size-check.sh, что и ограда в контейнере: допуск 1 GiB абсолютный.
 #
-# Источник хранилища определяется по факту (findmnt), поэтому скрипт одинаково
-# работает и с loop-образом, и с разделом SSD, и с логическим томом.
-#
-# Проверка --fill считает число файлов из свободного места, а не из фиксированных
-# 80 GiB: на хранилище 927 GiB фиксированное число не достигало предела и давало
-# ложное «предел не действует».
-set -euo pipefail
+# Режим --fill заполняет файловую систему до ENOSPC. На рабочем SSD это
+# недопустимо: 927 GiB записей изнашивают диск и на время теста занимают всё
+# место. Поэтому --fill работает только на маленьком тестовом хранилище и
+# требует явного подтверждения человеком.
+set -euEo pipefail
 
 ROOT="${ROOT:-/home/igor/video-studio}"
-MOUNT="${MOUNT:-/srv/video-studio-data}"
-IMAGE="${IMAGE:-/srv/video-studio-data.img}"
+PRODUCTION_MOUNT="/srv/video-studio-data"
+PRODUCTION_SERIAL="24257G400264"
+FILL_MAX_GIB=16
+FILL_OPT_IN=".fill-test-ok"
+
+MOUNT="${MOUNT:-$PRODUCTION_MOUNT}"
 MIN_GIB="${MIN_GIB:-38}"
 FILL=0
 [ "${1:-}" = "--fill" ] && FILL=1
@@ -28,6 +31,10 @@ fail=0
 
 ok() { printf '  ПРОЙДЕНО: %s\n' "$1"; pass=$((pass+1)); }
 bad() { printf '  НЕ ПРОЙДЕНО: %s\n' "$1"; fail=$((fail+1)); }
+die() { printf 'ОТКАЗ: %s\n' "$1" >&2; exit 2; }
+
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "$0")/.." && pwd)/size-check.sh"
 
 cd "$ROOT"
 
@@ -36,54 +43,57 @@ source=""
 if findmnt -no TARGET "$MOUNT" >/dev/null 2>&1; then
   fstype=$(findmnt -no FSTYPE "$MOUNT")
   source=$(findmnt -no SOURCE "$MOUNT")
+  total_ki=$(df -Pk "$MOUNT" | awk 'NR==2{print $2}')
   size=$(df -BG --output=size "$MOUNT" | awk 'NR==2{gsub(/G/,"",$1); print $1}')
   [ "$fstype" = "ext4" ] && ok "тип файловой системы ext4" || bad "тип '$fstype' вместо ext4"
 else
   bad "$MOUNT не смонтирован"
 fi
 
+source_serial=""
 case "$source" in
   /dev/mapper/*|/dev/dm-*)
     ok "источник $source — логический том" ;;
   /dev/loop*)
-    [ -f "$IMAGE" ] && ok "источник $source, образ $IMAGE на месте" \
-      || bad "источник $source, но файла образа $IMAGE нет" ;;
-  /dev/*)
+    ok "источник $source — loop-образ" ;;
+  /dev/?*)
     if [ -b "$source" ]; then
       disk=$(lsblk -no PKNAME "$source" | head -1)
-      ok "источник $source — раздел на /dev/${disk} (${source})"
+      source_serial=$(lsblk -dno SERIAL "/dev/$disk" 2>/dev/null || true)
+      ok "источник $source — раздел на /dev/$disk"
       [ -n "$disk" ] && [ "$disk" != "sda" ] \
         && ok "раздел не на системном диске" \
         || bad "раздел на системном диске /dev/$disk"
+      [ "$source_serial" != "$PRODUCTION_SERIAL" ] \
+        && ok "это не рабочий SSD видеостудии" \
+        || bad "источник указывает на рабочий SSD видеостудии"
     else
       bad "источник $source не блочное устройство"
     fi ;;
   "") ;;
-  *)
-    bad "неизвестный источник $source" ;;
+  *) bad "неизвестный источник $source" ;;
 esac
 
-# Строка fstab ищется по точке монтирования: у loop там путь к образу,
-# у раздела — UUID, поэтому поиск по IMAGE давал ложное «нет записи».
 if grep -qE "[[:space:]]$MOUNT[[:space:]]" /etc/fstab 2>/dev/null; then
-  ok "запись в /etc/fstab есть (монтирование после перезагрузки)"
+  ok "запись в /etc/fstab есть"
   grep -q "nofail" /etc/fstab && ok "в fstab есть nofail" || bad "в fstab нет nofail"
 else
-  bad "в /etc/fstab нет записи для $MOUNT — после перезагрузки хранилище не поднимется"
+  bad "в /etc/fstab нет записи для $MOUNT"
 fi
 
-declared=$(tr -dc '0-9' 2>/dev/null < "$MOUNT/.storage-size-gib" || true)
+declared=$(tr -dc '0-9' < "$MOUNT/.storage-size-gib" 2>/dev/null || true)
 if [ -n "$declared" ] && [ "$declared" -ge "$MIN_GIB" ]; then
   ok "маркер хранилища: $declared GiB"
 else
   bad "маркер $MOUNT/.storage-size-gib отсутствует или меньше $MIN_GIB GiB"
 fi
 
-if [ -n "$declared" ] && [ -n "${size:-}" ]; then
-  if [ "$size" -ge $(( declared * 95 / 100 )) ] && [ "$size" -le $(( declared * 105 / 100 )) ]; then
-    ok "размер ${size} GiB совпадает с маркером $declared GiB"
+# Та же функция, что в ограде: допуск 1 GiB абсолютный.
+if [ -n "$declared" ] && [ -n "${total_ki:-}" ]; then
+  if size_matches "$total_ki" "$declared"; then
+    ok "размер $(( total_ki / 1048576 )) GiB совпадает с маркером $declared GiB (допуск 1 GiB)"
   else
-    bad "размер ${size} GiB не совпадает с маркером $declared GiB"
+    bad "размер $(( total_ki / 1048576 )) GiB не совпадает с маркером $declared GiB (допуск 1 GiB)"
   fi
 fi
 
@@ -94,17 +104,44 @@ if [ "$fail" -gt 0 ]; then
   exit 1
 fi
 
+# --- Проверки режима --fill: до запуска контейнера ---------------------------
+
+if [ "$FILL" = "1" ]; then
+  echo
+  echo "== 0. Допуск режима --fill =="
+  [ "$MOUNT" != "$PRODUCTION_MOUNT" ] || \
+    die "--fill запрещён на рабочем хранилище $PRODUCTION_MOUNT.
+Тест переполнения пишет до ENOSPC: на 927 GiB это износ диска и полное
+занятие места. Для теста создайте маленькое отдельное хранилище, например
+loop-образ 2 GiB, и укажите его: MOUNT=/mnt/storage-test ./scripts/verify-storage.sh --fill"
+
+  [ "$source_serial" != "$PRODUCTION_SERIAL" ] || \
+    die "--fill запрещён: источник указывает на рабочий SSD ($PRODUCTION_SERIAL)"
+
+  if [ "$size" -gt "$FILL_MAX_GIB" ]; then
+    die "--fill запрещён: хранилище $size GiB больше предела $FILL_MAX_GIB GiB.
+Тест пишет до отказа ФС, поэтому допустим только на маленьком хранилище."
+  fi
+  ok "размер $size GiB не больше $FILL_MAX_GIB GiB"
+
+  # Явное согласие человека: файл создаётся вручную в тестовом хранилище.
+  [ -f "$MOUNT/$FILL_OPT_IN" ] || \
+    die "--fill требует явного подтверждения: создайте файл $MOUNT/$FILL_OPT_IN
+в тестовом хранилище, чтобы было видно, что это не рабочее место."
+  ok "подтверждение $FILL_OPT_IN на месте"
+fi
+
 echo
 echo "== 2. Хранилище внутри контейнера =="
 "${DC[@]}" up -d studio-disk >/dev/null
 cid=$("${DC[@]}" ps -q studio-disk)
 [ -n "$cid" ] || { bad "контейнер studio-disk не запустился"; exit 1; }
 
-in_out=$(docker exec "$cid" df -BG --output=size /out | awk 'NR==2{gsub(/G/,"",$1); print $1}')
-if [ "$in_out" -ge $(( declared * 95 / 100 )) ] && [ "$in_out" -le $(( declared * 105 / 100 )) ]; then
-  ok "/out внутри контейнера ${in_out} GiB"
+in_total=$(docker exec "$cid" df -Pk /out | awk 'NR==2{print $2}')
+if size_matches "$in_total" "$declared"; then
+  ok "/out внутри контейнера $(( in_total / 1048576 )) GiB"
 else
-  bad "/out внутри контейнера ${in_out} GiB, ожидалось около $declared GiB"
+  bad "/out внутри контейнера $(( in_total / 1048576 )) GiB, ожидалось около $declared GiB"
 fi
 
 if docker exec "$cid" /usr/local/bin/ffmpeg-guard -version 2>&1 | grep -q 'квота .* действует'; then
@@ -137,12 +174,10 @@ docker exec "$cid" sh -c 'mkdir -p /out/.verify && echo probe > /out/.verify/pro
   && ok "запись в /out работает" || bad "запись в /out не работает"
 
 if [ "$FILL" = "1" ]; then
-  free_mib_before=$(docker exec "$cid" df -Pm /out | awk 'NR==2{print $4}')
-  # Число файлов из свободного места: 4 GiB на файл плюс запас на метаданные.
-  # Верхняя граница 400 защищает от бесконечного цикла при ошибке в расчёте.
-  want_files=$(( free_mib_before / 4096 + 2 ))
-  [ "$want_files" -gt 400 ] && want_files=400
-  echo "  свободно ${free_mib_before} MiB, буду писать до $want_files файлов по 4 GiB"
+  # Файлы по 1 GiB: на тестовом хранилище до 16 GiB это десятки файлов,
+  # а не сотни, и мусор убирается быстрее.
+  want_files=$(( size + 2 ))
+  echo "  тестовое хранилище $size GiB, буду писать до $want_files файлов по 1 GiB"
 
   result=$(docker exec -e WANT="$want_files" "$cid" sh -c '
     set -u
@@ -150,7 +185,7 @@ if [ "$FILL" = "1" ]; then
     i=0
     while [ "$i" -lt "$WANT" ]; do
       i=$((i+1))
-      if ! fallocate -l 4G "/out/.verify/fill/f$i" 2>/dev/null; then
+      if ! fallocate -l 1G "/out/.verify/fill/f$i" 2>/dev/null; then
         echo "ОТКАЗ НА ФАЙЛЕ $i"
         break
       fi
@@ -167,7 +202,7 @@ if [ "$FILL" = "1" ]; then
   else
     bad "заполнение не упёрлось в предел — предел не действует"
   fi
-  if [ -n "$free_mib" ] && [ "$free_mib" -lt 8192 ]; then
+  if [ -n "$free_mib" ] && [ "$free_mib" -lt 2048 ]; then
     ok "свободного места осталось ${free_mib} MiB — предел реальный"
   else
     bad "после заполнения свободно ${free_mib:-?} MiB — похоже, предела нет"
@@ -175,7 +210,7 @@ if [ "$FILL" = "1" ]; then
 
   docker exec "$cid" rm -rf /out/.verify/fill
   after_mib=$(docker exec "$cid" df -Pm /out | awk 'NR==2{print $3}')
-  [ "$after_mib" -lt 1024 ] && ok "после удаления занято ${after_mib} MiB" \
+  [ "$after_mib" -lt 256 ] && ok "после удаления занято ${after_mib} MiB" \
     || bad "после удаления занято ${after_mib} MiB — мусор остался"
 fi
 
@@ -186,9 +221,9 @@ echo "== 4. Перезапуск контейнера =="
 "${DC[@]}" restart studio-disk >/dev/null 2>&1 || true
 sleep 2
 cid=$("${DC[@]}" ps -q studio-disk)
-in_out2=$(docker exec "$cid" df -BG --output=size /out | awk 'NR==2{gsub(/G/,"",$1); print $1}')
-[ "$in_out" = "$in_out2" ] && ok "после перезапуска размер тот же: ${in_out2} GiB" \
-  || bad "после перезапуска размер изменился: ${in_out} -> ${in_out2} GiB"
+in_total2=$(docker exec "$cid" df -Pk /out | awk 'NR==2{print $2}')
+[ "$in_total" = "$in_total2" ] && ok "после перезапуска размер тот же: $(( in_total2 / 1048576 )) GiB" \
+  || bad "после перезапуска размер изменился: $(( in_total / 1048576 )) -> $(( in_total2 / 1048576 )) GiB"
 docker exec "$cid" /usr/local/bin/ffmpeg-guard -version >/dev/null 2>&1 \
   && ok "после перезапуска ограда работает" || bad "после перезапуска ограда не работает"
 

@@ -18,6 +18,13 @@ STORAGE_MARKER="${STORAGE_MARKER:-/storage/.storage-size-gib}"
 TMPFS_MAX_KI="${TMPFS_MAX_KI:-1048576}"   # 1 GiB
 DISK_MIN_GIB="${DISK_MIN_GIB:-38}"
 
+# Сверка размера с маркером живёт в отдельном модуле, общем с
+# scripts/verify-storage.sh: разойдись они — хост и контейнер начнут
+# принимать разные размеры.
+SIZE_CHECK_LIB="${SIZE_CHECK_LIB:-/usr/local/bin/size-check.sh}"
+[ -r "$SIZE_CHECK_LIB" ] || { printf 'ОГРАДА: нет модуля %s\n' "$SIZE_CHECK_LIB" >&2; exit 78; }
+. "$SIZE_CHECK_LIB"
+
 die() { printf 'ОГРАДА: %s\n' "$1" >&2; exit 78; }
 
 fstype() { stat -f -c %T "$1" 2>/dev/null || echo unknown; }
@@ -67,13 +74,7 @@ case "$GUARD_MODE" in
 
     total=$(size_ki "$OUT_DIR")
     [ "${total:-0}" -gt 0 ] || die "не удалось определить размер $OUT_DIR"
-    expected=$(( declared * 1048576 ))
-    # Допуск 1 GiB, а не проценты: маркер пишется из того же df, поэтому
-    # расхождение означает подмену каталога. Процентный допуск на объёме
-    # 927 GiB пропускал бы 935 GiB корневого раздела как «похожий размер».
-    diff_ki=$(( total - expected ))
-    [ "$diff_ki" -lt 0 ] && diff_ki=$(( -diff_ki ))
-    if [ "$diff_ki" -gt 1048576 ]; then
+    if ! size_matches "$total" "$declared"; then
       die "$OUT_DIR размером $((total/1024/1024)) GiB не совпадает с объявленными $declared GiB: хранилище не смонтировано"
     fi
     writable "$OUT_DIR"
