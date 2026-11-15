@@ -14,8 +14,9 @@ services:
     image: video-studio/ffmpeg:8.0.1
     build:
       context: ./image/ffmpeg
-    entrypoint: ["/bin/sleep"]
-    command: ["infinity"]
+    # Без аргументов контейнер просто живёт и держит tmpfs /out.
+    # С аргументами entrypoint сам передаёт их ограде и ffmpeg, поэтому
+    # `docker compose run --rm studio -version` работает как ожидается.
     user: "10001:10001"
     read_only: true
     init: true
