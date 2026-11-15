@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Проверка установки: конфигурация, лимиты, бинарники, кодеки и дисковая защита.
+# Проверка установки: конфигурация, лимиты, бинарники, кодеки, дисковая защита
+# и модуль сверки размера.
 # Медиа не читает, файлов не создаёт, кодирование не запускает.
 set -euo pipefail
 
@@ -103,6 +104,30 @@ if docker compose run --rm --no-deps --entrypoint /bin/sh studio -c 'test -x /us
   ok 'entrypoint-ограда в образе на месте'
 else
   bad 'ограда в образе отсутствует'
+fi
+
+# Ограда сверяет размер хранилища через общий модуль. Без модуля она обязана
+# отказать, а не продолжить работу: иначе проверка размера молча исчезнет.
+if docker compose run --rm --no-deps --entrypoint /bin/sh studio -c 'test -r /usr/local/bin/size-check.sh'; then
+  ok 'модуль сверки размера в образе на месте'
+else
+  bad 'модуль сверки размера в образе отсутствует'
+fi
+
+if docker compose run --rm --no-deps -e SIZE_CHECK_LIB=/usr/local/bin/missing-size-check \
+     studio -version >/dev/null 2>&1; then
+  bad 'ограда работает без модуля сверки размера'
+else
+  ok 'без модуля сверки размера ограда отказывает'
+fi
+
+if docker compose run --rm --no-deps --entrypoint /bin/sh studio -c '
+. /usr/local/bin/size-check.sh
+size_matches 42991616 40 && ! size_matches 42992640 40
+' 2>/dev/null; then
+  ok 'сверка размера: допуск 1 GiB, дальше отказ'
+else
+  bad 'сверка размера не совпала с допуском 1 GiB'
 fi
 
 echo

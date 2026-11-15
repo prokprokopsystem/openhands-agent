@@ -13,7 +13,7 @@
 | `compose.yaml` | режим `tmpfs`: изоляция, лимиты, `/out` в памяти 1 GiB |
 | `compose.disk.yaml` | режим `disk`: сервис `studio-disk` с хранилищем `/srv/video-studio-data`; источник — раздел SSD, том или loop-образ |
 | `scripts/run-render.sh` | единственный разрешённый способ запуска; режим задаётся `MODE=tmpfs\|disk` |
-| `scripts/verify.sh` | 25 проверок установки в режиме `tmpfs` |
+| `scripts/verify.sh` | 28 проверок установки в режиме `tmpfs` |
 | `scripts/verify-storage.sh` | проверки хранилища; источник определяется по `findmnt`; `--fill` только для маленького тестового хранилища |
 | `scripts/check-docker-space.sh` | бюджет Docker перед установкой HyperFrames |
 | `host/setup-ssd-storage.sh` | подготовка внешнего SSD: GPT + `ext4`, монтирование по UUID; dry-run по умолчанию, проверка модели и серийного номера |
