@@ -53,7 +53,14 @@ EOF
 st="$FAKE_STATE"
 mounted() { [ "${FAKE_MOUNTED:-0}" = 1 ] || [ -f "$st/mounted" ]; }
 case "${1:-}" in
-  --verify) [ "${FAKE_VERIFY_FAIL:-0}" = 1 ] && exit 1; exit 0 ;;
+  --verify)
+    # FAKE_VERIFY_FAIL=1 — проверка fstab не проходит; FAKE_VERIFY_OUT задаёт
+    # строки диагностики, чтобы различать «наша строка» и «чужая».
+    if [ "${FAKE_VERIFY_FAIL:-0}" = 1 ]; then
+      echo "${FAKE_VERIFY_OUT:-0 parse errors, 1 errors, 0 warnings}"
+      exit 1
+    fi
+    exit 0 ;;
   -S) mounted && { echo "$FAKE_MOUNT"; exit 0; }; exit 1 ;;
   -no)
     case "${2:-}" in
@@ -377,11 +384,84 @@ out=$(FAKE_ROOT=1 "$SB/host/setup-ssd-storage.sh" --apply --confirm-serial 24257
 [ "$(grep -c '^mount ' "$FAKE_LOG")" = 1 ] && ok "mount выполнен один раз" \
   || bad "mount: $(grep -c '^mount ' "$FAKE_LOG") раз"
 ln_mkdir=$(grep -n '^+ создать точку монтирования' <<<"$out" | cut -d: -f1)
+ln_fstab=$(grep -n '^+ добавить строку UUID' <<<"$out" | cut -d: -f1)
 ln_mount=$(grep -n '^+ mount' <<<"$out" | cut -d: -f1)
-[ -n "$ln_mkdir" ] && [ -n "$ln_mount" ] && [ "$ln_mkdir" -lt "$ln_mount" ] \
-  && ok "каталог создан до mount (строки $ln_mkdir < $ln_mount)" \
-  || bad "порядок нарушен: каталог=$ln_mkdir mount=$ln_mount"
+[ -n "$ln_mkdir" ] && [ -n "$ln_fstab" ] && [ "$ln_mkdir" -lt "$ln_fstab" ] \
+  && ok "каталог создан до записи fstab (строки $ln_mkdir < $ln_fstab)" \
+  || bad "порядок нарушен: каталог=$ln_mkdir fstab=$ln_fstab"
+[ -n "$ln_fstab" ] && [ -n "$ln_mount" ] && [ "$ln_fstab" -lt "$ln_mount" ] \
+  && ok "fstab записан до mount (строки $ln_fstab < $ln_mount)" \
+  || bad "порядок нарушен: fstab=$ln_fstab mount=$ln_mount"
 [ -f "$FAKE_MOUNT/.storage-size-gib" ] && ok "маркер записан" || bad "маркера нет"
+
+# =============================================================================
+head_ "S4c. setup-ssd-storage.sh: модуль сверки размера только в image/ffmpeg"
+setup_env
+rm -f "$SB/size-check.sh"
+mkdir -p "$SB/image/ffmpeg"
+cp "$SRC/size-check.sh" "$SB/image/ffmpeg/size-check.sh"
+cp "$SRC/host/setup-ssd-storage.sh" "$SB/host/"
+patch_ssd "$SB/host/setup-ssd-storage.sh"
+out=$(FAKE_ROOT=1 "$SB/host/setup-ssd-storage.sh" --apply --confirm-serial 24257G400264 2>&1); rc=$?
+[ "$rc" = 0 ] && ok "код 0 на серверной раскладке" \
+  || { bad "код $rc"; printf '%s\n' "$out" | tail -4; }
+[ -f "$FAKE_MOUNT/.storage-size-gib" ] && ok "маркер записан" || bad "маркера нет"
+
+# =============================================================================
+head_ "S4d. setup-ssd-storage.sh: модуля нет нигде — отказ до первой команды"
+setup_env
+rm -f "$SB/size-check.sh"
+cp "$SRC/host/setup-ssd-storage.sh" "$SB/host/"
+patch_ssd "$SB/host/setup-ssd-storage.sh"
+out=$(FAKE_ROOT=1 "$SB/host/setup-ssd-storage.sh" --apply --confirm-serial 24257G400264 2>&1); rc=$?
+[ "$rc" != 0 ] && ok "код $rc" || bad "скрипт не отказал"
+printf '%s' "$out" | grep -q "не найден size-check.sh" && ok "причина названа" || bad "нет сообщения"
+[ ! -s "$FAKE_LOG" ] && ok "ни одна внешняя команда не вызвана" || bad "вызваны: $(head -2 "$FAKE_LOG")"
+[ ! -e "${FAKE_DEV}-part1" ] && ok "раздел не создан" || bad "раздел создан"
+
+# =============================================================================
+head_ "S4e. setup-ssd-storage.sh: verify не видит источник — только своей строки"
+setup_env
+cp "$SRC/host/setup-ssd-storage.sh" "$SB/host/"
+patch_ssd "$SB/host/setup-ssd-storage.sh"
+export FAKE_VERIFY_FAIL=1
+export FAKE_VERIFY_OUT="0 parse errors, 1 errors, 0 warnings
+$FAKE_MOUNT
+   [E] unreachable on boot required source: UUID=test-uuid-1234"
+out=$(FAKE_ROOT=1 "$SB/host/setup-ssd-storage.sh" --apply --confirm-serial 24257G400264 2>&1); rc=$?
+[ "$rc" = 0 ] && ok "код 0: ожидаемая ошибка не блокирует" \
+  || { bad "код $rc"; printf '%s\n' "$out" | tail -4; }
+printf '%s' "$out" | grep -q "ещё не виден в by-uuid" && ok "причина названа" || bad "нет пояснения"
+[ "$(grep -c '^mount ' "$FAKE_LOG")" = 1 ] && ok "mount выполнен" || bad "mount не выполнен"
+grep -q "UUID=test-uuid-1234 $FAKE_MOUNT" "$FAKE_FSTAB" && ok "строка в fstab записана" || bad "строки нет"
+
+# =============================================================================
+head_ "S4f. setup-ssd-storage.sh: verify нашёл чужую ошибку — отказ, fstab цел"
+setup_env
+cp "$SRC/host/setup-ssd-storage.sh" "$SB/host/"
+patch_ssd "$SB/host/setup-ssd-storage.sh"
+export FAKE_VERIFY_FAIL=1
+export FAKE_VERIFY_OUT="0 parse errors, 1 errors, 0 warnings
+/boot
+   [E] unreachable on boot required source: UUID=someone-else"
+out=$(FAKE_ROOT=1 "$SB/host/setup-ssd-storage.sh" --apply --confirm-serial 24257G400264 2>&1); rc=$?
+[ "$rc" != 0 ] && ok "код $rc" || bad "скрипт не отказал"
+printf '%s' "$out" | grep -q "не прошла проверку" && ok "причина названа" || bad "нет сообщения"
+cmp -s "$FAKE_FSTAB" "$SB/fstab.orig" && ok "fstab не изменён" || bad "fstab изменён"
+[ "$(grep -c '^mount ' "$FAKE_LOG")" = 0 ] && ok "mount не выполнялся" || bad "mount выполнен"
+
+# =============================================================================
+head_ "S4g. setup-ssd-storage.sh: ошибка разбора fstab — отказ"
+setup_env
+cp "$SRC/host/setup-ssd-storage.sh" "$SB/host/"
+patch_ssd "$SB/host/setup-ssd-storage.sh"
+export FAKE_VERIFY_FAIL=1
+export FAKE_VERIFY_OUT="1 parse errors, 0 errors, 0 warnings
+$FAKE_MOUNT
+   [E] unknown option"
+out=$(FAKE_ROOT=1 "$SB/host/setup-ssd-storage.sh" --apply --confirm-serial 24257G400264 2>&1); rc=$?
+[ "$rc" != 0 ] && ok "код $rc" || bad "скрипт не отказал"
+cmp -s "$FAKE_FSTAB" "$SB/fstab.orig" && ok "fstab не изменён" || bad "fstab изменён"
 
 # =============================================================================
 head_ "S5. setup-ssd-storage.sh: повторный запуск после успеха"
@@ -573,10 +653,11 @@ out=$(FAKE_ROOT=1 FAKE_HOST_FREE_GIB=500 "$SB/host/setup-storage.sh" --apply 2>&
 [ "$(grep -c '^mount ' "$FAKE_LOG")" = 1 ] && ok "mount выполнен один раз" \
   || bad "mount: $(grep -c '^mount ' "$FAKE_LOG") раз"
 ln_mkdir=$(grep -n '^+ создать точку монтирования' <<<"$out" | cut -d: -f1)
+ln_fstab=$(grep -n '^+ добавить строку' <<<"$out" | cut -d: -f1)
 ln_mount=$(grep -n '^+ mount' <<<"$out" | cut -d: -f1)
-[ -n "$ln_mkdir" ] && [ -n "$ln_mount" ] && [ "$ln_mkdir" -lt "$ln_mount" ] \
-  && ok "каталог создан до mount (строки $ln_mkdir < $ln_mount)" \
-  || bad "порядок нарушен: каталог=$ln_mkdir mount=$ln_mount"
+[ -n "$ln_mkdir" ] && [ -n "$ln_fstab" ] && [ "$ln_mkdir" -lt "$ln_fstab" ] \
+  && ok "каталог создан до записи fstab (строки $ln_mkdir < $ln_fstab)" \
+  || bad "порядок нарушен: каталог=$ln_mkdir fstab=$ln_fstab"
 
 # =============================================================================
 head_ "L5. setup-storage.sh: отказ mount — образ удалён, fstab восстановлен"

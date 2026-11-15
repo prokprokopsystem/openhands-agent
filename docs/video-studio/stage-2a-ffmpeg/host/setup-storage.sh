@@ -99,6 +99,13 @@ rollback() {
 }
 trap rollback EXIT
 
+# См. setup-ssd-storage.sh: путь к модулю зависит от раскладки каталогов.
+SIZE_CHECK_LIB=""
+for c in "$(dirname "$0")/../size-check.sh" "$(dirname "$0")/../image/ffmpeg/size-check.sh"; do
+  if [ -r "$c" ]; then SIZE_CHECK_LIB="$c"; break; fi
+done
+[ -n "$SIZE_CHECK_LIB" ] || die "не найден size-check.sh ни в корне проекта, ни в image/ffmpeg"
+
 step "1. Проверки перед созданием"
 
 findmnt -no TARGET "$MOUNT" >/dev/null 2>&1 && die "$MOUNT уже смонтирован — хранилище создано"
@@ -148,10 +155,21 @@ do_fstab() {
   printf '%s %s ext4 %s 0 2\n' "$IMAGE" "$MOUNT" "$FSTAB_OPTS" >> "$tmp" || \
     die "не удалось дописать строку в копию fstab"
 
-  if ! findmnt --verify --tab-file="$tmp" >/dev/null 2>&1; then
-    findmnt --verify --verbose --tab-file="$tmp" 2>&1 | sed 's/^/    /' || true
-    die "fstab не изменён: новая редакция не прошла проверку"
+  # Ошибки достижимости, называющие только нашу строку, ожидаемы: цель
+  # создаётся этим же запуском. Всё остальное — отказ.
+  verify_out=$(mktemp) || die "mktemp не удался"
+  # LC_ALL=C: разбор вывода ниже опирается на английские слова.
+  if ! LC_ALL=C findmnt --verify --tab-file="$tmp" > "$verify_out" 2>&1; then
+    unexpected=$(grep -E '\[E\]' "$verify_out" | grep -vF "$IMAGE" | grep -vF "$MOUNT" || true)
+    grep -qE '(^|[^0-9])0 parse errors' "$verify_out" || unexpected="$unexpected разбор"
+    if [ -n "$unexpected" ]; then
+      say "  findmnt --verify нашёл проблему в новой редакции:"
+      sed 's/^/    /' "$verify_out"
+      rm -f "$verify_out"
+      die "fstab не изменён: новая редакция не прошла проверку"
+    fi
   fi
+  rm -f "$verify_out"
   before=$(grep -cvE '^[[:space:]]*(#|$)' "$FSTAB" || true)
   after=$(grep -cvE '^[[:space:]]*(#|$)' "$tmp" || true)
   before=${before:-0}
@@ -176,8 +194,8 @@ do_fstab() {
 }
 
 do_mountpoint() {
-  # mount не создаёт точку монтирования: без этого шага mount падал бы уже
-  # после mkfs, то есть откат оставлял бы созданный образ.
+  # mount не создаёт точку монтирования, а findmnt --verify считает
+  # несуществующую цель ошибкой. Поэтому каталог создаётся до записи fstab.
   [ -d "$MOUNT" ] || install -d -m 0755 "$MOUNT"
 }
 
@@ -202,8 +220,8 @@ do_marker() {
 do_verify() {
   total=$(df -Pk "$MOUNT" | awk 'NR==2{print $2}')
   declared=$(tr -dc '0-9' < "$MOUNT/.storage-size-gib")
-  # shellcheck disable=SC1091
-  . "$(dirname "$0")/../size-check.sh"
+  # shellcheck disable=SC1090
+  . "$SIZE_CHECK_LIB"
   size_matches "$total" "$declared" || die "размер $total KiB не совпал с маркером $declared GiB"
   findmnt -no SOURCE,FSTYPE,SIZE,OPTIONS "$MOUNT" | sed 's/^/  /'
   df -h "$MOUNT" | tail -1 | sed 's/^/  /'
@@ -213,8 +231,8 @@ step "2. План выполнения"
 
 stage "fallocate -l ${SIZE_GIB}G $IMAGE (с проверкой фактического размера)" do_image
 stage "mkfs.ext4 -q -m 0 -L $LABEL $IMAGE" do_mkfs
-stage "добавить строку в $FSTAB (резервная копия, findmnt --verify, проверка после записи)" do_fstab
 stage "создать точку монтирования $MOUNT" do_mountpoint
+stage "добавить строку в $FSTAB (резервная копия, findmnt --verify, проверка после записи)" do_fstab
 stage "mount $MOUNT" do_mount
 stage "создать in/tmp/out/archive, выставить владельцев" do_dirs
 stage "записать маркер $SIZE_GIB GiB" do_marker

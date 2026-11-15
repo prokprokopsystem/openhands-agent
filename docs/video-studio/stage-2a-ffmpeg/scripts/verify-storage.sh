@@ -33,8 +33,15 @@ ok() { printf '  ПРОЙДЕНО: %s\n' "$1"; pass=$((pass+1)); }
 bad() { printf '  НЕ ПРОЙДЕНО: %s\n' "$1"; fail=$((fail+1)); }
 die() { printf 'ОТКАЗ: %s\n' "$1" >&2; exit 2; }
 
-# shellcheck disable=SC1091
-. "$(cd "$(dirname "$0")/.." && pwd)/size-check.sh"
+# Модуль лежит в корне проекта (раскладка репозитория) или в каталоге образа
+# (раскладка на сервере).
+SIZE_CHECK_LIB=""
+for c in "$ROOT/size-check.sh" "$ROOT/image/ffmpeg/size-check.sh"; do
+  if [ -r "$c" ]; then SIZE_CHECK_LIB="$c"; break; fi
+done
+[ -n "$SIZE_CHECK_LIB" ] || die "не найден size-check.sh ни в $ROOT, ни в $ROOT/image/ffmpeg"
+# shellcheck disable=SC1090
+. "$SIZE_CHECK_LIB"
 
 cd "$ROOT"
 

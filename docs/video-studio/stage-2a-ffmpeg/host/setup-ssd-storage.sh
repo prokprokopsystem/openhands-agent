@@ -54,6 +54,16 @@ say() { printf '%s\n' "$*"; }
 die() { printf 'ОТКАЗ: %s\n' "$*" >&2; exit 1; }
 step() { printf '\n== %s ==\n' "$*"; }
 
+# Модуль сверки размера лежит либо в корне проекта (раскладка репозитория),
+# либо в каталоге образа (раскладка на сервере, где build context — отдельный
+# каталог). Путь разрешается до первого шага: иначе отсутствие модуля
+# всплывало бы в самом конце, после разметки, mkfs и mount.
+SIZE_CHECK_LIB=""
+for c in "$(dirname "$0")/../size-check.sh" "$(dirname "$0")/../image/ffmpeg/size-check.sh"; do
+  if [ -r "$c" ]; then SIZE_CHECK_LIB="$c"; break; fi
+done
+[ -n "$SIZE_CHECK_LIB" ] || die "не найден size-check.sh ни в корне проекта, ни в image/ffmpeg"
+
 # Права проверяются до любого шага, включая чтение устройства: без root
 # режим --apply не имеет смысла и не должен доходить до разрушительных команд.
 if [ "$APPLY" = "1" ]; then
@@ -224,6 +234,13 @@ do_mkfs() {
   mkfs.ext4 -m 0 -i "$INODE_BYTES" -L "$LABEL" "${DEV}-part1"
   UUID=$(blkid -s UUID -o value "${DEV}-part1")
   [ -n "$UUID" ] || die "не удалось получить UUID раздела"
+  # Ссылку /dev/disk/by-uuid создаёт udev. Без ожидания findmnt --verify на
+  # следующем шаге не увидит источник и откажет на ровном месте.
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    [ -e "/dev/disk/by-uuid/$UUID" ] && break
+    udevadm settle --timeout=2 >/dev/null 2>&1 || true
+    sleep 0.2
+  done
 }
 
 do_fstab() {
@@ -249,11 +266,24 @@ do_fstab() {
   printf 'UUID=%s %s ext4 %s 0 0\n' "$UUID" "$MOUNT" "$FSTAB_OPTS" >> "$tmp" || \
     die "не удалось дописать строку в копию fstab"
 
-  if ! findmnt --verify --tab-file="$tmp" >/dev/null 2>&1; then
-    say "  findmnt --verify нашёл проблему в новой редакции:"
-    findmnt --verify --verbose --tab-file="$tmp" 2>&1 | sed 's/^/    /' || true
-    die "fstab не изменён: новая редакция не прошла проверку"
+  # findmnt --verify проверяет и разбор, и достижимость источника с целью.
+  # Раздел создан секунду назад, поэтому источник может быть ещё не виден в
+  # /dev/disk/by-uuid. Ошибки, называющие только нашу строку, ожидаемы; любая
+  # другая ошибка или ошибка разбора — отказ.
+  verify_out=$(mktemp) || die "mktemp не удался"
+  # LC_ALL=C: разбор вывода ниже опирается на английские слова.
+  if ! LC_ALL=C findmnt --verify --tab-file="$tmp" > "$verify_out" 2>&1; then
+    unexpected=$(grep -E '\[E\]' "$verify_out" | grep -vF "UUID=$UUID" | grep -vF "$MOUNT" || true)
+    grep -qE '(^|[^0-9])0 parse errors' "$verify_out" || unexpected="$unexpected разбор"
+    if [ -n "$unexpected" ]; then
+      say "  findmnt --verify нашёл проблему в новой редакции:"
+      sed 's/^/    /' "$verify_out"
+      rm -f "$verify_out"
+      die "fstab не изменён: новая редакция не прошла проверку"
+    fi
+    say "  findmnt --verify: источник $UUID ещё не виден в by-uuid, ждём после монтирования"
   fi
+  rm -f "$verify_out"
   # Контроль, что остальные записи не потерялись при сборке.
   before=$(grep -cvE '^[[:space:]]*(#|$)' "$FSTAB" || true)
   after=$(grep -cvE '^[[:space:]]*(#|$)' "$tmp" || true)
@@ -282,8 +312,9 @@ do_fstab() {
 }
 
 do_mountpoint() {
-  # mount не создаёт точку монтирования: без этого шага mount падал бы уже
-  # после разметки и mkfs, то есть откат оставлял бы отформатированный раздел.
+  # mount не создаёт точку монтирования, а findmnt --verify считает
+  # несуществующую цель ошибкой. Поэтому каталог создаётся до записи fstab:
+  # иначе проверка fstab отказывала бы всегда.
   [ -d "$MOUNT" ] || install -d -m 0755 "$MOUNT"
 }
 
@@ -315,8 +346,8 @@ do_marker() {
 do_verify() {
   declared=$(tr -dc '0-9' < "$MOUNT/.storage-size-gib")
   total=$(df -Pk "$MOUNT" | awk 'NR==2{print $2}')
-  # shellcheck disable=SC1091
-  . "$(dirname "$0")/../size-check.sh"
+  # shellcheck disable=SC1090
+  . "$SIZE_CHECK_LIB"
   size_matches "$total" "$declared" || die "размер $total KiB не совпал с маркером $declared GiB"
   findmnt -no SOURCE,FSTYPE,SIZE,OPTIONS "$MOUNT" | sed 's/^/  /'
   df -h "$MOUNT" | tail -1 | sed 's/^/  /'
@@ -327,8 +358,8 @@ step "5. План выполнения"
 stage "sgdisk --zap-all $DEV" do_zap
 stage "sgdisk --new=1:0:0 --typecode=1:8300 --change-name=1:$LABEL $DEV" do_partition
 stage "mkfs.ext4 -m 0 -i $INODE_BYTES -L $LABEL ${DEV}-part1" do_mkfs
-stage "добавить строку UUID в $FSTAB (резервная копия, findmnt --verify, проверка после записи)" do_fstab
 stage "создать точку монтирования $MOUNT" do_mountpoint
+stage "добавить строку UUID в $FSTAB (резервная копия, findmnt --verify, проверка после записи)" do_fstab
 stage "mount $MOUNT" do_mount
 stage "создать in/out/tmp/archive, выставить владельцев" do_dirs
 stage "записать маркер размера из df" do_marker
