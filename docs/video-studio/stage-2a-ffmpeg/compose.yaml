@@ -1,0 +1,42 @@
+name: video-studio
+
+services:
+  ffmpeg:
+    image: video-studio/ffmpeg:8.0.1
+    build:
+      context: ./image/ffmpeg
+    user: "10001:10001"
+    read_only: true
+    init: true
+    cpus: 2.0
+    mem_limit: 2g
+    memswap_limit: 2g
+    pids_limit: 256
+    shm_size: 256m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    network_mode: "none"
+    restart: "no"
+    # RLIMIT_FSIZE: ядро не даст записать один файл больше 4 GiB.
+    ulimits:
+      fsize: 4294967296
+    tmpfs:
+      - /tmp:size=1g,mode=1777
+      - /run:size=16m,mode=0755
+    volumes:
+      - type: bind
+        source: ./work
+        target: /work
+        read_only: true
+      - type: bind
+        source: ./out
+        target: /out
+        read_only: false
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    entrypoint: ["/usr/local/bin/ffmpeg"]
