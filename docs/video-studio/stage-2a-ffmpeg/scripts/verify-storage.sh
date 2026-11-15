@@ -12,6 +12,16 @@
 # недопустимо: 927 GiB записей изнашивают диск и на время теста занимают всё
 # место. Поэтому --fill работает только на маленьком тестовом хранилище и
 # требует явного подтверждения человеком.
+#
+# Тождество хранилища проверяется в обе стороны:
+#   • на рабочей точке совпадение серийного номера обязательно — это признак
+#     правильного диска, а не запрет;
+#   • на любой другой точке рабочий SSD запрещён: проверка пишет пробы и не
+#     должна попадать на рабочий диск.
+#
+# Проверка идёт в собственном проекте compose ($PROJECT), поэтому её down не
+# может ни остановить, ни удалить контейнеры других сервисов. Состав чужих
+# контейнеров сверяется до и после.
 set -euEo pipefail
 
 ROOT="${ROOT:-/home/igor/video-studio}"
@@ -25,7 +35,16 @@ MIN_GIB="${MIN_GIB:-38}"
 FILL=0
 [ "${1:-}" = "--fill" ] && FILL=1
 
-DC=(docker compose -f "$ROOT/compose.disk.yaml" --project-directory "$ROOT")
+# Отдельное имя проекта: compose.yaml и compose.disk.yaml лежат в одном
+# каталоге и оба объявляют name: video-studio. Без своего имени down этой
+# проверки относился бы к тому же проекту, что и рабочий сервис studio, и мог
+# бы снять его сеть или остановить контейнер.
+PROJECT="video-studio-disk-check"
+# compose.disk.yaml подставляет этот путь в привязки томов. Проверка обязана
+# смотреть на то же хранилище, что и контейнер, иначе --fill на тестовом
+# образе заполнял бы рабочий SSD.
+export STORAGE_ROOT="$MOUNT"
+DC=(docker compose -f "$ROOT/compose.disk.yaml" --project-directory "$ROOT" --project-name "$PROJECT")
 pass=0
 fail=0
 
@@ -45,9 +64,23 @@ done
 
 cd "$ROOT"
 
+# Чужие контейнеры: снимок до и после. Свои не учитываются, иначе сравнение
+# ловило бы остатки прошлой попытки.
+container_snapshot() {
+  docker ps -a --format '{{.Names}}' 2>/dev/null | grep -v "^${PROJECT}" | sort || true
+}
+
 echo "== 1. Хранилище на хосте =="
+containers_before=$(container_snapshot)
 source=""
-if findmnt -no TARGET "$MOUNT" >/dev/null 2>&1; then
+source_serial=""
+total_ki=""
+size=""
+root_source=$(findmnt -no SOURCE / 2>/dev/null || true)
+
+# -M требует именно точку монтирования. Без него каталог внутри другого
+# раздела выглядел бы хранилищем, и запись пробы ушла бы на системный диск.
+if findmnt -no TARGET -M "$MOUNT" >/dev/null 2>&1; then
   fstype=$(findmnt -no FSTYPE "$MOUNT")
   source=$(findmnt -no SOURCE "$MOUNT")
   total_ki=$(df -Pk "$MOUNT" | awk 'NR==2{print $2}')
@@ -57,8 +90,8 @@ else
   bad "$MOUNT не смонтирован"
 fi
 
-source_serial=""
 case "$source" in
+  "") ;;
   /dev/mapper/*|/dev/dm-*)
     ok "источник $source — логический том" ;;
   /dev/loop*)
@@ -71,15 +104,31 @@ case "$source" in
       [ -n "$disk" ] && [ "$disk" != "sda" ] \
         && ok "раздел не на системном диске" \
         || bad "раздел на системном диске /dev/$disk"
-      [ "$source_serial" != "$PRODUCTION_SERIAL" ] \
-        && ok "это не рабочий SSD видеостудии" \
-        || bad "источник указывает на рабочий SSD видеостудии"
     else
       bad "источник $source не блочное устройство"
     fi ;;
-  "") ;;
-  *) bad "неизвестный источник $source" ;;
+  *)
+    bad "неизвестный источник $source" ;;
 esac
+
+# Тот же раздел, что корень, — это не хранилище: проба легла бы рядом с
+# сервисами и журналами.
+if [ -n "$source" ]; then
+  [ "$source" != "$root_source" ] \
+    && ok "источник не совпадает с корневой файловой системой ($root_source)" \
+    || bad "источник $source — корневая файловая система, писать в него нельзя"
+fi
+
+# Рабочая точка и рабочий SSD обязаны совпасть, любая другая — разойтись.
+if [ "$MOUNT" = "$PRODUCTION_MOUNT" ]; then
+  [ "$source_serial" = "$PRODUCTION_SERIAL" ] \
+    && ok "источник — рабочий SSD $PRODUCTION_SERIAL, как и требуется для $PRODUCTION_MOUNT" \
+    || bad "для $PRODUCTION_MOUNT нужен рабочий SSD $PRODUCTION_SERIAL, а источник '${source_serial:-неизвестен}'"
+else
+  [ "$source_serial" != "$PRODUCTION_SERIAL" ] \
+    && ok "источник не рабочий SSD — проверка не тронет $PRODUCTION_MOUNT" \
+    || bad "источник — рабочий SSD $PRODUCTION_SERIAL: писать в него через $MOUNT нельзя"
+fi
 
 if grep -qE "[[:space:]]$MOUNT[[:space:]]" /etc/fstab 2>/dev/null; then
   ok "запись в /etc/fstab есть"
@@ -122,7 +171,8 @@ if [ "$FILL" = "1" ]; then
 занятие места. Для теста создайте маленькое отдельное хранилище, например
 loop-образ 2 GiB, и укажите его: MOUNT=/mnt/storage-test ./scripts/verify-storage.sh --fill"
 
-  [ "$source_serial" != "$PRODUCTION_SERIAL" ] || \
+  # Совпадение с рабочим SSD здесь по-прежнему запрет, а не приглашение.
+  [ "${source_serial:-}" != "$PRODUCTION_SERIAL" ] || \
     die "--fill запрещён: источник указывает на рабочий SSD ($PRODUCTION_SERIAL)"
 
   if [ "$size" -gt "$FILL_MAX_GIB" ]; then
@@ -140,9 +190,20 @@ fi
 
 echo
 echo "== 2. Хранилище внутри контейнера =="
+# Остатки прошлой попытки — только своего проекта: down с чужим именем проекта
+# не должен попасть под рабочую установку.
+"${DC[@]}" down >/dev/null 2>&1 || true
 "${DC[@]}" up -d studio-disk >/dev/null
 cid=$("${DC[@]}" ps -q studio-disk)
 [ -n "$cid" ] || { bad "контейнер studio-disk не запустился"; exit 1; }
+
+# /out обязан быть на отдельной файловой системе: если хранилище отвалилось,
+# docker привязал бы каталог с корня, и проба записалась бы на системный диск.
+inside_dev=$(docker exec "$cid" stat -c %d /out)
+container_dev=$(docker exec "$cid" stat -c %d /)
+[ "$inside_dev" != "$container_dev" ] \
+  && ok "/out на отдельной файловой системе от корня контейнера" \
+  || bad "/out на корневой файловой системе контейнера — запись уйдёт на системный диск"
 
 in_total=$(docker exec "$cid" df -Pk /out | awk 'NR==2{print $2}')
 if size_matches "$in_total" "$declared"; then
@@ -238,7 +299,15 @@ echo
 echo "== 5. Уборка =="
 "${DC[@]}" down >/dev/null 2>&1 || true
 left=$("${DC[@]}" ps -aq | wc -l)
-[ "$left" -eq 0 ] && ok "контейнеры проекта остановлены" || bad "остались контейнеры: $left"
+[ "$left" -eq 0 ] && ok "контейнеры проекта $PROJECT остановлены" \
+  || bad "в проекте $PROJECT остались контейнеры: $left"
+
+containers_after=$(container_snapshot)
+if [ "$containers_before" = "$containers_after" ]; then
+  ok "состав остальных контейнеров не изменился"
+else
+  bad "состав контейнеров изменился: пропали '$(comm -23 <(printf '%s\n' "$containers_before") <(printf '%s\n' "$containers_after") | tr '\n' ' ')' появились '$(comm -13 <(printf '%s\n' "$containers_before") <(printf '%s\n' "$containers_after") | tr '\n' ' ')'"
+fi
 
 echo
 echo "ИТОГ: ПРОЙДЕНО $pass, НЕ ПРОЙДЕНО $fail"

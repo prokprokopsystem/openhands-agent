@@ -60,10 +60,21 @@ case "${1:-} ${2:-}" in
 esac
 EOF
 
+  # Настоящий findmnt различает запрос точной точки монтирования (-M) и запрос
+  # источника корня, поэтому имитация это тоже различает: иначе проверка
+  # «каталог внутри раздела» и «источник не корень» проходила бы молча.
   cat > "$bin/findmnt" <<'EOF'
 #!/bin/sh
 st="$FAKE_STATE"
 mounted() { [ "${FAKE_MOUNTED:-0}" = 1 ] || [ -f "$st/mounted" ]; }
+target=""
+exact=0
+for a in "$@"; do
+  case "$a" in
+    -M) exact=1 ;;
+    /*) target="$a" ;;
+  esac
+done
 case "${1:-}" in
   --verify)
     # FAKE_VERIFY_FAIL=1 — проверка fstab не проходит; FAKE_VERIFY_OUT задаёт
@@ -76,9 +87,17 @@ case "${1:-}" in
   -S) mounted && { echo "$FAKE_MOUNT"; exit 0; }; exit 1 ;;
   -no)
     case "${2:-}" in
-      TARGET)   mounted && { echo "$FAKE_MOUNT"; exit 0; }; exit 1 ;;
-      SOURCE)   echo "${FAKE_SOURCE:-${FAKE_DEV}-part1}" ;;
-      FSTYPE)   echo ext4 ;;
+      TARGET)
+        mounted || exit 1
+        # FAKE_IS_MOUNTPOINT=0 — каталог существует, но точкой монтирования
+        # не является: строгий запрос обязан отказать.
+        [ "$exact" = 1 ] && [ "${FAKE_IS_MOUNTPOINT:-1}" != 1 ] && exit 1
+        [ "$exact" = 1 ] && [ -n "$target" ] && [ "$target" != "$FAKE_MOUNT" ] && exit 1
+        echo "$FAKE_MOUNT"; exit 0 ;;
+      SOURCE)
+        if [ "$target" = "/" ]; then echo "${FAKE_ROOT_SOURCE:-/dev/mapper/root}"; exit 0; fi
+        echo "${FAKE_SOURCE:-${FAKE_DEV}-part1}" ;;
+      FSTYPE)   echo "${FAKE_FSTYPE:-ext4}" ;;
       SOURCE,FSTYPE,SIZE,OPTIONS) echo "${FAKE_DEV}-part1 ext4 40G rw,nofail" ;;
       *) exit 1 ;;
     esac ;;
@@ -337,7 +356,9 @@ setup_env() {
         FAKE_TOTAL_KI MIN_GIB FAKE_PARTTYPE FAKE_PARTLABEL FAKE_PART_START \
         FAKE_PART_BYTES FAKE_FUSER_BUSY FAKE_WIPEFS_FAIL FAKE_WIPEFS_KEEP \
         FAKE_MKFS_FAIL FAKE_UUID FAKE_WIPEFS_PROBE_FAIL FAKE_BLKID_DOS_ONLY \
-        FAKE_BLKID_FAIL_NOSTDERR FAKE_BLKID_DENIED
+        FAKE_BLKID_FAIL_NOSTDERR FAKE_BLKID_DENIED FAKE_IS_MOUNTPOINT \
+        FAKE_ROOT_SOURCE FAKE_FOREIGN FAKE_FOREIGN_LOSE FAKE_OUT_DEV \
+        FAKE_ROOT_DEV FAKE_UP_FAIL FAKE_FSTYPE
 }
 
 # Для проверок verify-storage: смонтированное хранилище с маркером и записью
@@ -353,6 +374,103 @@ seed_verify_env() {
   printf 'UUID=x %s ext4 defaults,nofail 0 2\n' "$FAKE_MOUNT" >> "$FAKE_FSTAB"
   export FAKE_MOUNTED=1 FAKE_TOTAL_KI="$total_ki" FAKE_SOURCE=/dev/loop7
   export MOUNT="$FAKE_MOUNT"
+}
+
+# verify-storage проверяет настоящие блочные устройства. В песочнице их нет,
+# поэтому признак блочности подменяется непустым именем источника — так же,
+# как это уже сделано в patch_remove и patch_resize.
+patch_verify() {
+  python3 - "$SB/scripts/verify-storage.sh" <<'PYVERIFY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+old = 'if [ -b "$source" ]; then'
+assert old in s, old
+s = s.replace(old, 'if [ -n "$source" ]; then', 1)
+open(p, "w").write(s)
+PYVERIFY
+}
+
+# Имитация docker: compose с отдельным именем проекта, exec для проверок
+# внутри контейнера и снимок чужих контейнеров. Все вызовы пишутся в FAKE_LOG,
+# поэтому «к чему скрипт обращался» проверяется по факту.
+seed_verify_docker() {
+  mkdir -p "$SB/bin-dc"
+  cat > "$SB/bin-dc/docker" <<'EOF'
+#!/bin/sh
+echo "docker $*" >> "$FAKE_LOG"
+st="$FAKE_STATE"
+case "$1" in
+  compose)
+    shift
+    verb=""
+    for a in "$@"; do
+      case "$a" in up|down|restart|ps) verb="$a" ;; esac
+    done
+    case "$verb" in
+      up) [ "${FAKE_UP_FAIL:-0}" = 1 ] && { echo "compose: отказ" >&2; exit 1; }
+          : > "$st/up"; exit 0 ;;
+      down) rm -f "$st/up"; exit 0 ;;
+      restart) : > "$st/restarted"; exit 0 ;;
+      ps)
+        for a in "$@"; do
+          case "$a" in
+            -q) echo "cid-studio-disk"; exit 0 ;;
+            -aq) [ -f "$st/up" ] && echo "cid-studio-disk"; exit 0 ;;
+          esac
+        done
+        exit 0 ;;
+    esac
+    exit 0 ;;
+  exec)
+    shift
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -e|-u|-w) shift 2 ;;
+        -*) shift ;;
+        *) break ;;
+      esac
+    done
+    shift
+    case "$*" in
+      *"/scratch"*) exit 0 ;;
+      *"/work/.t"*) exit 1 ;;
+      *"/storage/.storage-size-gib"*) exit 0 ;;
+      *"ffmpeg-guard"*) echo "ffmpeg-guard: квота 40G действует"; exit 0 ;;
+      *"df -Pk /out"*) printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/sdc1 %s 10240 1000 1%% /out\n' "${FAKE_TOTAL_KI:-41943040}"; exit 0 ;;
+      *"df -Pm /out"*) printf 'Filesystem 1048576-blocks Used Available Capacity Mounted on\n/dev/sdc1 %s %s %s 1%% /out\n' "$(( ${FAKE_TOTAL_KI:-41943040} / 1024 ))" "${FAKE_USED_MIB:-10}" "${FAKE_FREE_MIB:-40000}"; exit 0 ;;
+      *"stat -c %d /out"*) echo "${FAKE_OUT_DEV:-42}"; exit 0 ;;
+      *"stat -c %d /"*) echo "${FAKE_ROOT_DEV:-41}"; exit 0 ;;
+      *) exit 0 ;;
+    esac ;;
+  ps)
+    case "$*" in
+      *--format*)
+        [ -f "$st/up" ] && echo "video-studio-disk-check-studio-disk-1"
+        if [ -n "${FAKE_FOREIGN:-}" ]; then
+          if [ "${FAKE_FOREIGN_LOSE:-0}" = 1 ] && [ -f "$st/ps_seen" ]; then
+            printf '%s\n' "$FAKE_FOREIGN" | grep -v '^amnesia-bridge$'
+          else
+            printf '%s\n' "$FAKE_FOREIGN"
+          fi
+        fi
+        : > "$st/ps_seen"
+        exit 0 ;;
+    esac
+    exit 0 ;;
+esac
+exit 0
+EOF
+  chmod +x "$SB/bin-dc/docker"
+  export PATH="$SB/bin-dc:$SB/bin:$PATH"
+}
+
+# Рабочая точка с настоящим видом источника: раздел на диске и его серийный
+# номер. Так проверяется именно сверка тождества, а не ветка loop-образа.
+seed_verify_prod() {
+  # Путь именно в /dev: ветка раздела узнаётся по нему. Наличие файла не
+  # важно — признак блочности в песочнице подменён patch_verify.
+  export FAKE_SOURCE=/dev/sdc1 FAKE_ROOT_SOURCE=/dev/mapper/root
 }
 
 patch_remove() {
@@ -1337,6 +1455,12 @@ check() { if size_matches "$1" "$2"; then echo yes; else echo no; fi; }
 head_ "V2. verify-storage.sh: --fill на рабочем хранилище запрещён"
 setup_env
 seed_verify_env 40 41943040 "$FAKE_MOUNT"
+# Источник согласован с рабочей точкой: серийный номер совпадает, иначе отказ
+# пришёл бы раньше, на сверке тождества, и ворота --fill не проверялись бы.
+patch_verify
+seed_verify_docker
+seed_verify_prod
+export FAKE_SERIAL=24257G400264
 out=$(MIN_GIB=38 "$SB/scripts/verify-storage.sh" --fill 2>&1); rc=$?
 [ "$rc" = 2 ] && ok "код 2" || { bad "код $rc"; printf '%s\n' "$out" | tail -4; }
 printf '%s' "$out" | grep -q "запрещён на рабочем хранилище" && ok "причина названа" || bad "нет сообщения"
@@ -1382,6 +1506,214 @@ grep -q 'SIZE_CHECK_LIB' "$SRC/guard.sh" && ok "guard.sh подключает о
 grep -c '1048576' "$SRC/scripts/verify-storage.sh" >/dev/null && ok "процентного допуска в verify нет" || true
 grep -q '95 / 100\|105 / 100' "$SRC/scripts/verify-storage.sh" && bad "в verify остался процентный допуск" || ok "процентного допуска нет"
 [ "$(grep -c 'size_matches' "$SRC/host/setup-ssd-storage.sh")" -ge 1 ] && ok "установочный скрипт тоже сверяет через модуль" || bad "нет сверки"
+
+# =============================================================================
+# W — тождество хранилища, изоляция контейнеров и защита системного диска.
+
+run_verify() { bash "$SB/scripts/verify-storage.sh" "$@"; }
+docker_calls() { grep '^docker ' "$FAKE_LOG" 2>/dev/null || true; }
+# Снимок `docker ps -a` безобиден и делается всегда; ворота проверяются
+# по фактическому запуску контейнера.
+container_started() { docker_calls | grep -Eq 'compose .* up|^docker exec|compose .* restart'; }
+
+# --- W1. рабочая точка и рабочий SSD: совпадение обязательно ----------------
+head_ "W1. verify-storage.sh: на рабочей точке серийный номер обязан совпасть"
+setup_env
+seed_verify_env 926 972029952 "$FAKE_MOUNT"
+patch_verify
+seed_verify_docker
+seed_verify_prod
+export FAKE_SERIAL=24257G400264
+out=$(MIN_GIB=900 run_verify 2>&1); rc=$?
+[ "$rc" = 0 ] && ok "код 0 — проверка прошла" || { bad "код $rc"; printf '%s\n' "$out" | tail -6; }
+printf '%s' "$out" | grep -q "рабочий SSD 24257G400264, как и требуется" \
+  && ok "совпадение принято как правильное" || bad "совпадение не принято"
+printf '%s' "$out" | grep -q "писать в него через" && bad "рабочий SSD отвергнут" \
+  || ok "ложного запрета нет"
+
+# --- W2. рабочая точка, чужой диск -------------------------------------------
+head_ "W2. verify-storage.sh: на рабочей точке чужой серийный номер — отказ"
+setup_env
+seed_verify_env 926 972029952 "$FAKE_MOUNT"
+patch_verify
+seed_verify_docker
+seed_verify_prod
+export FAKE_SERIAL=9999WRONG
+out=$(MIN_GIB=900 run_verify 2>&1); rc=$?
+[ "$rc" = 1 ] && ok "код 1" || bad "код $rc"
+printf '%s' "$out" | grep -q "нужен рабочий SSD 24257G400264" && ok "причина названа" || bad "нет сообщения"
+
+# --- W3. тестовая точка на рабочем SSD --------------------------------------
+head_ "W3. verify-storage.sh: тестовая точка на рабочем SSD запрещена"
+setup_env
+seed_verify_env 40 41943040 /nonexistent
+patch_verify
+seed_verify_docker
+seed_verify_prod
+export FAKE_SERIAL=24257G400264
+out=$(MIN_GIB=38 run_verify 2>&1); rc=$?
+[ "$rc" = 1 ] && ok "код 1" || bad "код $rc"
+printf '%s' "$out" | grep -q "писать в него через" && ok "причина названа" || bad "нет сообщения"
+container_started && bad "контейнер запускался: $(docker_calls | grep -E 'up|exec|restart' | head -2)" \
+  || ok "контейнер не запускался"
+
+# --- W4. источник — корневая файловая система -------------------------------
+head_ "W4. verify-storage.sh: источник совпал с корнем — отказ до контейнера"
+setup_env
+seed_verify_env 40 41943040 /nonexistent
+patch_verify
+seed_verify_docker
+export FAKE_SOURCE=/dev/mapper/root FAKE_ROOT_SOURCE=/dev/mapper/root
+out=$(MIN_GIB=38 run_verify 2>&1); rc=$?
+[ "$rc" = 1 ] && ok "код 1" || bad "код $rc"
+printf '%s' "$out" | grep -q "корневая файловая система, писать в него нельзя" \
+  && ok "корень распознан" || bad "корень не распознан"
+printf '%s' "$out" | grep -q "логический том" && ok "ветка тома пройдена" \
+  || bad "ветка тома не пройдена"
+container_started && bad "контейнер запускался: $(docker_calls | grep -E 'up|exec|restart' | head -2)" \
+  || ok "контейнер не запускался"
+
+# --- W5. хранилище не смонтировано ------------------------------------------
+head_ "W5. verify-storage.sh: не смонтировано — отказ, ничего не создано"
+setup_env
+seed_verify_env 926 972029952 /nonexistent
+patch_verify
+seed_verify_docker
+export FAKE_MOUNTED=0
+out=$(MIN_GIB=900 run_verify 2>&1); rc=$?
+[ "$rc" = 1 ] && ok "код 1" || bad "код $rc"
+printf '%s' "$out" | grep -q "не смонтирован" && ok "причина названа" || bad "нет сообщения"
+container_started && bad "контейнер запускался: $(docker_calls | grep -E 'up|exec|restart' | head -2)" \
+  || ok "контейнер не запускался"
+
+# --- W6. строгий запрос точки монтирования ----------------------------------
+head_ "W6. verify-storage.sh: спрашивает именно точку монтирования (-M)"
+grep -q 'findmnt -no TARGET -M' "$SRC/scripts/verify-storage.sh" \
+  && ok "используется -M" || bad "нет -M: каталог внутри раздела сойдёт за хранилище"
+setup_env
+seed_verify_env 926 972029952 /nonexistent
+patch_verify
+seed_verify_docker
+export FAKE_IS_MOUNTPOINT=0
+out=$(MIN_GIB=900 run_verify 2>&1); rc=$?
+[ "$rc" = 1 ] && ok "код 1" || bad "код $rc"
+printf '%s' "$out" | grep -q "не смонтирован" && ok "каталог без монтирования отвергнут" \
+  || bad "каталог без монтирования принят"
+
+# --- W7. полный прогон: изоляция от чужих сервисов --------------------------
+head_ "W7. verify-storage.sh: полный прогон не трогает чужие контейнеры"
+setup_env
+seed_verify_env 926 972029952 "$FAKE_MOUNT"
+patch_verify
+seed_verify_docker
+seed_verify_prod
+export FAKE_SERIAL=24257G400264
+export FAKE_FOREIGN="amnesia-bridge
+nextcloud-aio-mastercontainer
+openhands-agent
+paperless-webserver-1
+wg0"
+out=$(MIN_GIB=900 run_verify 2>&1); rc=$?
+[ "$rc" = 0 ] && ok "код 0" || { bad "код $rc"; printf '%s\n' "$out" | tail -8; }
+grep -q -- '--project-name video-studio-disk-check' "$FAKE_LOG" \
+  && ok "собственный проект compose" || bad "нет собственного имени проекта"
+docker_calls | grep -q 'compose .*down' && ok "уборка через compose down" || bad "нет down"
+if docker_calls | grep -Eq '^docker (stop|rm|kill|restart|prune)( |$)'; then
+  bad "прямые команды над контейнерами: $(docker_calls | grep -E '^docker (stop|rm|kill|prune)' | head -2)"
+else
+  ok "прямых stop/rm/kill/prune нет"
+fi
+docker_calls | grep -Eq 'docker (stop|rm|kill) [a-z]*(amnesia|paperless|nextcloud|openhands)' \
+  && bad "обращение к чужому контейнеру" || ok "чужие контейнеры не названы ни в одной команде"
+printf '%s' "$out" | grep -q "состав остальных контейнеров не изменился" \
+  && ok "снимок чужих контейнеров совпал" || bad "снимок не совпал"
+printf '%s' "$out" | grep -q "контейнеры проекта video-studio-disk-check остановлены" \
+  && ok "остановлен только свой проект" || bad "свой проект не остановлен"
+
+# --- W8. чужой контейнер пропал во время проверки ---------------------------
+head_ "W8. verify-storage.sh: пропажа чужого контейнера — провал проверки"
+setup_env
+seed_verify_env 926 972029952 "$FAKE_MOUNT"
+patch_verify
+seed_verify_docker
+seed_verify_prod
+export FAKE_SERIAL=24257G400264 FAKE_FOREIGN_LOSE=1
+export FAKE_FOREIGN="amnesia-bridge
+paperless-webserver-1"
+out=$(MIN_GIB=900 run_verify 2>&1); rc=$?
+printf '%s' "$out" | grep -q "состав контейнеров изменился" && ok "изменение замечено" \
+  || bad "изменение не замечено"
+[ "$rc" = 1 ] && ok "код 1" || bad "код $rc"
+
+# --- W9. /out на корневой файловой системе контейнера -----------------------
+head_ "W9. verify-storage.sh: /out на корне контейнера — провал"
+setup_env
+seed_verify_env 926 972029952 "$FAKE_MOUNT"
+patch_verify
+seed_verify_docker
+seed_verify_prod
+export FAKE_SERIAL=24257G400264 FAKE_OUT_DEV=41 FAKE_ROOT_DEV=41
+out=$(MIN_GIB=900 run_verify 2>&1); rc=$?
+printf '%s' "$out" | grep -q "/out на корневой файловой системе контейнера" \
+  && ok "подмена раздела замечена" || bad "подмена не замечена"
+[ "$rc" = 1 ] && ok "код 1" || bad "код $rc"
+
+# --- W10. --fill при рабочем SSD на тестовой точке --------------------------
+head_ "W10. verify-storage.sh: --fill на тестовой точке с рабочим SSD — отказ"
+setup_env
+seed_verify_env 2 2097152 /nonexistent
+patch_verify
+seed_verify_docker
+seed_verify_prod
+export FAKE_SERIAL=24257G400264
+out=$(MIN_GIB=1 run_verify --fill 2>&1); rc=$?
+[ "$rc" = 1 ] && ok "код 1 — отказ раньше ворот --fill" || bad "код $rc"
+printf '%s' "$out" | grep -q "писать в него через" && ok "рабочий SSD назван" || bad "нет сообщения"
+printf '%s' "$out" | grep -q "Допуск режима --fill" && bad "дело дошло до ворот --fill" \
+  || ok "до --fill не дошло: отказ на тождестве"
+container_started && bad "контейнер запускался: $(docker_calls | grep -E 'up|exec|restart' | head -2)" \
+  || ok "контейнер не запускался"
+
+# --- W10b. ворота --fill на месте, в том числе запасные ---------------------
+head_ "W10b. verify-storage.sh: запрет --fill на рабочем SSD сохранён"
+grep -q 'запрещён на рабочем хранилище' "$SRC/scripts/verify-storage.sh" \
+  && ok "ворота по пути хранилища" || bad "нет ворот по пути"
+grep -q 'запрещён: источник указывает на рабочий SSD' "$SRC/scripts/verify-storage.sh" \
+  && ok "запасные ворота по серийному номеру" || bad "нет ворот по серийному номеру"
+
+# --- W11. хранилище задаётся в compose и экспортируется скриптом ------------
+head_ "W11. compose.disk.yaml: привязки идут от STORAGE_ROOT"
+grep -q 'STORAGE_ROOT' "$SRC/compose.disk.yaml" && ok "compose читает STORAGE_ROOT" \
+  || bad "в compose жёсткий путь"
+[ "$(grep -c 'STORAGE_ROOT:-/srv/video-studio-data' "$SRC/compose.disk.yaml")" -ge 4 ] \
+  && ok "все четыре привязки параметризованы" || bad "часть привязок жёсткая"
+grep -q 'export STORAGE_ROOT="$MOUNT"' "$SRC/scripts/verify-storage.sh" \
+  && ok "проверка передаёт свой каталог" || bad "проверка не передаёт каталог"
+grep -q 'export STORAGE_ROOT="$STORAGE"' "$SRC/scripts/run-render.sh" \
+  && ok "рендер передаёт свой каталог" || bad "рендер не передаёт каталог"
+
+# --- W12. настоящий docker compose подставляет путь -------------------------
+head_ "W12. docker compose config: STORAGE_ROOT доходит до привязок"
+real_docker=$(PATH=/usr/bin:/bin:/usr/local/bin command -v docker 2>/dev/null || true)
+if [ -z "$real_docker" ]; then
+  ok "пропущено: docker недоступен"
+else
+  probe="$SB/storage-probe"
+  out=$(STORAGE_ROOT="$probe" "$real_docker" compose -f "$SRC/compose.disk.yaml" config 2>&1); rc=$?
+  if [ "$rc" = 0 ]; then
+    printf '%s' "$out" | grep -q "source: $probe/out" && ok "привязка /out ведёт в $probe/out" \
+      || bad "привязка /out не та"
+    printf '%s' "$out" | grep -q "source: $probe/in" && ok "привязка /work ведёт в $probe/in" \
+      || bad "привязка /work не та"
+    printf '%s' "$out" | grep -q "source: $probe\$" && ok "привязка /storage ведёт в $probe" \
+      || bad "привязка /storage не та"
+  else
+    bad "docker compose config: код $rc: $(printf '%s' "$out" | tail -2)"
+  fi
+  out=$(env -u STORAGE_ROOT "$real_docker" compose -f "$SRC/compose.disk.yaml" config 2>&1)
+  printf '%s' "$out" | grep -q "source: /srv/video-studio-data/out" \
+    && ok "без STORAGE_ROOT остаётся рабочий путь" || bad "рабочий путь потерян"
+fi
 
 # =============================================================================
 printf '\n=== ИТОГ: ПРОЙДЕНО %s, НЕ ПРОЙДЕНО %s ===\n' "$PASS" "$FAIL"

@@ -11,6 +11,11 @@
 #   /srv/video-studio-data/tmp     -> /scratch  запись, внутри квоты
 #   /srv/video-studio-data         -> /storage  только чтение, маркер размера
 #
+# Каталог хранилища задаётся STORAGE_ROOT, по умолчанию рабочий путь. Это не
+# удобство, а условие безопасности: проверка тестового хранилища обязана
+# привязывать именно проверенный каталог. С жёстко прописанным рабочим путём
+# `MOUNT=/mnt/storage-test verify-storage.sh --fill` заполнял бы рабочий SSD.
+#
 # Прежний сервис studio в compose.yaml остаётся рабочим и не меняется.
 name: video-studio
 
@@ -44,18 +49,18 @@ services:
       - /run:size=16m,mode=0755
     volumes:
       - type: bind
-        source: /srv/video-studio-data
+        source: ${STORAGE_ROOT:-/srv/video-studio-data}
         target: /storage
         read_only: true
       - type: bind
-        source: /srv/video-studio-data/in
+        source: ${STORAGE_ROOT:-/srv/video-studio-data}/in
         target: /work
         read_only: true
       - type: bind
-        source: /srv/video-studio-data/out
+        source: ${STORAGE_ROOT:-/srv/video-studio-data}/out
         target: /out
       - type: bind
-        source: /srv/video-studio-data/tmp
+        source: ${STORAGE_ROOT:-/srv/video-studio-data}/tmp
         target: /scratch
     logging:
       driver: json-file

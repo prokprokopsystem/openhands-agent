@@ -40,6 +40,9 @@ case "$MODE" in
     printf 'ПРОЙДЕНО: хранилище %s, свободно %s GiB, на / %s GiB\n' \
       "$STORAGE" "$storage_free" "$host_free"
 
+    # Тот же каталог, что проверен выше: иначе STORAGE=… проверял бы одно
+    # хранилище, а рендер писал в рабочее.
+    export STORAGE_ROOT="$STORAGE"
     DC=(docker compose -f "$ROOT/compose.disk.yaml")
     "${DC[@]}" up -d studio-disk >/dev/null
     trap '"${DC[@]}" stop studio-disk >/dev/null 2>&1 || true' EXIT
