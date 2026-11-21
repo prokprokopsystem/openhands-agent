@@ -19,6 +19,8 @@ export MUSIC="${MUSIC:-/in/music.mp3}"
 OUTDIR="${OUTDIR:-/out/family-memories}"
 export TOOLS="${TOOLS:-/tools}"
 TARGET="${TARGET:-316.108}"
+MUSIC_SS="${MUSIC_SS:-0}"      # сдвиг в треке для короткого контрольного отрывка
+CLIP_TOOL="${CLIP_TOOL:-$TOOLS/family-clip.sh}"
 GAIN="${GAIN:--2.5}"   # трек: -13.6 LUFS и пик +0.9 dBFS, после сдвига ровно -16 LUFS
 FPS=30
 
@@ -88,9 +90,10 @@ printf 'план: %s клипов, длина видео после кванто
 # ---- проход 1: нормализация каждого фрагмента ----
 printf 'проход 1: нормализация %s фрагментов\n' "$n"
 export OUT="$WORK"
+export CLIP_TOOL
 
 awk -F, 'NR>1 {print $1, $2, $3, $4, $5, $6, $7}' "$WORK/q.csv" \
-  | xargs -n7 sh -c '"$TOOLS/family-clip.sh" "$1" "$2" "$3" "$4" "$5" "$6" "$7"' _
+  | xargs -n7 sh -c '"$CLIP_TOOL" "$1" "$2" "$3" "$4" "$5" "$6" "$7"' _
 
 got=$(find "$WORK" -maxdepth 1 -name '*.mp4' | wc -l)
 [ "$got" -eq "$n" ] || { printf 'ОТКАЗ: получилось %s фрагментов из %s\n' "$got" "$n" >&2; exit 5; }
@@ -98,7 +101,11 @@ got=$(find "$WORK" -maxdepth 1 -name '*.mp4' | wc -l)
 # ---- проход 2: склейка и музыка ----
 printf 'проход 2: склейка %s фрагментов\n' "$n"
 args=$(awk -F, -v w="$WORK" 'NR>1 {printf " -i %s/%03d.mp4", w, $1}' "$WORK/q.csv")
-args="$args -i $MUSIC"
+if [ "$MUSIC_SS" = "0" ]; then
+  args="$args -i $MUSIC"
+else
+  args="$args -ss $MUSIC_SS -i $MUSIC"
+fi
 
 # shellcheck disable=SC2086
 ffmpeg -nostdin -hide_banner -v warning -stats -n $args \
