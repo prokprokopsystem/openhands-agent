@@ -1,0 +1,70 @@
+# Схема хранения с дисковым лимитом. Не активируется без согласования.
+#
+# Отличие от compose.yaml: вывод идёт не в tmpfs, а в отдельное дисковое
+# хранилище /srv/video-studio-data (ext4 на выделенном SSD). Предел объёма
+# задаёт файловая система: при переполнении запись останавливается с ENOSPC.
+# Схема не зависит от того, что служит источником: раздел диска, логический
+# том или loop-образ.
+#
+#   /srv/video-studio-data/in      -> /work     только чтение
+#   /srv/video-studio-data/out     -> /out      запись, внутри квоты
+#   /srv/video-studio-data/tmp     -> /scratch  запись, внутри квоты
+#   /srv/video-studio-data         -> /storage  только чтение, маркер размера
+#
+# Каталог хранилища задаётся STORAGE_ROOT, по умолчанию рабочий путь. Это не
+# удобство, а условие безопасности: проверка тестового хранилища обязана
+# привязывать именно проверенный каталог. С жёстко прописанным рабочим путём
+# `MOUNT=/mnt/storage-test verify-storage.sh --fill` заполнял бы рабочий SSD.
+#
+# Прежний сервис studio в compose.yaml остаётся рабочим и не меняется.
+name: video-studio
+
+services:
+  studio-disk:
+    image: video-studio/ffmpeg:8.0.1
+    build:
+      context: ./image/ffmpeg
+    user: "10001:10001"
+    read_only: true
+    init: true
+    cpus: 2.0
+    mem_limit: 3g
+    memswap_limit: 3g
+    pids_limit: 512
+    # Запас под Chromium: он требует больше shm, чем ffmpeg.
+    shm_size: 512m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    network_mode: "none"
+    restart: "no"
+    environment:
+      GUARD_MODE: disk
+      TMPDIR: /scratch
+    ulimits:
+      # Предел одного файла, а не суммы. Сумму ограничивает файловая система.
+      fsize: 21474836480
+    tmpfs:
+      - /run:size=16m,mode=0755
+    volumes:
+      - type: bind
+        source: ${STORAGE_ROOT:-/srv/video-studio-data}
+        target: /storage
+        read_only: true
+      - type: bind
+        source: ${STORAGE_ROOT:-/srv/video-studio-data}/in
+        target: /work
+        read_only: true
+      - type: bind
+        source: ${STORAGE_ROOT:-/srv/video-studio-data}/out
+        target: /out
+      - type: bind
+        source: ${STORAGE_ROOT:-/srv/video-studio-data}/tmp
+        target: /scratch
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    stop_grace_period: 10s
