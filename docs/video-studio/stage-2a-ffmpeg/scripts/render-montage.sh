@@ -1,32 +1,53 @@
 #!/bin/sh
 # Сборка фильма «Маленькое добро» из пяти клипов Google Flow.
 #
-# Работает внутри образа студии: ffmpeg есть только там.
+# Запускается внутри образа студии, потому что ffmpeg есть только там:
 #   docker run --rm --network none --user 10001:10001 \
 #     -v /srv/video-studio-data/in/maloe-dobro:/work:ro \
 #     -v /srv/video-studio-data/out:/out \
 #     -v <скрипты>:/tools:ro --entrypoint sh video-studio/ffmpeg:8.0.1 \
 #     /tools/render-montage.sh
 #
-# Сухая проверка (ничего не пишет, только считает кадры):
+# Сухая проверка (граф считается полностью, файл не пишется):
 #   ... -e DRY_RUN=1 ... /tools/render-montage.sh
 #
-# Клипы находятся по образцу имени, а не по полному имени: имя одного файла
-# пришло с Windows с усечением «…» внутри, и жёсткая строка была бы хрупкой.
+# Третья сцена монтируется «хвостом»: остаётся только уход робота при уже
+# готовом укрытии, сам процесс установки вырезан из-за визуальных ошибок.
+#
+# Клипы ищутся по образцу имени: имя одного файла пришло с Windows с усечением
+# «…» внутри, и жёсткая строка сломалась бы.
 set -eu
 
 SRC="${SRC:-/work}"
 OUTDIR="${OUTDIR:-/out}"
 VERSION="${VERSION:-v1}"
-# Точка выхода третьей сцены. 6.291667 = 151 кадр, отсекает выдвижение подпорки.
-SCENE3_OUT="${SCENE3_OUT:-6.291667}"
 DRY_RUN="${DRY_RUN:-0}"
 TARGET_LUFS="${TARGET_LUFS:--16}"
 
-# Длительность видео в каждом клипе: 190 кадров при 24 fps.
-CLIP_LEN=7.916667
+FPS=24
+CLIP_FRAMES=190
+
+# Третья сцена: кадры 164..189 включительно, то есть 26 кадров.
+S3_IN_FRAME="${S3_IN_FRAME:-164}"
+S3_FRAMES="${S3_FRAMES:-26}"
+
+# Растворение 4→5. Восемь десятых секунды при 24 fps — это 19.2 кадра,
+# а кадр неделим. 19 кадров (0.7917 с) ближе к 0.8 с, чем 20 (0.8333 с),
+# и сохраняет точное число кадров в результате.
+XFADE_FRAMES="${XFADE_FRAMES:-19}"
+
+# Рамка на стыке без растворения. Это не «перетекание» в 0.4 с: настоящее
+# перетекание укорачивает звук и расходится с видео, а удлинение требует
+# увода атмосферы следующей сцены раньше её изображения. 40 мс убирают щелчок
+# и перепад, не сдвигая синхронизацию ни на кадр.
+AUDIO_CUT_FADE="${AUDIO_CUT_FADE:-0.04}"
 
 die() { printf 'ОТКАЗ: %s\n' "$1" >&2; exit 2; }
+conflict() { printf 'ОТКАЗ: %s\n' "$1" >&2; exit 3; }
+
+case "$VERSION" in
+  ""|*/*|*..*) die "недопустимое имя версии: '$VERSION'" ;;
+esac
 
 # Один образец — один файл. Два совпадения означают неоднозначность, и тогда
 # лучше остановиться, чем угадывать, какой из файлов нужен.
@@ -45,63 +66,109 @@ S3=$(pick 'Robot_builds_rain_shelter_for_*.mp4')
 S4=$(pick 'Flower_straightens_under_metal_s*.mp4')
 S5=$(pick 'Aerial_view_of_industrial_city_*.mp4')
 
-# Выравнивание громкости по измеренным уровням EBU R128 до общей цели −23 LUFS.
-# Числа получены замером, а не на слух: разброс между клипами 9.6 LU.
+# Проверка, что запрошенный хвост существует в третьем клипе. Без неё
+# опечатка в номере кадра дала бы пустой или короткий фрагмент в фильме.
+have=$(ffprobe -v error -select_streams v:0 -show_entries stream=nb_frames \
+  -of csv=p=0 "$S3" 2>/dev/null || true)
+case "$have" in
+  ''|*[!0-9]*) : ;;
+  *) [ "$((S3_IN_FRAME + S3_FRAMES))" -le "$have" ] \
+       || die "хвост сцены 3 выходит за клип: $((S3_IN_FRAME + S3_FRAMES)) кадров при $have в файле" ;;
+esac
+
+# Поправки громкости: замер EBU R128 каждого используемого фрагмента, цель −23 LUFS.
+# У третьей сцены замер сделан по хвосту, а не по всему клипу: хвост громче
+# на 3.2 LU (−24.3 против −27.5), и старая поправка +4.5 дБ сделала бы его громче.
 V1=-3.4
 V2=5.0
-V3=4.5
+V3=1.3
 V4=6.2
 V5=2.3
 
-TOTAL=$(awk -v a="$CLIP_LEN" -v b="$SCENE3_OUT" \
-  'BEGIN{printf "%.6f", 4*a + b}')
-FADE_OUT_START=$(awk -v t="$TOTAL" 'BEGIN{printf "%.3f", t-1.0}')
+calc() {
+  awk -v f="$FPS" -v c="$CLIP_FRAMES" -v s3="$S3_FRAMES" \
+      -v x="$XFADE_FRAMES" -v i="$S3_IN_FRAME" "$@"
+}
+
+# Кадры и секунды всех сцен и результата.
+S3_IN_SEC=$(calc 'BEGIN{printf "%.6f", i/f}')
+S3_SEC=$(calc 'BEGIN{printf "%.6f", s3/f}')
+CLIP_SEC=$(calc 'BEGIN{printf "%.6f", c/f}')
+XFADE_SEC=$(calc 'BEGIN{printf "%.6f", x/f}')
+PRE_FRAMES=$(calc 'BEGIN{printf "%d", 3*c + s3}')
+TOTAL_FRAMES=$(calc 'BEGIN{printf "%d", 3*c + s3 + c - x}')
+TOTAL_SEC=$(calc 'BEGIN{printf "%.6f", (3*c + s3 + c - x)/f}')
+XFADE_OFFSET=$(calc -v p="$PRE_FRAMES" 'BEGIN{printf "%.6f", (p - x)/f}')
+FADE_OUT_START=$(calc 'BEGIN{printf "%.6f", (3*c + s3 + c - x)/f - 1.0}')
+CUT_FADE_END=$(calc -v d="$CLIP_SEC" -v a="$AUDIO_CUT_FADE" 'BEGIN{printf "%.6f", d-a}')
+S3_CUT_FADE_END=$(calc -v d="$S3_SEC" -v a="$AUDIO_CUT_FADE" 'BEGIN{printf "%.6f", d-a}')
 
 OUT="$OUTDIR/maloe-dobro/$VERSION.mp4"
 
 printf 'Источники:\n'
-printf '  1 %s\n' "$S1"
-printf '  2 %s\n' "$S2"
-printf '  3 %s (до %s с)\n' "$S3" "$SCENE3_OUT"
-printf '  4 %s\n' "$S4"
-printf '  5 %s\n' "$S5"
-printf 'Итог: %s с, вывод %s\n' "$TOTAL" "$OUT"
+printf '  1 %s — кадры 0..189\n' "$S1"
+printf '  2 %s — кадры 0..189\n' "$S2"
+printf '  3 %s — кадры %s..%s (%s кадров, %s с)\n' \
+  "$S3" "$S3_IN_FRAME" "$((S3_IN_FRAME + S3_FRAMES - 1))" "$S3_FRAMES" "$S3_SEC"
+printf '  4 %s — кадры 0..189\n' "$S4"
+printf '  5 %s — кадры 0..189\n' "$S5"
+printf '\nРасчёт:\n'
+printf '  до растворения: %s кадров, %s с\n' "$PRE_FRAMES" "$(calc -v p="$PRE_FRAMES" 'BEGIN{printf "%.6f", p/f}')"
+printf '  растворение 4→5: %s кадров, %s с, начало на %s с\n' "$XFADE_FRAMES" "$XFADE_SEC" "$XFADE_OFFSET"
+printf '  итог: %s кадров, %s с\n' "$TOTAL_FRAMES" "$TOTAL_SEC"
+printf '  вывод: %s\n' "$OUT"
 
 FILTER="
-[0:v]trim=0:${CLIP_LEN},setpts=PTS-STARTPTS[v0];
-[0:a]atrim=0:${CLIP_LEN},asetpts=PTS-STARTPTS,volume=${V1}dB[a0];
-[1:v]trim=0:${CLIP_LEN},setpts=PTS-STARTPTS[v1];
-[1:a]atrim=0:${CLIP_LEN},asetpts=PTS-STARTPTS,volume=${V2}dB[a1];
-[2:v]trim=0:${SCENE3_OUT},setpts=PTS-STARTPTS[v2];
-[2:a]atrim=0:${SCENE3_OUT},asetpts=PTS-STARTPTS,volume=${V3}dB[a2];
-[3:v]trim=0:${CLIP_LEN},setpts=PTS-STARTPTS[v3];
-[3:a]atrim=0:${CLIP_LEN},asetpts=PTS-STARTPTS,volume=${V4}dB[a3];
-[4:v]trim=0:${CLIP_LEN},setpts=PTS-STARTPTS[v4];
-[4:a]atrim=0:${CLIP_LEN},asetpts=PTS-STARTPTS,volume=${V5}dB[a4];
-[v0][a0][v1][a1][v2][a2][v3][a3][v4][a4]concat=n=5:v=1:a=1[v][a];
-[v]fade=t=in:st=0:d=0.5,fade=t=out:st=${FADE_OUT_START}:d=1.0[vout];
-[a]loudnorm=I=${TARGET_LUFS}:TP=-1.5:LRA=11[aout]
+[0:v]trim=start_frame=0:end_frame=${CLIP_FRAMES},setpts=PTS-STARTPTS[v0];
+[1:v]trim=start_frame=0:end_frame=${CLIP_FRAMES},setpts=PTS-STARTPTS[v1];
+[2:v]trim=start_frame=${S3_IN_FRAME}:end_frame=$((S3_IN_FRAME + S3_FRAMES)),setpts=PTS-STARTPTS[v2];
+[3:v]trim=start_frame=0:end_frame=${CLIP_FRAMES},setpts=PTS-STARTPTS[v3];
+[4:v]trim=start_frame=0:end_frame=${CLIP_FRAMES},setpts=PTS-STARTPTS,fps=${FPS},settb=1/${FPS}[v4];
+[v0][v1][v2][v3]concat=n=4:v=1:a=0[vcat];
+[vcat]tpad=stop_mode=clone:stop=2,fps=${FPS},settb=1/${FPS}[vpre];
+[vpre][v4]xfade=transition=fade:duration=${XFADE_SEC}:offset=${XFADE_OFFSET}[vmix];
+[vmix]fade=t=in:st=0:d=0.5,fade=t=out:st=${FADE_OUT_START}:d=1.0[vout];
+[0:a]atrim=start=0:end=${CLIP_SEC},asetpts=PTS-STARTPTS,volume=${V1}dB,afade=t=out:st=${CUT_FADE_END}:d=${AUDIO_CUT_FADE}[a0];
+[1:a]atrim=start=0:end=${CLIP_SEC},asetpts=PTS-STARTPTS,volume=${V2}dB,afade=t=in:st=0:d=${AUDIO_CUT_FADE},afade=t=out:st=${CUT_FADE_END}:d=${AUDIO_CUT_FADE}[a1];
+[2:a]atrim=start=${S3_IN_SEC}:end=${CLIP_SEC},asetpts=PTS-STARTPTS,volume=${V3}dB,afade=t=in:st=0:d=${AUDIO_CUT_FADE},afade=t=out:st=${S3_CUT_FADE_END}:d=${AUDIO_CUT_FADE}[a2];
+[3:a]atrim=start=0:end=${CLIP_SEC},asetpts=PTS-STARTPTS,volume=${V4}dB,afade=t=in:st=0:d=${AUDIO_CUT_FADE}[a3];
+[4:a]atrim=start=0:end=${CLIP_SEC},asetpts=PTS-STARTPTS,volume=${V5}dB[a4];
+[a0][a1][a2][a3]concat=n=4:v=0:a=1[apre];
+[apre][a4]acrossfade=d=${XFADE_SEC}:c1=tri:c2=tri[amix];
+[amix]loudnorm=I=${TARGET_LUFS}:TP=-1.5:LRA=11,aresample=48000[aout]
 "
 
 if [ "$DRY_RUN" = "1" ]; then
-  # Кодирование не выполняется: проверяется только граф фильтров и тайминги.
-  exec ffmpeg -hide_banner -nostats -y \
+  # Кодирование не выполняется: проверяются граф, тайминги и число кадров.
+  exec ffmpeg -hide_banner -nostats \
     -i "$S1" -i "$S2" -i "$S3" -i "$S4" -i "$S5" \
     -filter_complex "$FILTER" \
-    -map "[vout]" -map "[aout]" -f null -
+    -map "[vout]" -map "[aout]" -frames:v "$TOTAL_FRAMES" -f null -
+fi
+
+# Готовая версия не перезаписывается: имя версии — это и есть защита от потери
+# уже отданного результата. `-y` ниже поэтому не используется.
+PART="$OUT.part.mp4"
+if [ -e "$OUT" ] || [ -e "$PART" ]; then
+  conflict "файл $OUT уже существует; выберите другую VERSION, прежние версии не перезаписываются"
 fi
 
 mkdir -p "$OUTDIR/maloe-dobro"
+trap 'rm -f "$PART"' EXIT INT TERM
 
-ffmpeg -hide_banner -nostats -y \
+ffmpeg -hide_banner -nostats -n \
   -i "$S1" -i "$S2" -i "$S3" -i "$S4" -i "$S5" \
   -filter_complex "$FILTER" \
   -map "[vout]" -map "[aout]" \
+  -frames:v "$TOTAL_FRAMES" \
   -c:v libx264 -profile:v high -level 4.0 -pix_fmt yuv420p \
-  -crf 18 -preset medium -r 24 -g 48 \
+  -crf "${X264_CRF:-18}" -preset "${X264_PRESET:-medium}" -r "$FPS" -g 48 \
   -c:a aac -b:a 192k -ar 48000 -ac 2 \
   -movflags +faststart \
-  "$OUT"
+  "$PART"
+
+mv "$PART" "$OUT"
+trap - EXIT INT TERM
 
 printf '\nГотово: %s\n' "$OUT"
 ffprobe -v error -show_entries format=duration,size:stream=codec_name,width,height,r_frame_rate,nb_frames \

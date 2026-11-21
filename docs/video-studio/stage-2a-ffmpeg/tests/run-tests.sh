@@ -1967,19 +1967,39 @@ grep -q "Flower_straightens_under_metal_s\*" "$SRC/scripts/render-montage.sh" \
   && ok "четвёртый клип ищется по образцу, а не по полному имени" \
   || bad "жёсткое имя файла с усечением"
 
-# Точка выхода третьей сцены задаётся числом кадров, а не «на глаз».
-grep -q 'SCENE3_OUT="${SCENE3_OUT:-6.291667}"' "$SRC/scripts/render-montage.sh" \
-  && ok "по умолчанию 151 кадр (6.291667 с)" || bad "другое значение по умолчанию"
+# Вариант D: у третьей сцены остаётся только хвост, 26 кадров с 164-го.
+grep -q 'S3_IN_FRAME="${S3_IN_FRAME:-164}"' "$SRC/scripts/render-montage.sh" \
+  && ok "вход третьей сцены — кадр 164" || bad "другой вход третьей сцены"
+grep -q 'S3_FRAMES="${S3_FRAMES:-26}"' "$SRC/scripts/render-montage.sh" \
+  && ok "остаётся 26 кадров" || bad "другое число кадров"
+grep -q 'trim=start_frame=\${S3_IN_FRAME}' "$SRC/scripts/render-montage.sh" \
+  && ok "видео режется по номеру кадра, а не по времени" || bad "обрезка по времени"
+grep -q 'atrim=start=\${S3_IN_SEC}' "$SRC/scripts/render-montage.sh" \
+  && ok "звук третьей сцены сдвинут тем же входом" || bad "звук не сдвинут со входом"
+
+# Хвост сцены громче всего клипа на 3.2 LU: поправка должна считаться по хвосту.
+grep -q '^V3=1.3' "$SRC/scripts/render-montage.sh" \
+  && ok "поправка третьей сцены +1.3 дБ по замеру хвоста" || bad "поправка V3 не по хвосту"
+
+# Растворение 4→5 обязано быть в графе: без него остаётся резкая склейка.
+grep -q 'xfade=transition=fade' "$SRC/scripts/render-montage.sh" \
+  && ok "растворение 4→5 есть в графе" || bad "нет xfade"
+grep -q 'acrossfade=d=' "$SRC/scripts/render-montage.sh" \
+  && ok "звук растворения сшит acrossfade" || bad "нет acrossfade"
+
+# 0.8 с — это 19.2 кадра, а кадр неделим. Итог должен остаться целым.
+grep -q 'XFADE_FRAMES="${XFADE_FRAMES:-19}"' "$SRC/scripts/render-montage.sh" \
+  && ok "растворение задано 19 кадрами (0.7917 с)" || bad "растворение не в кадрах"
+
+# xfade требует одинаковую базу времени у входов: concat и исходник расходятся.
+grep -q 'settb=1/\${FPS}' "$SRC/scripts/render-montage.sh" \
+  && ok "базы времени входов выровнены" || bad "нет нормализации timebase"
 
 # Выравнивание уровней должно опираться на замеры, а не на догадку.
-for v in 'V1=-3.4' 'V2=5.0' 'V3=4.5' 'V4=6.2' 'V5=2.3'; do
+for v in 'V1=-3.4' 'V2=5.0' 'V4=6.2' 'V5=2.3'; do
   grep -q "^$v" "$SRC/scripts/render-montage.sh" || bad "нет поправки $v"
 done
 ok "поправки громкости совпадают с измеренными EBU R128"
-
-# Звук режется по длине видео: иначе 13 мс на клип накопятся в рассинхрон.
-grep -q 'atrim=0:\${CLIP_LEN}' "$SRC/scripts/render-montage.sh" \
-  && ok "звук обрезается по длине видео" || bad "звук не выровнен по видео"
 
 grep -q 'loudnorm=I=' "$SRC/scripts/render-montage.sh" \
   && ok "финальная громкость нормируется" || bad "нет loudnorm"
@@ -1987,6 +2007,33 @@ grep -q 'loudnorm=I=' "$SRC/scripts/render-montage.sh" \
 # Сухая проверка не должна создавать файл фильма.
 grep -q 'f null -' "$SRC/scripts/render-montage.sh" \
   && ok "есть режим сухой проверки без записи" || bad "нет режима сухой проверки"
+
+# Готовая версия не перезаписывается: рендер идёт с -n, а не с -y.
+grep -q 'ffmpeg -hide_banner -nostats -n' "$SRC/scripts/render-montage.sh" \
+  && ok "рендер запускается с -n" || bad "нет -n"
+if grep -q 'ffmpeg -hide_banner -nostats -y' "$SRC/scripts/render-montage.sh"; then
+  bad "в рендере остался -y"
+else
+  ok "в рендере нет -y"
+fi
+
+# Отказ при существующем файле: код 3 и понятное сообщение.
+mkdir -p "$SB/five" "$SB/exists/maloe-dobro"
+: > "$SB/five/Robot_examining_flower_in_rain_a.mp4"
+: > "$SB/five/Robot_lifting_metal_sheet_shelter_a.mp4"
+: > "$SB/five/Robot_builds_rain_shelter_for_a.mp4"
+: > "$SB/five/Flower_straightens_under_metal_sa.mp4"
+: > "$SB/five/Aerial_view_of_industrial_city_a.mp4"
+: > "$SB/exists/maloe-dobro/v1.mp4"
+out=$(SRC="$SB/five" OUTDIR="$SB/exists" sh "$SRC/scripts/render-montage.sh" 2>&1); rc=$?
+[ "$rc" = 3 ] && ok "существующий файл даёт код 3" || bad "код $rc вместо 3"
+printf '%s' "$out" | grep -q "не перезаписываются" && ok "отказ объяснён" \
+  || bad "нет объяснения отказа"
+
+# Имя версии не должно уводить запись из каталога вывода.
+rm -f "$SB/exists/maloe-dobro/v1.mp4"
+out=$(SRC="$SB/five" OUTDIR="$SB/exists" VERSION=../evil sh "$SRC/scripts/render-montage.sh" 2>&1); rc=$?
+[ "$rc" = 2 ] && ok "путь в имени версии отклонён" || bad "код $rc вместо 2"
 
 # =============================================================================
 printf '\n=== ИТОГ: ПРОЙДЕНО %s, НЕ ПРОЙДЕНО %s ===\n' "$PASS" "$FAIL"
