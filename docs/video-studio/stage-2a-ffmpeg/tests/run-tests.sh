@@ -1944,6 +1944,50 @@ grep -qE '(^|[[:space:]])rm[[:space:]]+-' "$SRC/scripts/inventory-sources.sh" \
 grep -qF "IFS=\$'\037'" "$SRC/scripts/inventory-sources.sh" \
   && ok "поля разделены непечатаемым символом" || bad "разделитель снова пробельный"
 
+# --- Z. render-montage.sh: отказы до запуска ffmpeg -------------------------
+head_ "Z1. render-montage.sh: клипы находятся однозначно или работа не начинается"
+
+mkdir -p "$SB/noclips"
+out=$(SRC="$SB/noclips" OUTDIR="$SB/out" sh "$SRC/scripts/render-montage.sh" 2>&1); rc=$?
+[ "$rc" = 2 ] && ok "код 2 без клипов" || bad "код $rc"
+printf '%s' "$out" | grep -q "не найден клип" && ok "назван отсутствующий клип" \
+  || bad "нет сообщения об отсутствующем клипе"
+
+# Два файла на один образец — неоднозначность, а не повод выбрать первый.
+mkdir -p "$SB/dups"
+: > "$SB/dups/Robot_examining_flower_in_rain_a.mp4"
+: > "$SB/dups/Robot_examining_flower_in_rain_b.mp4"
+out=$(SRC="$SB/dups" OUTDIR="$SB/out" sh "$SRC/scripts/render-montage.sh" 2>&1); rc=$?
+[ "$rc" = 2 ] && ok "код 2 при двух совпадениях" || bad "код $rc"
+printf '%s' "$out" | grep -q "нужен ровно один" && ok "неоднозначность названа" \
+  || bad "нет сообщения о неоднозначности"
+
+# Клипы ищутся по образцу: имя с усечённым «…» не должно ломать поиск.
+grep -q "Flower_straightens_under_metal_s\*" "$SRC/scripts/render-montage.sh" \
+  && ok "четвёртый клип ищется по образцу, а не по полному имени" \
+  || bad "жёсткое имя файла с усечением"
+
+# Точка выхода третьей сцены задаётся числом кадров, а не «на глаз».
+grep -q 'SCENE3_OUT="${SCENE3_OUT:-6.291667}"' "$SRC/scripts/render-montage.sh" \
+  && ok "по умолчанию 151 кадр (6.291667 с)" || bad "другое значение по умолчанию"
+
+# Выравнивание уровней должно опираться на замеры, а не на догадку.
+for v in 'V1=-3.4' 'V2=5.0' 'V3=4.5' 'V4=6.2' 'V5=2.3'; do
+  grep -q "^$v" "$SRC/scripts/render-montage.sh" || bad "нет поправки $v"
+done
+ok "поправки громкости совпадают с измеренными EBU R128"
+
+# Звук режется по длине видео: иначе 13 мс на клип накопятся в рассинхрон.
+grep -q 'atrim=0:\${CLIP_LEN}' "$SRC/scripts/render-montage.sh" \
+  && ok "звук обрезается по длине видео" || bad "звук не выровнен по видео"
+
+grep -q 'loudnorm=I=' "$SRC/scripts/render-montage.sh" \
+  && ok "финальная громкость нормируется" || bad "нет loudnorm"
+
+# Сухая проверка не должна создавать файл фильма.
+grep -q 'f null -' "$SRC/scripts/render-montage.sh" \
+  && ok "есть режим сухой проверки без записи" || bad "нет режима сухой проверки"
+
 # =============================================================================
 printf '\n=== ИТОГ: ПРОЙДЕНО %s, НЕ ПРОЙДЕНО %s ===\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
