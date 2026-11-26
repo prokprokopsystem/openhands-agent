@@ -30,6 +30,8 @@
 | [Протокол передачи исходников](https://github.com/prokprokopsystem/openhands-agent/blob/video-studio-disk-storage/docs/video-studio/Протокол-передача-исходников-2026-11-21.md) | SCP/SFTP, пути, инвентаризация, монтажные проверки |
 | [Отчёт дискового режима](https://github.com/prokprokopsystem/openhands-agent/blob/video-studio-disk-storage/docs/video-studio/Отчёт-проверка-дискового-режима-2026-11-15.md) | Датированные результаты тестов SSD и контейнера |
 | [Этап 2а](Отчёт-этап-2а-2026-11-15.md) | **История** запуска FFmpeg до отдельного дискового режима |
+| [Сценарий «Из Токио звоню»](cartoon-rocket-fuel/СЦЕНАРИЙ-И-ПЛАН.md) | Сюжет, реплики, производственный план мультфильма |
+| [Отчёт: монтаж «Из Токио звоню» v1](cartoon-rocket-fuel/ОТЧЁТ-монтаж-v1-2026-11-26.md) | Монтажный лист, синхронизация, проверки, ограничения |
 | [Google Drive — AI-видеостудия](https://drive.google.com/drive/folders/1PY0KvqKprqDUuQJGKQaVPCKeAnq8FASt) | Замысел, план, принятые решения и эксперименты; не источник актуального серверного состояния |
 | [Паспорт проекта](https://docs.google.com/document/d/1FkZInMtdcirWjtYZm2uJdgBFv6TbQtu5oAl_xS8_SPw/edit) | Концепция и архитектурные решения |
 | [Инструменты и тесты](https://docs.google.com/document/d/1I6aihg4hX6Bky9koQ6yEcUcs-_Z4DLoo-R-BfApH_LM/edit) | История инструментов, лимитов и проверок |
